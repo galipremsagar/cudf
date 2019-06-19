@@ -2705,7 +2705,7 @@ class DataFrame(object):
         DataFrame
 
         """
-        if not(axis in (0, None)):
+        if axis not in (0, None):
             raise NotImplementedError("axis is not supported yet")
 
         if numeric_only:
