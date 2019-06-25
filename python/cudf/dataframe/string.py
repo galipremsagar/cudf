@@ -55,7 +55,8 @@ class StringMethods(object):
                     if isinstance(ret, nvstrings.nvstrings):
                         ret = Series(
                             columnops.as_column(ret),
-                            index=self._index
+                            index=self._index,
+                            name=self._parent._name
                         )
                     return ret
                 return wrapper
@@ -87,7 +88,7 @@ class StringMethods(object):
             np.dtype('int32'),
             mask=mask
         )
-        return Series(column, index=self._index)
+        return Series(column, index=self._index, name=self._parent._name)
 
     def cat(self, others=None, sep=None, na_rep=None):
         """
@@ -413,7 +414,7 @@ class StringMethods(object):
 class StringColumn(columnops.TypedColumnBase):
     """Implements operations for Columns of String type
     """
-    def __init__(self, data, null_count=None, **kwargs):
+    def __init__(self, data, null_count=None, name=None, **kwargs):
         """
         Parameters
         ----------
@@ -423,12 +424,14 @@ class StringColumn(columnops.TypedColumnBase):
             The number of null values in the mask.
         """
         from collections.abc import Sequence
+        print(data)
         if isinstance(data, Sequence):
             data = nvstrings.to_device(data)
         assert isinstance(data, nvstrings.nvstrings)
         self._data = data
         self._dtype = np.dtype("object")
-
+        self._name = name
+        
         if null_count is None:
             null_count = data.null_count()
         self._null_count = null_count
@@ -453,6 +456,10 @@ class StringColumn(columnops.TypedColumnBase):
     def __len__(self):
         return self._data.size()
 
+    @property
+    def name(self):
+        return self._name
+    
     @property
     def dtype(self):
         return self._dtype
@@ -570,7 +577,7 @@ class StringColumn(columnops.TypedColumnBase):
 
     def to_pandas(self, index=None):
         pd_series = self.to_arrow().to_pandas()
-        return pd.Series(pd_series, index=index)
+        return pd.Series(pd_series, index=index, name=self._name)
 
     def to_array(self, fillna=None):
         """Get a dense numpy array for the data.
