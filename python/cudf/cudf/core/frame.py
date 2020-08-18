@@ -1320,8 +1320,6 @@ class Frame(libcudf.table.Table):
             raise NotImplementedError("The method keyword is not supported")
         if limit is not None:
             raise NotImplementedError("The limit keyword is not supported")
-        if axis:
-            raise NotImplementedError("The axis keyword is not supported")
 
         if isinstance(value, cudf.Series):
             value = value.reindex(self._data.names)
