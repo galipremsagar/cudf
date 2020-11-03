@@ -437,3 +437,21 @@ def timedelta_generator(dtype, size):
 
 def boolean_generator(size):
     return lambda: np.random.choice(a=[False, True], size=size)
+
+
+def str_generator(size):
+    def map_mimesis_ranstr(df):
+        df["a"] = df["a"].map(
+            lambda x: mimesis.random.random.schoice(string.printable, 128)
+        )
+        return df
+
+    from dask import dataframe as dd
+    from dask.distributed import Client
+
+    _ = Client(memory_limit="300GB")
+    df = pd.DataFrame()
+    df["a"] = np.empty(size, dtype="str")
+    ddf = dd.from_pandas(df, npartitions=128)
+    df = ddf.map_partitions(map_mimesis_ranstr).compute()
+    return lambda: df["a"].values
