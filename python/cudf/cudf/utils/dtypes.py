@@ -77,6 +77,8 @@ pyarrow_dtypes_to_pandas_dtypes = {
     pa.int64(): pd.Int64Dtype(),
     pa.bool_(): pd.BooleanDtype(),
     pa.string(): pd.StringDtype(),
+    pa.float32(): pd.Float32Dtype(),
+    pa.float64(): pd.Float64Dtype(),
 }
 
 pandas_dtypes_to_cudf_dtypes = {

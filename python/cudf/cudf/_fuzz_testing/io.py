@@ -77,7 +77,7 @@ class IOFuzz(object):
         param = self._inputs[self._idx]
         dtypes_meta = param["dtypes_meta"]
         num_rows = param["num_rows"]
-        num_cols = param["num_columns"]
+        num_cols = param["num_cols"]
         seed = param["seed"]
         random.seed(seed)
         self._idx += 1

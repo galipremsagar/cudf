@@ -52,12 +52,12 @@ class ParquetReader(IOFuzz):
         else:
             dtypes_list = list(
                 cudf.utils.dtypes.ALL_TYPES
-                - {"category", "datetime64[ns]"}
+                - {"category", "datetime64[ns]", "str"}
                 - cudf.utils.dtypes.TIMEDELTA_TYPES
                 # TODO: Remove uint32 below after this bug is fixed
                 # https://github.com/pandas-dev/pandas/issues/37327
                 - {"uint32"}
-                | {"list", "decimal64"}
+                # | {"list", "decimal64"}
             )
             dtypes_meta, num_rows, num_cols = _generate_rand_meta(
                 self, dtypes_list
@@ -75,15 +75,8 @@ class ParquetReader(IOFuzz):
         df = pyarrow_to_pandas(table)
         logging.info(f"Shape of DataFrame generated: {table.shape}")
 
-        # TODO: Change this to write into
-        # a BytesIO object once below issue is fixed
-        # https://issues.apache.org/jira/browse/ARROW-10123
-
-        # file = io.BytesIO()
         df.to_parquet("temp_file")
-        # file.seek(0)
-        # self._current_buffer = copy.copy(file.read())
-        # return self._current_buffer
+
         self._df = df
         return "temp_file"
 

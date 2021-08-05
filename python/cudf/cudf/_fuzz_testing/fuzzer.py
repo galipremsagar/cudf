@@ -87,6 +87,7 @@ class Fuzzer(object):
 
         while True:
             logging.info(f"Running test {self._total_executions}")
+            # import pdb;pdb.set_trace()
             file_name = self._data_handler.generate_input()
             try:
                 self._start_time = datetime.datetime.now()
