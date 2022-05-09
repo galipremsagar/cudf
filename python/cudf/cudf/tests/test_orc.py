@@ -403,7 +403,7 @@ def test_orc_writer(datadir, tmpdir, reference_file, columns, compression):
     assert_frame_equal(expect, got)
 
 
-@pytest.mark.parametrize("stats_freq", ["NONE", "STRIPE", "ROWGROUP"])
+@pytest.mark.parametrize("stats_freq", [None, "STRIPE", "ROWGROUP"])
 def test_orc_writer_statistics_frequency(datadir, tmpdir, stats_freq):
     reference_file = "TestOrcFile.demo-12-zlib.orc"
     pdf_fname = datadir / reference_file
@@ -424,7 +424,7 @@ def test_orc_writer_statistics_frequency(datadir, tmpdir, stats_freq):
     assert_frame_equal(expect, got)
 
 
-@pytest.mark.parametrize("stats_freq", ["NONE", "STRIPE", "ROWGROUP"])
+@pytest.mark.parametrize("stats_freq", [None, "STRIPE", "ROWGROUP"])
 def test_chunked_orc_writer_statistics_frequency(datadir, tmpdir, stats_freq):
     reference_file = "TestOrcFile.test1.orc"
     pdf_fname = datadir / reference_file

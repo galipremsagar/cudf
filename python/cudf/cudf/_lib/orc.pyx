@@ -223,10 +223,11 @@ cdef cudf_io_types.statistics_freq _get_orc_stat_freq(object statistics):
       - ORC "STRIPE"   == CUDF "ROWGROUP"
       - ORC "ROWGROUP" == CUDF "PAGE"
     """
-    statistics = str(statistics).upper()
-    if statistics == "NONE":
+    if statistics is None:
         return cudf_io_types.statistics_freq.STATISTICS_NONE
-    elif statistics == "STRIPE":
+
+    statistics = str(statistics).upper()
+    if statistics == "STRIPE":
         return cudf_io_types.statistics_freq.STATISTICS_ROWGROUP
     elif statistics == "ROWGROUP":
         return cudf_io_types.statistics_freq.STATISTICS_PAGE

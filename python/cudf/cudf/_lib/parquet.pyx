@@ -577,10 +577,11 @@ cpdef merge_filemetadata(object filemetadata_list):
 
 
 cdef cudf_io_types.statistics_freq _get_stat_freq(object statistics):
-    statistics = str(statistics).upper()
-    if statistics == "NONE":
+    if statistics is None:
         return cudf_io_types.statistics_freq.STATISTICS_NONE
-    elif statistics == "ROWGROUP":
+
+    statistics = str(statistics).upper()
+    if statistics == "ROWGROUP":
         return cudf_io_types.statistics_freq.STATISTICS_ROWGROUP
     elif statistics == "PAGE":
         return cudf_io_types.statistics_freq.STATISTICS_PAGE
