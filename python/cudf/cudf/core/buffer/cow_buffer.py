@@ -15,7 +15,7 @@ T = TypeVar("T", bound="CopyOnWriteBuffer")
 
 
 def _keys_cleanup(ptr):
-    weak_set_values = CopyOnWriteBuffer._instances[(ptr,)]
+    weak_set_values = CopyOnWriteBuffer._instances[ptr]
     if (
         len(weak_set_values) == 1
         and next(iter(weak_set_values.data))() is None
@@ -23,7 +23,7 @@ def _keys_cleanup(ptr):
         # When the last remaining reference is being cleaned up we will still
         # have a dead weak-reference in `weak_set_values`, if that is the case
         # we are good to perform the key's cleanup
-        del CopyOnWriteBuffer._instances[(ptr,)]
+        del CopyOnWriteBuffer._instances[ptr]
 
 
 class CopyOnWriteBuffer(Buffer):
@@ -43,9 +43,8 @@ class CopyOnWriteBuffer(Buffer):
     _zero_copied: bool
 
     def _finalize_init(self):
-        key = (self._ptr,)
-        self.__class__._instances[key].add(self)
-        self._instances = self.__class__._instances[key]
+        self.__class__._instances[self._ptr].add(self)
+        self._instances = self.__class__._instances[self._ptr]
         self._zero_copied = False
         weakref.finalize(self, _keys_cleanup, self._ptr)
 
