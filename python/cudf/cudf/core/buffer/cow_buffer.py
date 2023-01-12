@@ -14,8 +14,8 @@ from cudf.core.buffer.buffer import Buffer, cuda_array_interface_wrapper
 T = TypeVar("T", bound="CopyOnWriteBuffer")
 
 
-def _keys_cleanup(ptr, size):
-    weak_set_values = CopyOnWriteBuffer._instances[(ptr, size)]
+def _keys_cleanup(ptr):
+    weak_set_values = CopyOnWriteBuffer._instances[(ptr,)]
     if (
         len(weak_set_values) == 1
         and next(iter(weak_set_values.data))() is None
@@ -23,7 +23,7 @@ def _keys_cleanup(ptr, size):
         # When the last remaining reference is being cleaned up we will still
         # have a dead weak-reference in `weak_set_values`, if that is the case
         # we are good to perform the key's cleanup
-        del CopyOnWriteBuffer._instances[(ptr, size)]
+        del CopyOnWriteBuffer._instances[(ptr,)]
 
 
 class CopyOnWriteBuffer(Buffer):
@@ -43,11 +43,11 @@ class CopyOnWriteBuffer(Buffer):
     _zero_copied: bool
 
     def _finalize_init(self):
-        key = (self._ptr, self._size)
+        key = (self._ptr,)
         self.__class__._instances[key].add(self)
         self._instances = self.__class__._instances[key]
         self._zero_copied = False
-        weakref.finalize(self, _keys_cleanup, self._ptr, self._size)
+        weakref.finalize(self, _keys_cleanup, self._ptr)
 
     @classmethod
     def _from_device_memory(
@@ -105,18 +105,10 @@ class CopyOnWriteBuffer(Buffer):
     def _getitem(self, offset: int, size: int) -> Buffer:
         """
         Helper for `__getitem__`
-
-        Returns the same underlying memory pointer if offset is 0
-        and size == self.size, else makes a copy to return the
-        slice.
         """
-        if offset != 0 or self.size != size:
-            buf = self.copy(deep=True)
-        else:
-            buf = self
-        return buf._from_device_memory(
+        return self._from_device_memory(
             cuda_array_interface_wrapper(
-                ptr=buf._ptr + offset, size=size, owner=buf.owner
+                ptr=self._ptr + offset, size=size, owner=self.owner
             )
         )
 

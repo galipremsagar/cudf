@@ -539,6 +539,8 @@ cdef class Column:
                     rmm.DeviceBuffer(ptr=data_ptr,
                                      size=(size+offset) * dtype_itemsize)
                 )
+            elif column_owner and isinstance(data_owner, CopyOnWriteBuffer):
+                data = data_owner.copy(deep=False)
             elif (
                 # This is an optimization of the most common case where
                 # from_column_view creates a "view" that is identical to
@@ -565,7 +567,9 @@ cdef class Column:
                     owner=data_owner,
                     exposed=True,
                 )
-                if isinstance(data_owner, SpillableBuffer):
+                if isinstance(data_owner, CopyOnWriteBuffer):
+                    data_owner.ptr  # accessing the pointer marks it exposed.
+                elif isinstance(data_owner, SpillableBuffer):
                     if data_owner.is_spilled:
                         raise ValueError(
                             f"{data_owner} is spilled, which invalidates "

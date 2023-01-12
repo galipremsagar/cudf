@@ -99,6 +99,14 @@ def test_series_setitem_cow(copy_on_write):
         assert_eq(actual, cudf.Series([1, 2, 300, 300, 5]))
     assert_eq(new_copy, cudf.Series([1, 2, 300, 300, 5]))
 
+    new_slice = actual[2:]
+    new_slice[0:2] = 10
+    assert_eq(new_slice, cudf.Series([10, 10, 5], index=[2, 3, 4]))
+    if copy_on_write:
+        assert_eq(actual, cudf.Series([1, 2, 3, 4, 5]))
+    else:
+        assert_eq(actual, cudf.Series([1, 2, 10, 10, 5]))
+
 
 def test_multiple_series_cow():
     cudf.set_option("copy_on_write", True)
