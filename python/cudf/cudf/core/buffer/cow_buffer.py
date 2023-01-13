@@ -21,15 +21,22 @@ def _keys_cleanup(ptr):
         and next(iter(weak_set_values.data))() is None
     ):
         # When the last remaining reference is being cleaned up we will still
-        # have a dead weak-reference in `weak_set_values`, if that is the case
-        # we are good to perform the key's cleanup
+        # have a dead reference in `weak_set_values`. If that is the case, then
+        # we can safely clean up the key
         del CopyOnWriteBuffer._instances[ptr]
 
 
 class CopyOnWriteBuffer(Buffer):
-    """A Buffer represents device memory.
+    """A Copy-on-write buffer that implements Buffer.
 
-    Use the factory function `as_buffer` to create a Buffer instance.
+    This buffer enables making copies of data only when there
+    is a write operation being performed.
+
+    See `Copy-on-write` section in `library_design.md` for
+    detailed information on `CopyOnWriteBuffer`.
+
+    Use the factory function `as_buffer` to create a CopyOnWriteBuffer
+    instance.
     """
 
     # This dict keeps track of all instances that have the same `ptr`
@@ -90,14 +97,24 @@ class CopyOnWriteBuffer(Buffer):
 
     @property
     def ptr(self) -> int:
-        """Device pointer to the start of the buffer."""
+        """Device pointer to the start of the buffer.
+
+        This will trigger a deep copy if there are any weak references.
+        The Buffer would be marked as zero copied.
+        """
         self._unlink_shared_buffers()
         self._zero_copied = True
         return self._ptr
 
     @property
     def mutable_ptr(self) -> int:
-        """Device pointer to the start of the buffer."""
+        """Device pointer to the start of the buffer.
+
+        This will trigger a deep copy if there are any weak references.
+        """
+        # Shouldn't need to mark the Buffer as zero copied,
+        # because this API is used by libcudf only to create
+        # mutable views.
         self._unlink_shared_buffers()
         return self._ptr
 
@@ -126,17 +143,17 @@ class CopyOnWriteBuffer(Buffer):
         -------
         Buffer
         """
-        if not deep and not self._zero_copied:
+        if deep or self._zero_copied:
+            return self._from_device_memory(
+                rmm.DeviceBuffer(ptr=self._ptr, size=self.size)
+            )
+        else:
             copied_buf = CopyOnWriteBuffer.__new__(CopyOnWriteBuffer)
             copied_buf._ptr = self._ptr
             copied_buf._size = self._size
             copied_buf._owner = self._owner
             copied_buf._finalize_init()
             return copied_buf
-        else:
-            return self._from_device_memory(
-                rmm.DeviceBuffer(ptr=self._ptr, size=self.size)
-            )
 
     @property
     def __cuda_array_interface__(self) -> dict:
@@ -164,8 +181,10 @@ class CopyOnWriteBuffer(Buffer):
     @property
     def _get_readonly_proxy_obj(self) -> dict:
         """
-        Internal Implementation for the CUDA Array Interface which is
-        read-only.
+        Returns a proxy object with a read-only CUDA Array Interface.
+
+        See `Copy-on-write` section in `library_design.md` for
+        more information on this API.
         """
         return cuda_array_interface_wrapper(
             ptr=self._ptr,
