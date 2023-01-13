@@ -540,6 +540,10 @@ cdef class Column:
                                      size=(size+offset) * dtype_itemsize)
                 )
             elif column_owner and isinstance(data_owner, CopyOnWriteBuffer):
+                # TODO: In future, see if we can just pass on the
+                # CopyOnWriteBuffer reference to another column
+                # and still create a weak reference.
+                # With the current design that's not possible.
                 data = data_owner.copy(deep=False)
             elif (
                 # This is an optimization of the most common case where
