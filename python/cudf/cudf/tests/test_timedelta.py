@@ -688,6 +688,9 @@ def test_timedelta_dt_components(data, dtype):
     if gsr.isnull().any():
         assert_eq(expected, actual.astype("float"))
     else:
+        import pdb
+
+        pdb.set_trace()
         assert_eq(expected, actual)
 
 
@@ -987,7 +990,9 @@ def test_timedelta_index_properties(data, dtype, name):
 
     expected_days = pdi.days
     actual_days = gdi.days
+    import pdb
 
+    pdb.set_trace()
     local_assert(expected_days, actual_days)
 
     expected_seconds = pdi.seconds
@@ -1044,6 +1049,9 @@ def test_timedelta_fillna(data, dtype, fill_value):
 
     expected = psr.fillna(fill_value)
     actual = sr.fillna(fill_value)
+    import pdb
+
+    pdb.set_trace()
     assert_eq(expected, actual)
 
     expected = expected.dropna()
@@ -1376,6 +1384,9 @@ def test_timedelta_std(data, dtype, ddof):
     if np.isnat(expected.to_numpy()) and np.isnat(actual.to_numpy()):
         assert True
     else:
+        import pdb
+
+        pdb.set_trace()
         np.testing.assert_allclose(
             expected.to_numpy().astype("float64"),
             actual.to_numpy().astype("float64"),

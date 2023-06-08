@@ -376,12 +376,19 @@ class DatetimeColumn(column.ColumnBase):
     def mean(
         self, skipna=None, min_count: int = 0, dtype=np.float64
     ) -> ScalarLike:
-        return pd.Timestamp(
+        result = pd.Timestamp(
             self.as_numerical.mean(
                 skipna=skipna, min_count=min_count, dtype=dtype
             ),
             unit=self.time_unit,
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def std(
         self,
@@ -390,17 +397,31 @@ class DatetimeColumn(column.ColumnBase):
         dtype: Dtype = np.float64,
         ddof: int = 1,
     ) -> pd.Timedelta:
-        return pd.Timedelta(
+        result = pd.Timedelta(
             self.as_numerical.std(
                 skipna=skipna, min_count=min_count, dtype=dtype, ddof=ddof
             )
             * _unit_to_nanoseconds_conversion[self.time_unit],
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def median(self, skipna: Optional[bool] = None) -> pd.Timestamp:
-        return pd.Timestamp(
+        result = pd.Timestamp(
             self.as_numerical.median(skipna=skipna), unit=self.time_unit
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def quantile(
         self,
@@ -416,9 +437,14 @@ class DatetimeColumn(column.ColumnBase):
             return_scalar=return_scalar,
         )
         if return_scalar:
-            return pd.Timestamp(result, unit=self.time_unit).as_unit(
-                self.time_unit
-            )
+            result = pd.Timestamp(result, unit=self.time_unit)
+            if PANDAS_GE_200:
+                return result.as_unit(self.time_unit)
+            else:
+                try:
+                    return result._as_unit(self.time_unit)
+                except Exception:
+                    return result
         return result.astype(self.dtype)
 
     def _binaryop(self, other: ColumnBinaryOperand, op: str) -> ColumnBase:

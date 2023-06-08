@@ -206,7 +206,9 @@ def test_ufunc_series(request, ufunc, has_nulls, indexed):
         mask = reduce(operator.or_, (a.isna() for a in aligned)).to_pandas()
 
     got = ufunc(*args)
+    import pdb
 
+    pdb.set_trace()
     with _hide_ufunc_warnings(ufunc):
         expect = ufunc(*(arg.to_pandas() for arg in pandas_args))
 

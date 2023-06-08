@@ -1578,7 +1578,9 @@ def test_multiindex_append(data, other):
 
     expected = pdi.append(other_pd)
     actual = gdi.append(other_gd)
+    import pdb
 
+    pdb.set_trace()
     assert_eq(expected, actual)
 
 

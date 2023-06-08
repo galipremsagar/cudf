@@ -1633,7 +1633,9 @@ def test_groupby_nth(n, by):
 
     expect = pdf.groupby(by).nth(n)
     got = gdf.groupby(by).nth(n)
+    import pdb
 
+    pdb.set_trace()
     assert_groupby_results_equal(expect, got, check_dtype=False)
 
 
@@ -3129,7 +3131,9 @@ def test_groupby_dtypes(groups):
         expected = pdf.groupby(groups).dtypes
     with pytest.warns(FutureWarning):
         actual = df.groupby(groups).dtypes
+    import pdb
 
+    pdb.set_trace()
     assert_eq(expected, actual)
 
 

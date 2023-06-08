@@ -1422,7 +1422,9 @@ def test_reset_index(level, drop, inplace, original_name, name):
             "For exception checks, see "
             "test_reset_index_dup_level_name_exceptions"
         )
+    import pdb
 
+    pdb.set_trace()
     expect = ps.reset_index(level=level, drop=drop, name=name, inplace=inplace)
 
     got = gs.reset_index(level=level, drop=drop, name=name, inplace=inplace)

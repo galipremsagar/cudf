@@ -323,15 +323,29 @@ class TimeDeltaColumn(ColumnBase):
         return libcudf.unary.cast(self, dtype=dtype)
 
     def mean(self, skipna=None, dtype: Dtype = np.float64) -> pd.Timedelta:
-        return pd.Timedelta(
+        result = pd.Timedelta(
             self.as_numerical.mean(skipna=skipna, dtype=dtype),
             unit=self.time_unit,
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def median(self, skipna: Optional[bool] = None) -> pd.Timedelta:
-        return pd.Timedelta(
+        result = pd.Timedelta(
             self.as_numerical.median(skipna=skipna), unit=self.time_unit
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def isin(self, values: Sequence) -> ColumnBase:
         return cudf.core.tools.datetimes._isin_datetimelike(self, values)
@@ -350,9 +364,14 @@ class TimeDeltaColumn(ColumnBase):
             return_scalar=return_scalar,
         )
         if return_scalar:
-            return pd.Timedelta(result, unit=self.time_unit).as_unit(
-                self.time_unit
-            )
+            result = pd.Timedelta(result, unit=self.time_unit)
+            if PANDAS_GE_200:
+                return result.as_unit(self.time_unit)
+            else:
+                try:
+                    return result._as_unit(self.time_unit)
+                except Exception:
+                    return result
         return result.astype(self.dtype)
 
     def sum(
@@ -361,7 +380,7 @@ class TimeDeltaColumn(ColumnBase):
         min_count: int = 0,
         dtype: Optional[Dtype] = None,
     ) -> pd.Timedelta:
-        return pd.Timedelta(
+        result = pd.Timedelta(
             # Since sum isn't overridden in Numerical[Base]Column, mypy only
             # sees the signature from Reducible (which doesn't have the extra
             # parameters from ColumnBase._reduce) so we have to ignore this.
@@ -369,7 +388,14 @@ class TimeDeltaColumn(ColumnBase):
                 skipna=skipna, min_count=min_count, dtype=dtype
             ),
             unit=self.time_unit,
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def std(
         self,
@@ -378,12 +404,19 @@ class TimeDeltaColumn(ColumnBase):
         dtype: Dtype = np.float64,
         ddof: int = 1,
     ) -> pd.Timedelta:
-        return pd.Timedelta(
+        result = pd.Timedelta(
             self.as_numerical.std(
                 skipna=skipna, min_count=min_count, ddof=ddof, dtype=dtype
             ),
             unit=self.time_unit,
-        ).as_unit(self.time_unit)
+        )
+        if PANDAS_GE_200:
+            return result.as_unit(self.time_unit)
+        else:
+            try:
+                return result._as_unit(self.time_unit)
+            except Exception:
+                return result
 
     def components(self, index=None) -> "cudf.DataFrame":
         """

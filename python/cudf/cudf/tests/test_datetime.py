@@ -631,7 +631,9 @@ def test_cudf_to_datetime(data, dayfirst):
     # TODO: Remove typecast to `ns` and following if/else
     # workaround after following issue is fixed:
     # https://github.com/pandas-dev/pandas/issues/52449
+    import pdb
 
+    pdb.set_trace()
     if actual is not None and expected is not None:
         assert_eq(
             actual.astype(pd_data.dtype)
@@ -1278,6 +1280,9 @@ def test_datetime_reductions(data, op, dtype):
     ):
         assert True
     else:
+        import pdb
+
+        pdb.set_trace()
         assert_eq(expected, actual)
 
 
@@ -1307,6 +1312,9 @@ def test_datetime_infer_format(data, dtype):
     sr = cudf.Series(data)
     psr = pd.Series(data)
 
+    import pdb
+
+    pdb.set_trace()
     assert_exceptions_equal(
         lfunc=psr.astype,
         rfunc=sr.astype,
