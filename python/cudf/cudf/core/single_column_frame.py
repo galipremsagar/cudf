@@ -385,7 +385,7 @@ class SingleColumnFrame(Frame, NotIterable):
         """
         if self._column.null_count == len(self):
             return 0
-        return self._column.distinct_count(dropna=dropna)
+        return self._column.distinct_count(dropna=dropna, nan_as_null=True)
 
     def _get_elements_from_column(self, arg) -> Union[ScalarLike, ColumnBase]:
         # A generic method for getting elements from a column that supports a

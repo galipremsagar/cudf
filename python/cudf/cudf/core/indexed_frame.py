@@ -41,6 +41,7 @@ from cudf._typing import (
 from cudf.api.extensions import no_default
 from cudf.api.types import (
     _is_non_decimal_numeric_dtype,
+    is_float_dtype,
     is_bool_dtype,
     is_categorical_dtype,
     is_decimal_dtype,
@@ -5027,9 +5028,19 @@ class IndexedFrame(Frame):
             if source.empty:
                 return source.astype("float64")
 
+        # if na_option == "keep":
+        #     nan_cols = {col_name: libcudf.unary.is_nan(col) if is_float_dtype(col.dtype) else None for col_name, col in source._data.item()}
+        #     source = source.nans_to_nulls()
         result_columns = libcudf.sort.rank_columns(
             [*source._columns], method_enum, na_option, ascending, pct
         )
+        # if na_option == "keep":
+        #     res_col = []
+        #     for i, col in enumerate(result_columns):
+        #         if is_float_dtype(col.dtype):
+        #             col[nan_cols[i]] = np.nan
+        #         res_col.append(col)
+        #     result_columns = res_col
 
         return self.__class__._from_data(
             dict(zip(source._column_names, result_columns)),

@@ -20,7 +20,7 @@ from cudf._lib.reshape import interleave_columns
 from cudf._lib.sort import segmented_sort_by_key
 from cudf._lib.types import size_type_dtype
 from cudf._typing import AggType, DataFrameOrSeries, MultiColumnAggType
-from cudf.api.types import is_list_like
+from cudf.api.types import is_list_like, is_float_dtype
 from cudf.core.abc import Serializable
 from cudf.core.column.column import ColumnBase, arange, as_column
 from cudf.core.column_accessor import ColumnAccessor
@@ -421,7 +421,10 @@ class GroupBy(Serializable, Reducible, Scannable):
         """
         if not axis == 0:
             raise NotImplementedError("Only axis=0 is supported.")
-
+        if na_option not in {"keep", "top", "bottom"}:
+            raise ValueError(
+                "na_option must be one of 'keep', 'top', or 'bottom'"
+            )
         def rank(x):
             return getattr(x, "rank")(
                 method=method,
@@ -430,7 +433,25 @@ class GroupBy(Serializable, Reducible, Scannable):
                 pct=pct,
             )
 
-        return self.agg(rank)
+        
+        
+        # nan_cols = {col_name: libcudf.unary.is_nan(col) if is_float_dtype(col.dtype) else None for col_name, col in self.obj._data.items()}
+        # result = self.obj.nans_to_nulls().groupby(
+        #     by=self.grouping.keys,
+        #     dropna=self._dropna,
+        #     sort=self._sort,
+        #     group_keys=self._group_keys,
+        #     as_index=self._as_index,
+        # ).agg(rank)
+        result = self.agg(rank)
+        # if na_option == "keep":
+        #     for col_name, col in result._data.items():
+        #         if col_name in nan_cols:
+        #             new_col = col.astype(self.obj._data[col_name].dtype)
+        #             new_col[nan_cols[col_name]] = np.nan
+        #             result._data[col_name] = new_col
+
+        return result
 
     @cached_property
     def _groupby(self):

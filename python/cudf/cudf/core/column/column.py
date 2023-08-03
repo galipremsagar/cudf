@@ -934,7 +934,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
 
     @property
     def is_unique(self) -> bool:
-        return self.distinct_count() == len(self)
+        return self.distinct_count(nan_as_null=True) == len(self)
 
     @property
     def is_monotonic_increasing(self) -> bool:
@@ -957,12 +957,12 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             [self], column_order=[ascending], null_precedence=[na_position]
         )[0]
 
-    def distinct_count(self, dropna: bool = True) -> int:
+    def distinct_count(self, dropna: bool = True, nan_as_null=False) -> int:
         try:
             return self._distinct_count[dropna]
         except KeyError:
             self._distinct_count[dropna] = cpp_distinct_count(
-                self, ignore_nulls=dropna
+                self, ignore_nulls=dropna, nan_as_null=nan_as_null
             )
             return self._distinct_count[dropna]
 
@@ -1913,6 +1913,7 @@ def as_column(
     * pyarrow array
     * pandas.Categorical objects
     """
+    # import pdb;pdb.set_trace()
     if isinstance(arbitrary, ColumnBase):
         if dtype is not None:
             return arbitrary.astype(dtype)
@@ -2157,7 +2158,7 @@ def as_column(
                 data = data.astype(dtype)
         elif arb_dtype.kind in ("O", "U"):
             data = as_column(
-                pa.Array.from_pandas(arbitrary), dtype=arbitrary.dtype
+                pa.array(arbitrary), dtype=arbitrary.dtype
             )
             # There is no cast operation available for pa.Array from int to
             # str, Hence instead of handling in pa.Array block, we
@@ -2412,7 +2413,7 @@ def _construct_array(
         if (
             dtype is None
             and not cudf._lib.scalar._is_null_host_scalar(arbitrary)
-            and infer_dtype(arbitrary)
+            and infer_dtype(arbitrary, skipna=False)
             in (
                 "mixed",
                 "mixed-integer",

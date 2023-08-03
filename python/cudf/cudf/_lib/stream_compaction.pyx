@@ -181,11 +181,7 @@ def distinct_count(Column source_column, ignore_nulls=True, nan_as_null=False):
         if ignore_nulls
         else null_policy.INCLUDE
     )
-    cdef nan_policy cpp_nan_handling = (
-        nan_policy.NAN_IS_NULL
-        if nan_as_null
-        else nan_policy.NAN_IS_VALID
-    )
+    cdef nan_policy cpp_nan_handling = nan_policy.NAN_IS_VALID
 
     cdef column_view source_column_view = source_column.view()
     with nogil:

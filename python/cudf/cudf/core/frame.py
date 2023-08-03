@@ -2831,7 +2831,7 @@ class Frame(BinaryOperand, Scannable):
             Name and unique value counts of each column in frame.
         """
         return {
-            name: col.distinct_count(dropna=dropna)
+            name: col.distinct_count(dropna=dropna, nan_as_null=True)
             for name, col in self._data.items()
         }
 

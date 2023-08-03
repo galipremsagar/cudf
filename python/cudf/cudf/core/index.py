@@ -37,6 +37,7 @@ from cudf.api.types import (
     is_scalar,
     is_string_dtype,
 )
+from cudf.api.extensions import no_default
 from cudf.core._base_index import BaseIndex, _index_astype_docstring
 from cudf.core.column import (
     CategoricalColumn,
@@ -3291,7 +3292,7 @@ class Index(BaseIndex, metaclass=IndexMeta):
         copy=False,
         name=None,
         tupleize_cols=True,
-        nan_as_null=True,
+        nan_as_null=no_default,
         **kwargs,
     ):
         assert (
@@ -3301,6 +3302,8 @@ class Index(BaseIndex, metaclass=IndexMeta):
             raise NotImplementedError(
                 "tupleize_cols != True is not yet supported"
             )
+        if nan_as_null is no_default:
+            nan_as_null = not cudf.get_option("mode.pandas_compatible")
 
         return as_index(
             data,

@@ -21,6 +21,7 @@ import cudf
 from cudf import _lib as libcudf
 from cudf._typing import DataFrameOrSeries
 from cudf.api.types import is_integer, is_list_like, is_object_dtype
+from cudf.api.extensions import no_default
 from cudf.core import column
 from cudf.core._compat import PANDAS_GE_150
 from cudf.core.frame import Frame
@@ -1490,7 +1491,7 @@ class MultiIndex(Frame, BaseIndex, NotIterable):
 
     @classmethod
     @_cudf_nvtx_annotate
-    def from_pandas(cls, multiindex, nan_as_null=None):
+    def from_pandas(cls, multiindex, nan_as_null=no_default):
         """
         Convert from a Pandas MultiIndex
 
@@ -1511,6 +1512,11 @@ class MultiIndex(Frame, BaseIndex, NotIterable):
         """
         if not isinstance(multiindex, pd.MultiIndex):
             raise TypeError("not a pandas.MultiIndex")
+        if nan_as_null is no_default:
+            if cudf.get_option("mode.pandas_compatible"):
+                nan_as_null = False
+            else:
+                nan_as_null = None
 
         # if `multiindex` has two or more levels that
         # have the same name, then `multiindex.to_frame()`

@@ -118,6 +118,7 @@ def test_series_nunique(nan_as_null, dropna):
 
     expect = pd_series.nunique(dropna=dropna)
     got = cudf_series.nunique(dropna=dropna)
+    # import pdb;pdb.set_trace()
     assert expect == got
 
     cudf_series = cudf.Series([1.0, np.nan, np.nan], nan_as_null=nan_as_null)
