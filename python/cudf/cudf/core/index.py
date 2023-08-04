@@ -28,6 +28,7 @@ from cudf._lib.datetime import extract_quarter, is_leap_year
 from cudf._lib.filling import sequence
 from cudf._lib.search import search_sorted
 from cudf._lib.types import size_type_dtype
+from cudf.api.extensions import no_default
 from cudf.api.types import (
     _is_non_decimal_numeric_dtype,
     is_categorical_dtype,
@@ -3291,7 +3292,7 @@ class Index(BaseIndex, metaclass=IndexMeta):
         copy=False,
         name=None,
         tupleize_cols=True,
-        nan_as_null=True,
+        nan_as_null=no_default,
         **kwargs,
     ):
         assert (
@@ -3301,6 +3302,9 @@ class Index(BaseIndex, metaclass=IndexMeta):
             raise NotImplementedError(
                 "tupleize_cols != True is not yet supported"
             )
+
+        if nan_as_null is no_default:
+            nan_as_null = not cudf.get_option("mode.pandas_compatible")
 
         return as_index(
             data,

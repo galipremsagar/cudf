@@ -2219,3 +2219,11 @@ def test_series_constructor_unbounded_sequence():
 
     with pytest.raises(TypeError):
         cudf.Series(A())
+
+
+def test_series_constructor_nan():
+    with cudf.set_option("mode.pandas_compatible", True):
+        actual = cudf.Series([1, 2, np.nan, None])
+        expected = pd.Series([1, 2, np.nan, None])
+
+        assert_eq(actual, expected)

@@ -498,8 +498,10 @@ class Series(SingleColumnFrame, IndexedFrame, Serializable):
         dtype=None,
         name=None,
         copy=False,
-        nan_as_null=True,
+        nan_as_null=no_default,
     ):
+        if nan_as_null is no_default:
+            nan_as_null = not cudf.get_option("mode.pandas_compatible")
         if isinstance(data, pd.Series):
             if name is None:
                 name = data.name
@@ -618,7 +620,7 @@ class Series(SingleColumnFrame, IndexedFrame, Serializable):
 
     @classmethod
     @_cudf_nvtx_annotate
-    def from_pandas(cls, s, nan_as_null=None):
+    def from_pandas(cls, s, nan_as_null=no_default):
         """
         Convert from a Pandas Series.
 
@@ -656,6 +658,11 @@ class Series(SingleColumnFrame, IndexedFrame, Serializable):
         3     NaN
         dtype: float64
         """
+        if nan_as_null is no_default:
+            if cudf.get_option("mode.pandas_compatible"):
+                nan_as_null = False
+            else:
+                nan_as_null = None
         return cls(s, nan_as_null=nan_as_null)
 
     @property  # type: ignore

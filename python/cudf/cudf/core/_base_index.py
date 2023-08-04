@@ -19,6 +19,7 @@ from cudf._lib.stream_compaction import (
 )
 from cudf._lib.types import size_type_dtype
 from cudf._typing import DtypeObj
+from cudf.api.extensions import no_default
 from cudf.api.types import (
     is_bool_dtype,
     is_integer,
@@ -1613,7 +1614,7 @@ class BaseIndex(Serializable):
             return NotImplemented
 
     @classmethod
-    def from_pandas(cls, index, nan_as_null=None):
+    def from_pandas(cls, index, nan_as_null=no_default):
         """
         Convert from a Pandas Index.
 
@@ -1645,6 +1646,12 @@ class BaseIndex(Serializable):
         """
         if not isinstance(index, pd.Index):
             raise TypeError("not a pandas.Index")
+
+        if nan_as_null is no_default:
+            if cudf.get_option("mode.pandas_compatible"):
+                nan_as_null = False
+            else:
+                nan_as_null = None
 
         ind = cudf.Index(column.as_column(index, nan_as_null=nan_as_null))
         ind.name = index.name

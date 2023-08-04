@@ -603,9 +603,17 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
 
     @_cudf_nvtx_annotate
     def __init__(
-        self, data=None, index=None, columns=None, dtype=None, nan_as_null=True
+        self,
+        data=None,
+        index=None,
+        columns=None,
+        dtype=None,
+        nan_as_null=no_default,
     ):
         super().__init__()
+
+        if nan_as_null is no_default:
+            nan_as_null = not cudf.get_option("mode.pandas_compatible")
 
         if isinstance(columns, (Series, cudf.BaseIndex)):
             columns = columns.to_pandas()
@@ -5018,7 +5026,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
 
     @classmethod
     @_cudf_nvtx_annotate
-    def from_pandas(cls, dataframe, nan_as_null=None):
+    def from_pandas(cls, dataframe, nan_as_null=no_default):
         """
         Convert from a Pandas DataFrame.
 
@@ -5052,6 +5060,12 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
 
         if not dataframe.columns.is_unique:
             raise ValueError("Duplicate column names are not allowed")
+
+        if nan_as_null is no_default:
+            if cudf.get_option("mode.pandas_compatible"):
+                nan_as_null = False
+            else:
+                nan_as_null = None
 
         # Set columns
         data = {}
@@ -7328,7 +7342,7 @@ for binop in [
 
 
 @_cudf_nvtx_annotate
-def from_pandas(obj, nan_as_null=None):
+def from_pandas(obj, nan_as_null=no_default):
     """
     Convert certain Pandas objects into the cudf equivalent.
 
@@ -7426,6 +7440,11 @@ def from_pandas(obj, nan_as_null=None):
     >>> type(pmidx)
     <class 'pandas.core.indexes.multi.MultiIndex'>
     """
+    if nan_as_null is no_default:
+        if cudf.get_option("mode.pandas_compatible"):
+            nan_as_null = False
+        else:
+            nan_as_null = None
     if isinstance(obj, pd.DataFrame):
         return DataFrame.from_pandas(obj, nan_as_null=nan_as_null)
     elif isinstance(obj, pd.Series):
