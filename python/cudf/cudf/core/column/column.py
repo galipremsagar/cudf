@@ -990,6 +990,8 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             np.object_,
             str,
         }:
+            if cudf.get_option("mode.pandas_compatible") and np.dtype(dtype).type in {np.object_}:
+                raise TypeError("Unsupported dtype")
             return self.as_string_column(dtype, **kwargs)
         elif is_list_dtype(dtype):
             if not self.dtype == dtype:
@@ -2231,6 +2233,8 @@ def as_column(
         data = ColumnBase.from_scalar(arbitrary, length if length else 1)
     elif isinstance(arbitrary, pd.core.arrays.masked.BaseMaskedArray):
         data = as_column(pa.Array.from_pandas(arbitrary), dtype=dtype)
+    elif isinstance(arbitrary, (pd.DatetimeIndex, pd.TimedeltaIndex)) and arbitrary.freq is not None:
+        raise NotImplementedError("freq is not implemented yet")
     elif isinstance(arbitrary, pd.DatetimeIndex) and isinstance(
         arbitrary.dtype, pd.DatetimeTZDtype
     ):

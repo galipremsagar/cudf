@@ -206,16 +206,22 @@ class TimeDeltaColumn(ColumnBase):
                 if isinstance(other, ColumnBase) and not isinstance(
                     other, TimeDeltaColumn
                 ):
-                    return _all_bools_with_nulls(
+                    res = _all_bools_with_nulls(
                         self, other, bool_fill_value=op == "__ne__"
                     )
+                    if cudf.get_option("mode.pandas_compatible"):
+                        res = res.fillna(False if op != "__ne__" else True)
+                    return res
 
         if out_dtype is None:
             return NotImplemented
 
         lhs, rhs = (other, this) if reflect else (this, other)
 
-        return libcudf.binaryop.binaryop(lhs, rhs, op, out_dtype)
+        res = libcudf.binaryop.binaryop(lhs, rhs, op, out_dtype)
+        if cudf.get_option("mode.pandas_compatible") and out_dtype == np.bool_:
+            res = res.fillna(False if op != "__ne__" else True)
+        return res
 
     def normalize_binop_value(self, other) -> ColumnBinaryOperand:
         if isinstance(other, (ColumnBase, cudf.Scalar)):

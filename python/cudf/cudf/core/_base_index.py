@@ -1770,6 +1770,8 @@ class BaseIndex(Serializable):
         """
         if not isinstance(index, pd.Index):
             raise TypeError("not a pandas.Index")
+        if isinstance(index, (pd.DatetimeIndex, pd.TimedeltaIndex)) and index.freq is not None:
+            raise NotImplementedError("freq is not implemented yet")
 
         ind = cudf.Index(column.as_column(index, nan_as_null=nan_as_null))
         ind.name = index.name

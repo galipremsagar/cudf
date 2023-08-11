@@ -460,14 +460,20 @@ class DatetimeColumn(column.ColumnBase):
             if isinstance(other, ColumnBase) and not isinstance(
                 other, DatetimeColumn
             ):
-                return _all_bools_with_nulls(
+                res = _all_bools_with_nulls(
                     self, other, bool_fill_value=op == "__ne__"
                 )
+                if cudf.get_option("mode.pandas_compatible"):
+                    res = res.fillna(False if op != "__ne__" else True)
+                return res
 
         if out_dtype is None:
             return NotImplemented
 
-        return libcudf.binaryop.binaryop(lhs, rhs, op, out_dtype)
+        res = libcudf.binaryop.binaryop(lhs, rhs, op, out_dtype)
+        if cudf.get_option("mode.pandas_compatible") and out_dtype == cudf.dtype(np.bool_):
+            res = res.fillna(False if op != "__ne__" else True)
+        return res
 
     def fillna(
         self,
