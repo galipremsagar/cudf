@@ -1162,7 +1162,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         """
         Get unique values in the data
         """
-        return drop_duplicates([self], keep="first")[0]
+        return drop_duplicates([self], keep="first")[0]._with_type_metadata(self.dtype)
 
     def serialize(self) -> Tuple[dict, list]:
         # data model:
@@ -2461,16 +2461,19 @@ def _construct_array(
         arbitrary = cupy.asarray(arbitrary, dtype=dtype)
     except (TypeError, ValueError):
         native_dtype = dtype
+        inferred_dtype = None
         if (
             dtype is None
             and not cudf._lib.scalar._is_null_host_scalar(arbitrary)
-            and infer_dtype(arbitrary, skipna=False)
+            and (inferred_dtype := infer_dtype(arbitrary, skipna=False))
             in (
                 "mixed",
                 "mixed-integer",
             )
         ):
             native_dtype = "object"
+        if inferred_dtype == "interval":
+            return pd.array(arbitrary)
         arbitrary = np.asarray(
             arbitrary,
             dtype=native_dtype

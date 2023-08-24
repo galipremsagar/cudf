@@ -3210,6 +3210,9 @@ class IntervalIndex(GenericIndex):
 
     def _is_boolean(self):
         return False
+    
+    def _clean_nulls_from_index(self):
+        return self
 
 
 class StringIndex(GenericIndex):
