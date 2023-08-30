@@ -1925,6 +1925,7 @@ def as_column(
     import pdb
 
     pdb.set_trace()
+    "a"
     if isinstance(arbitrary, ColumnBase):
         if dtype is not None:
             return arbitrary.astype(dtype)
