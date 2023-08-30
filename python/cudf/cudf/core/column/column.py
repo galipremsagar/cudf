@@ -23,7 +23,6 @@ from typing import (
 
 import cupy
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 from numba import cuda
 from typing_extensions import Self
@@ -31,6 +30,7 @@ from typing_extensions import Self
 import rmm
 
 import cudf
+import pandas as pd
 from cudf import _lib as libcudf
 from cudf._lib.column import Column
 from cudf._lib.null_mask import (
@@ -1922,6 +1922,9 @@ def as_column(
     * pyarrow array
     * pandas.Categorical objects
     """
+    import pdb
+
+    pdb.set_trace()
     if isinstance(arbitrary, ColumnBase):
         if dtype is not None:
             return arbitrary.astype(dtype)
