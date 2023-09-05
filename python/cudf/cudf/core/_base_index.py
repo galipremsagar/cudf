@@ -941,7 +941,9 @@ class BaseIndex(Serializable):
                 f"of None or False; {sort} was passed."
             )
 
-        other = cudf.Index(other)
+        other = cudf.Index(other, name=getattr(other, "name", self.name))
+        # if len(other) == 0:
+        #     other = other.astype(self.dtype)
 
         res_name = _get_result_name(self.name, other.name)
 

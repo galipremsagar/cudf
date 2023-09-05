@@ -676,12 +676,35 @@ class RangeIndex(BaseIndex, BinaryOperand):
         # If all the above optimizations don't cater to the inputs,
         # we materialize RangeIndexes into integer indexes and
         # then perform `union`.
-        return self._as_int_index()._union(other, sort=sort)
+        # import pdb;pdb.set_trace()
+        result = self._as_int_index()._union(other, sort=sort)
+        return self._try_reconstruct_range_index(result)
+        # if result.dtype.kind == "f":
+        #     return result
+        # # GH 46675 & 43885: If values is equally spaced, return a
+        # # more memory-compact RangeIndex instead of Int64Index
+        # unique_diffs = result.to_frame(name="None").diff()["None"]
+        # if len(unique_diffs) == 2 and (unique_diffs[0] is cudf.NA and unique_diffs[1] != 0):
+        #     diff = unique_diffs[1]
+        #     new_range = range(result[0], result[-1] + diff, diff)
+        #     return type(self)(new_range, name=result.name)
+
+    def _try_reconstruct_range_index(self, index):
+        if index.dtype.kind == "f":
+            return index
+        # GH 46675 & 43885: If values is equally spaced, return a
+        # more memory-compact RangeIndex instead of Int64Index
+        unique_diffs = index.to_frame(name="None").diff()["None"].unique()
+        if len(unique_diffs) == 2 and (unique_diffs[0] is cudf.NA and unique_diffs[1] != 0):
+            diff = unique_diffs[1]
+            new_range = range(index[0], index[-1] + diff, diff)
+            return type(self)(new_range, name=index.name)
+        return index
 
     @_cudf_nvtx_annotate
     def _intersection(self, other, sort=False):
         if not isinstance(other, RangeIndex):
-            return super()._intersection(other, sort=sort)
+            return self._try_reconstruct_range_index(super()._intersection(other, sort=sort))
 
         if not len(self) or not len(other):
             return RangeIndex(0)
@@ -721,8 +744,8 @@ class RangeIndex(BaseIndex, BinaryOperand):
             new_index = new_index[::-1]
         if sort is None:
             new_index = new_index.sort_values()
-
-        return new_index
+        return self._try_reconstruct_range_index(new_index)
+        # return new_index
 
     def sort_values(
         self,
