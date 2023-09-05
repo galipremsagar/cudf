@@ -26,6 +26,7 @@ from cudf.core._compat import PANDAS_GE_150
 from cudf.core.frame import Frame
 from cudf.core.index import BaseIndex, _lexsorted_equal_range, as_index
 from cudf.utils.utils import NotIterable, _cudf_nvtx_annotate, _is_same_name
+from cudf.core._base_index import _get_result_name
 
 
 def _maybe_indices_to_slice(indices: cp.ndarray) -> Union[slice, cp.ndarray]:
@@ -199,6 +200,9 @@ class MultiIndex(Frame, BaseIndex, NotIterable):
     @_cudf_nvtx_annotate
     def names(self):
         return self._names
+
+    def to_series(self, index=None, name=None):
+        raise NotImplementedError("not implemented")
 
     @names.setter  # type: ignore
     @_cudf_nvtx_annotate
@@ -1887,6 +1891,32 @@ class MultiIndex(Frame, BaseIndex, NotIterable):
             self_name if _is_same_name(self_name, other_name) else None
             for self_name, other_name in zip(self.names, other.names)
         ]
+
+    @_cudf_nvtx_annotate
+    def union(self, other, sort=None):
+        if not isinstance(other, MultiIndex):
+            msg = "other must be a MultiIndex or a list of tuples"
+            try:
+                other = MultiIndex.from_tuples(other, names=self.names)
+            except (ValueError, TypeError) as err:
+                # ValueError raised by tuples_to_object_array if we
+                #  have non-object dtype
+                raise TypeError(msg) from err
+
+        if sort not in {None, False}:
+            raise ValueError(
+                f"The 'sort' keyword only takes the values of "
+                f"None or False; {sort} was passed."
+            )
+
+        if not len(other) or self.equals(other):
+            return self._get_reconciled_name_object(other)
+        elif not len(self):
+            return other._get_reconciled_name_object(self)
+
+        result = self._union(other, sort=sort)
+        result.name = _get_result_name(self.name, other.name)
+        return result
 
     @_cudf_nvtx_annotate
     def _union(self, other, sort=None):

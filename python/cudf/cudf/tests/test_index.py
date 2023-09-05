@@ -816,6 +816,7 @@ def test_index_difference(data, other, sort, name_data, name_other):
     gd_other = cudf.from_pandas(pd_other)
 
     expected = pd_data.difference(pd_other, sort=sort)
+
     actual = gd_data.difference(gd_other, sort=sort)
     assert_eq(expected, actual)
 

@@ -702,6 +702,13 @@ class RangeIndex(BaseIndex, BinaryOperand):
         return index
 
     @_cudf_nvtx_annotate
+    def difference(self, other, sort=None):
+        if isinstance(other, RangeIndex) and self.equals(other):
+            return self[:0]
+
+        return self._try_reconstruct_range_index(super().difference(other, sort=sort))
+
+    @_cudf_nvtx_annotate
     def _intersection(self, other, sort=False):
         if not isinstance(other, RangeIndex):
             return self._try_reconstruct_range_index(super()._intersection(other, sort=sort))
