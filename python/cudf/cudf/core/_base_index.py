@@ -25,6 +25,8 @@ from cudf.api.types import (
     is_integer_dtype,
     is_list_like,
     is_scalar,
+    is_signed_integer_dtype,
+    is_unsigned_integer_dtype,
 )
 from cudf.core.abc import Serializable
 from cudf.core.column import ColumnBase, column
@@ -538,11 +540,20 @@ class BaseIndex(Serializable):
                 f"The 'sort' keyword only takes the values of "
                 f"None or False; {sort} was passed."
             )
+        if cudf.get_option("mode.pandas_compatible"):
+            if (is_bool_dtype(self.dtype) and not is_bool_dtype(other.dtype)) or (not is_bool_dtype(self.dtype) and is_bool_dtype(other.dtype)):
+                raise TypeError("cannot create mixed types")
+            if (is_signed_integer_dtype(self.dtype) and other.dtype == cudf.dtype("uint64")) or (self.dtype  == cudf.dtype("uint64") and is_signed_integer_dtype(other.dtype)):
+                raise TypeError("cannot create mixed types")
 
         if not len(other) or self.equals(other):
-            return self._get_reconciled_name_object(other)
+            dtypes = {self.dtype, other.dtype}
+            common_dtype = cudf.utils.dtypes.find_common_type(dtypes)
+            return self._get_reconciled_name_object(other).astype(common_dtype)
         elif not len(self):
-            return other._get_reconciled_name_object(self)
+            dtypes = {self.dtype, other.dtype}
+            common_dtype = cudf.utils.dtypes.find_common_type(dtypes)
+            return other._get_reconciled_name_object(self).astype(common_dtype)
 
         result = self._union(other, sort=sort)
         result.name = _get_result_name(self.name, other.name)

@@ -676,7 +676,6 @@ class RangeIndex(BaseIndex, BinaryOperand):
         # If all the above optimizations don't cater to the inputs,
         # we materialize RangeIndexes into integer indexes and
         # then perform `union`.
-        # import pdb;pdb.set_trace()
         result = self._as_int_index()._union(other, sort=sort)
         return self._try_reconstruct_range_index(result)
         # if result.dtype.kind == "f":
@@ -704,7 +703,7 @@ class RangeIndex(BaseIndex, BinaryOperand):
     @_cudf_nvtx_annotate
     def difference(self, other, sort=None):
         if isinstance(other, RangeIndex) and self.equals(other):
-            return self[:0]
+            return self[:0]._get_reconciled_name_object(other)
 
         return self._try_reconstruct_range_index(super().difference(other, sort=sort))
 
