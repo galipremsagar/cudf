@@ -11,6 +11,7 @@ import cudf
 from cudf.api.types import is_decimal_dtype, is_dtype_equal
 from cudf.core.column import CategoricalColumn
 from cudf.core.dtypes import CategoricalDtype
+from cudf.errors import MixedTypeError
 
 if TYPE_CHECKING:
     from cudf.core.column import ColumnBase
@@ -74,6 +75,8 @@ def _match_join_keys(
             common_type = ltype.categories.dtype
         else:
             common_type = rtype.categories.dtype
+        if cudf.utils.dtypes.is_mixed_with_object_dtype(lcol, rcol):
+            raise MixedTypeError("cudf doesn't support mixed type")
         common_type = cudf.utils.dtypes._dtype_pandas_compatible(common_type)
         return lcol.astype(common_type), rcol.astype(common_type)
 
@@ -86,6 +89,8 @@ def _match_join_keys(
             "of the same precision and scale"
         )
 
+    if cudf.utils.dtypes.is_mixed_with_object_dtype(lcol, rcol):
+        raise MixedTypeError("cudf doesn't support mixed type")
     if (
         np.issubdtype(ltype, np.number)
         and np.issubdtype(rtype, np.number)

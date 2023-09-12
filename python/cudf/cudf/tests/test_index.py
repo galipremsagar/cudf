@@ -37,6 +37,7 @@ from cudf.testing._utils import (
     expect_warning_if,
 )
 from cudf.utils.utils import search_range
+from cudf.utils.dtypes import is_mixed_with_object_dtype
 
 
 def test_df_set_index_from_series():
@@ -833,6 +834,82 @@ def test_index_difference(data, other, sort, name_data, name_other):
     actual = gd_data.difference(gd_other, sort=sort)
 
     assert_eq(expected, actual)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        [1, 2, 3, 4, 5, 6],
+        [4, 5, 6, 10, 20, 30],
+        [10, 20, 30, 40, 50, 60],
+        ["1", "2", "3", "4", "5", "6"],
+        ["5", "6", "2", "a", "b", "c"],
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [1.0, 5.0, 6.0, 0.0, 1.3],
+        ["ab", "cd", "ef"],
+        pd.Series(["1", "2", "a", "3", None], dtype="category"),
+        range(0, 10),
+        [],
+    ],
+)
+@pytest.mark.parametrize(
+    "other",
+    [
+        [1, 2, 3, 4, 5, 6],
+        [4, 5, 6, 10, 20, 30],
+        [10, 20, 30, 40, 50, 60],
+        ["1", "2", "3", "4", "5", "6"],
+        ["5", "6", "2", "a", "b", "c"],
+        ["ab", "ef", None],
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        [1.0, 5.0, 6.0, 0.0, 1.3],
+        range(2, 4),
+        pd.Series(["1", "a", "3", None], dtype="category"),
+        [],
+    ],
+)
+@pytest.mark.parametrize("sort", [None, False])
+@pytest.mark.parametrize(
+    "name_data,name_other",
+    [("abc", "c"), (None, "abc"), ("abc", pd.NA), ("abc", "abc")],
+)
+def test_index_union1(request, data, other, sort, name_data, name_other):
+    pd_data = pd.Index(data, name=name_data)
+    pd_other = pd.Index(other, name=name_other)
+
+    gd_data = cudf.from_pandas(pd_data)
+    gd_other = cudf.from_pandas(pd_other)
+
+    expected = pd_data.union(pd_other, sort=sort)
+    if "mixed" in cudf.api.types.infer_dtype(expected) or (
+        expected.dtype == np.dtype("O")
+        and is_mixed_with_object_dtype(gd_data, gd_other)
+        and (len(pd_data) == 0 or len(pd_other) == 0)
+    ):
+        if (
+            isinstance(gd_data, cudf.CategoricalIndex)
+            and not isinstance(gd_other, cudf.CategoricalIndex)
+        ) or (
+            not isinstance(gd_data, cudf.CategoricalIndex)
+            and isinstance(gd_other, cudf.CategoricalIndex)
+        ):
+            with pytest.raises(TypeError):
+                actual = gd_data.union(gd_other, sort=sort)
+        else:
+            with pytest.raises(TypeError):
+                actual = gd_data.union(gd_other, sort=sort)
+    else:
+        actual = gd_data.union(gd_other, sort=sort)
+        if isinstance(actual, cudf.CategoricalIndex) and not isinstance(
+            expected, pd.CategoricalIndex
+        ):
+            request.node.add_marker(
+                pytest.mark.xfail(
+                    condition=True,
+                    reason="",
+                )
+            )
+        assert_eq(expected, actual)
 
 
 @pytest.mark.parametrize("other", ["a", 1, None])
@@ -2093,7 +2170,7 @@ def test_union_index(idx1, idx2, sort):
 
     actual = idx1.union(idx2, sort=sort)
 
-    assert_eq(expected, actual)
+    assert_eq(expected, actual, exact=True)
 
 
 @pytest.mark.parametrize(

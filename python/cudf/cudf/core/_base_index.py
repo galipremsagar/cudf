@@ -528,6 +528,9 @@ class BaseIndex(Serializable):
                     (2, 'Green')],
                    )
         """
+        if not can_convert_to_column(other):
+            raise TypeError("Input must be Index or array-like")
+
         if not isinstance(other, BaseIndex):
             other = cudf.Index(other, name=self.name)
 
@@ -537,10 +540,16 @@ class BaseIndex(Serializable):
                 f"None or False; {sort} was passed."
             )
 
+        if is_mixed_with_object_dtype(self, other):
+            raise TypeError("cannot return mixed dtype")
         if not len(other) or self.equals(other):
-            return self._get_reconciled_name_object(other)
+            dtypes = [self.dtype, other.dtype]
+            common_dtype = cudf.utils.dtypes.find_common_type(dtypes)
+            return self._get_reconciled_name_object(other).astype(common_dtype)
         elif not len(self):
-            return other._get_reconciled_name_object(self)
+            dtypes = [self.dtype, other.dtype]
+            common_dtype = cudf.utils.dtypes.find_common_type(dtypes)
+            return other._get_reconciled_name_object(self).astype(common_dtype)
 
         result = self._union(other, sort=sort)
         result.name = _get_result_name(self.name, other.name)
@@ -1343,7 +1352,7 @@ class BaseIndex(Serializable):
         union_result = cudf.core.index._index_from_data({0: res._data[0]})
 
         if sort is None and len(other):
-            return union_result.sort_values()
+            return union_result.sort_values(na_position="first")
         return union_result
 
     def _intersection(self, other, sort=None):

@@ -22,6 +22,7 @@ from cudf import _lib as libcudf
 from cudf._typing import DataFrameOrSeries
 from cudf.api.types import is_integer, is_list_like, is_object_dtype
 from cudf.core import column
+from cudf.core._base_index import _get_result_name
 from cudf.core._compat import PANDAS_GE_150
 from cudf.core.frame import Frame
 from cudf.core.index import BaseIndex, _lexsorted_equal_range, as_index
@@ -233,6 +234,30 @@ class MultiIndex(Frame, BaseIndex, NotIterable):
                 "not supported"
             )
         return self
+
+    @_cudf_nvtx_annotate
+    def union(self, other, sort=None):
+        if not isinstance(other, MultiIndex):
+            msg = "other must be a MultiIndex or a list of tuples"
+            try:
+                other = MultiIndex.from_tuples(other, names=self.names)
+            except (ValueError, TypeError) as err:
+                raise TypeError(msg) from err
+
+        if sort not in {None, False}:
+            raise ValueError(
+                f"The 'sort' keyword only takes the values of "
+                f"None or False; {sort} was passed."
+            )
+
+        if not len(other) or self.equals(other):
+            return self._get_reconciled_name_object(other)
+        elif not len(self):
+            return other._get_reconciled_name_object(self)
+
+        result = self._union(other, sort=sort)
+        result.name = _get_result_name(self.name, other.name)
+        return result
 
     @_cudf_nvtx_annotate
     def rename(self, names, inplace=False):
