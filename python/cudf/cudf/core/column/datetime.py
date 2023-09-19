@@ -209,6 +209,8 @@ class DatetimeColumn(column.ColumnBase):
     ) -> "cudf.Series":
         # Workaround until following issue is fixed:
         # https://issues.apache.org/jira/browse/ARROW-9772
+        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+            return super().to_pandas(index=index, **kwargs)
 
         # Pandas supports only `datetime64[ns]`, hence the cast.
         return pd.Series(
@@ -539,7 +541,7 @@ class DatetimeColumn(column.ColumnBase):
         else:
             return False
 
-    def _with_type_metadata(self, dtype):
+    def _with_type_metadata(self, dtype, pandas_dtype=None):
         if is_datetime64tz_dtype(dtype):
             return DatetimeTZColumn(
                 data=self.base_data,
@@ -549,6 +551,8 @@ class DatetimeColumn(column.ColumnBase):
                 offset=self.offset,
                 null_count=self.null_count,
             )
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
 

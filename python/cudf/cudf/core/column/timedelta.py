@@ -148,6 +148,8 @@ class TimeDeltaColumn(ColumnBase):
     ) -> pd.Series:
         # Workaround until following issue is fixed:
         # https://issues.apache.org/jira/browse/ARROW-9772
+        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+            return super().to_pandas(index=index, **kwargs)
 
         # Pandas supports only `timedelta64[ns]`, hence the cast.
         pd_series = pd.Series(

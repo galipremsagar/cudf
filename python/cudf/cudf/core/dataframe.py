@@ -1631,7 +1631,8 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
                 )
         for name, col in out._data.items():
             out._data[name] = col._with_type_metadata(
-                tables[0]._data[name].dtype
+                tables[0]._data[name].dtype,
+                pandas_dtype=tables[0]._data[name]._pandas_dtype,
             )
 
         # Reassign index and column names
@@ -3770,6 +3771,7 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
         # No column from index is transposed with libcudf.
         source_columns = [*self._columns]
         source_dtype = source_columns[0].dtype
+        source_pandas_dtype = source_columns[0]._pandas_dtype
         if is_categorical_dtype(source_dtype):
             if any(not is_categorical_dtype(c.dtype) for c in source_columns):
                 raise ValueError("Columns must all have the same dtype")
@@ -3788,13 +3790,16 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
         if is_categorical_dtype(source_dtype):
             result_columns = [
                 codes._with_type_metadata(
-                    cudf.core.dtypes.CategoricalDtype(categories=cats)
+                    cudf.core.dtypes.CategoricalDtype(categories=cats),
+                    pandas_dtype=source_pandas_dtype,
                 )
                 for codes in result_columns
             ]
         else:
             result_columns = [
-                result_column._with_type_metadata(source_dtype)
+                result_column._with_type_metadata(
+                    source_dtype, pandas_dtype=source_pandas_dtype
+                )
                 for result_column in result_columns
             ]
 

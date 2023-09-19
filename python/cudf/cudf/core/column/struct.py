@@ -63,6 +63,8 @@ class StructColumn(ColumnBase):
     ) -> pd.Series:
         # We cannot go via Arrow's `to_pandas` because of the following issue:
         # https://issues.apache.org/jira/browse/ARROW-12680
+        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+            return super().to_pandas(index=index, **kwargs)
 
         pd_series = pd.Series(self.to_arrow().tolist(), dtype="object")
 
@@ -129,7 +131,9 @@ class StructColumn(ColumnBase):
             "Structs are not yet supported via `__cuda_array_interface__`"
         )
 
-    def _with_type_metadata(self: StructColumn, dtype: Dtype) -> StructColumn:
+    def _with_type_metadata(
+        self: StructColumn, dtype: Dtype, pandas_dtype=None
+    ) -> StructColumn:
         from cudf.core.column import IntervalColumn
         from cudf.core.dtypes import IntervalDtype
 
@@ -137,7 +141,7 @@ class StructColumn(ColumnBase):
         if isinstance(dtype, IntervalDtype):
             return IntervalColumn.from_struct_column(self, closed=dtype.closed)
         elif isinstance(dtype, StructDtype):
-            return build_struct_column(
+            res = build_struct_column(
                 names=dtype.fields.keys(),
                 children=tuple(
                     self.base_children[i]._with_type_metadata(dtype.fields[f])
@@ -148,7 +152,11 @@ class StructColumn(ColumnBase):
                 offset=self.offset,
                 null_count=self.null_count,
             )
-
+            if pandas_dtype is not None:
+                res._pandas_dtype = pandas_dtype
+            return res
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
 

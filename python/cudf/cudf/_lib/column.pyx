@@ -79,6 +79,7 @@ cdef class Column:
         self._dtype = dtype
         self._offset = offset
         self._null_count = null_count
+        self._pandas_dtype = None
         self.set_base_children(children)
         self.set_base_data(data)
         self.set_base_mask(mask)

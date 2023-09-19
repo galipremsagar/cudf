@@ -201,7 +201,9 @@ class DecimalBaseColumn(NumericalBaseColumn):
             self, quant, interpolation, sorted_indices, exact
         )
 
-        return result._with_type_metadata(self.dtype)
+        return result._with_type_metadata(
+            self.dtype, pandas_dtype=self._pandas_dtype
+        )
 
     def as_numerical_column(
         self, dtype: Dtype, **kwargs
@@ -262,11 +264,14 @@ class Decimal32Column(DecimalBaseColumn):
         )
 
     def _with_type_metadata(
-        self: "cudf.core.column.Decimal32Column", dtype: Dtype
+        self: "cudf.core.column.Decimal32Column",
+        dtype: Dtype,
+        pandas_dtype=None,
     ) -> "cudf.core.column.Decimal32Column":
         if isinstance(dtype, Decimal32Dtype):
             self.dtype.precision = dtype.precision
-
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
 
@@ -283,11 +288,14 @@ class Decimal128Column(DecimalBaseColumn):
         return super().to_arrow().cast(self.dtype.to_arrow())
 
     def _with_type_metadata(
-        self: "cudf.core.column.Decimal128Column", dtype: Dtype
+        self: "cudf.core.column.Decimal128Column",
+        dtype: Dtype,
+        pandas_dtype=None,
     ) -> "cudf.core.column.Decimal128Column":
         if isinstance(dtype, Decimal128Dtype):
             self.dtype.precision = dtype.precision
-
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
 
@@ -349,11 +357,14 @@ class Decimal64Column(DecimalBaseColumn):
         )
 
     def _with_type_metadata(
-        self: "cudf.core.column.Decimal64Column", dtype: Dtype
+        self: "cudf.core.column.Decimal64Column",
+        dtype: Dtype,
+        pandas_dtype=None,
     ) -> "cudf.core.column.Decimal64Column":
         if isinstance(dtype, Decimal64Dtype):
             self.dtype.precision = dtype.precision
-
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
 

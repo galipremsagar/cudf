@@ -225,4 +225,4 @@ class NumericalBaseColumn(ColumnBase, Scannable):
     def _scan(self, op: str) -> ColumnBase:
         return libcudf.reduce.scan(
             op.replace("cum", ""), self, True
-        )._with_type_metadata(self.dtype)
+        )._with_type_metadata(self.dtype, pandas_dtype=self._pandas_dtype)

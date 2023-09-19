@@ -22,6 +22,7 @@ class Column:
     _children: Tuple[ColumnBase, ...]
     _base_children: Tuple[ColumnBase, ...]
     _distinct_count: Dict[bool, int]
+    _pandas_dtype: DtypeObj
 
     def __init__(
         self,

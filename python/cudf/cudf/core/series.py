@@ -1619,7 +1619,9 @@ class Series(SingleColumnFrame, IndexedFrame, Serializable):
         col = concat_columns([o._column for o in objs])
 
         if len(objs):
-            col = col._with_type_metadata(objs[0].dtype)
+            col = col._with_type_metadata(
+                objs[0].dtype, pandas_dtype=objs[0]._column._pandas_dtype
+            )
 
         return cls(data=col, index=index, name=name)
 

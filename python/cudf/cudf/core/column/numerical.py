@@ -51,6 +51,7 @@ from cudf.utils.dtypes import (
     min_column_type,
     min_signed_type,
     np_dtypes_to_pandas_dtypes,
+    pandas_dtypes_to_np_dtypes,
     numeric_normalize_types,
 )
 
@@ -656,7 +657,9 @@ class NumericalColumn(NumericalBaseColumn):
 
         return False
 
-    def _with_type_metadata(self: ColumnBase, dtype: Dtype) -> ColumnBase:
+    def _with_type_metadata(
+        self: ColumnBase, dtype: Dtype, pandas_dtype=None
+    ) -> ColumnBase:
         if isinstance(dtype, CategoricalDtype):
             return column.build_categorical_column(
                 categories=dtype.categories._values,
@@ -667,7 +670,8 @@ class NumericalColumn(NumericalBaseColumn):
                 offset=self.offset,
                 null_count=self.null_count,
             )
-
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
     def to_pandas(
@@ -676,8 +680,14 @@ class NumericalColumn(NumericalBaseColumn):
         nullable: bool = False,
         **kwargs,
     ) -> pd.Series:
-        if nullable and self.dtype in np_dtypes_to_pandas_dtypes:
-            pandas_nullable_dtype = np_dtypes_to_pandas_dtypes[self.dtype]
+        if (nullable and self.dtype in np_dtypes_to_pandas_dtypes) or (
+            self._pandas_dtype in pandas_dtypes_to_np_dtypes
+            or isinstance(self._pandas_dtype, pd.ArrowDtype)
+        ):
+            if isinstance(self._pandas_dtype, pd.ArrowDtype):
+                pandas_nullable_dtype = self._pandas_dtype
+            else:
+                pandas_nullable_dtype = np_dtypes_to_pandas_dtypes[self.dtype]
             arrow_array = self.to_arrow()
             pandas_array = pandas_nullable_dtype.__from_arrow__(arrow_array)
             pd_series = pd.Series(pandas_array, copy=False)

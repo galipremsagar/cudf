@@ -39,7 +39,7 @@ from cudf.core.column import column, datetime
 from cudf.core.column.column import ColumnBase
 from cudf.core.column.methods import ColumnMethods
 from cudf.utils.docutils import copy_docstring
-from cudf.utils.dtypes import can_convert_to_column
+from cudf.utils.dtypes import can_convert_to_column, pandas_dtypes_to_np_dtypes
 
 
 def str_to_boolean(column: StringColumn):
@@ -5739,8 +5739,15 @@ class StringColumn(column.ColumnBase):
         nullable: bool = False,
         **kwargs,
     ) -> pd.Series:
-        if nullable:
-            pandas_array = pd.StringDtype().__from_arrow__(self.to_arrow())
+        if nullable or (
+            self._pandas_dtype in pandas_dtypes_to_np_dtypes
+            or isinstance(self._pandas_dtype, pd.ArrowDtype)
+        ):
+            if isinstance(self._pandas_dtype, pd.ArrowDtype):
+                pd_dtype = self._pandas_dtype
+            else:
+                pd_dtype = pd.StringDtype()
+            pandas_array = pd_dtype.__from_arrow__(self.to_arrow())
             pd_series = pd.Series(pandas_array, copy=False)
         else:
             pd_series = self.to_arrow().to_pandas(**kwargs)

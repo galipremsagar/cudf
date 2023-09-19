@@ -213,7 +213,12 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         # way, but must consume the parameter to avoid passing it to PyArrow
         # (which does not recognize it).
         kwargs.pop("nullable", None)
-        pd_series = self.to_arrow().to_pandas(**kwargs)
+        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+            arrow_array = self.to_arrow()
+            pandas_array = self._pandas_dtype.__from_arrow__(arrow_array)
+            pd_series = pd.Series(pandas_array, copy=False)
+        else:
+            pd_series = self.to_arrow().to_pandas(**kwargs)
 
         if index is not None:
             pd_series.index = index
@@ -291,7 +296,9 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
 
     def dropna(self, drop_nan: bool = False) -> ColumnBase:
         # The drop_nan argument is only used for numerical columns.
-        return drop_nulls([self])[0]._with_type_metadata(self.dtype)
+        return drop_nulls([self])[0]._with_type_metadata(
+            self.dtype, pandas_dtype=self._pandas_dtype
+        )
 
     def to_arrow(self) -> pa.Array:
         """Convert to PyArrow Array
@@ -446,7 +453,9 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         `copy-on-write` is enabled.
         """
         result = libcudf.copying.copy_column(self)
-        return result._with_type_metadata(self.dtype)
+        return result._with_type_metadata(
+            self.dtype, pandas_dtype=self._pandas_dtype
+        )
 
     def copy(self, deep: bool = True) -> Self:
         """
@@ -565,7 +574,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if stride == 1:
             return libcudf.copying.column_slice(self, [start, stop])[
                 0
-            ]._with_type_metadata(self.dtype)
+            ]._with_type_metadata(self.dtype, pandas_dtype=self._pandas_dtype)
         else:
             # Need to create a gather map for given slice with stride
             gather_map = arange(
@@ -682,11 +691,11 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if is_bool_dtype(key.dtype):
             return libcudf.copying.boolean_mask_scatter([value], [self], key)[
                 0
-            ]._with_type_metadata(self.dtype)
+            ]._with_type_metadata(self.dtype, pandas_dtype=self._pandas_dtype)
         else:
             return libcudf.copying.scatter([value], key, [self])[
                 0
-            ]._with_type_metadata(self.dtype)
+            ]._with_type_metadata(self.dtype, pandas_dtype=self._pandas_dtype)
 
     def _check_scatter_key_length(
         self, num_keys: int, value: Union[cudf.core.scalar.Scalar, ColumnBase]
@@ -715,7 +724,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         """
         return libcudf.replace.replace_nulls(
             input_col=self, replacement=value, method=method, dtype=dtype
-        )._with_type_metadata(self.dtype)
+        )._with_type_metadata(self.dtype, pandas_dtype=self._pandas_dtype)
 
     def isnull(self) -> ColumnBase:
         """Identify missing values in a Column."""
@@ -848,7 +857,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
 
         return libcudf.copying.gather([self], indices, nullify=nullify)[
             0
-        ]._with_type_metadata(self.dtype)
+        ]._with_type_metadata(self.dtype, pandas_dtype=self._pandas_dtype)
 
     def isin(self, values: Sequence) -> ColumnBase:
         """Check whether values are contained in the Column.
@@ -1119,7 +1128,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             raise ValueError("boolean_mask is not boolean type.")
 
         return apply_boolean_mask([self], mask)[0]._with_type_metadata(
-            self.dtype
+            self.dtype, pandas_dtype=self._pandas_dtype
         )
 
     def argsort(
@@ -1163,7 +1172,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         Get unique values in the data
         """
         return drop_duplicates([self], keep="first")[0]._with_type_metadata(
-            self.dtype
+            self.dtype, pandas_dtype=self._pandas_dtype
         )
 
     def serialize(self) -> Tuple[dict, list]:
@@ -1321,7 +1330,9 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         """
         return self.dtype
 
-    def _with_type_metadata(self: ColumnBase, dtype: Dtype) -> ColumnBase:
+    def _with_type_metadata(
+        self: ColumnBase, dtype: Dtype, pandas_dtype=None
+    ) -> ColumnBase:
         """
         Copies type metadata from self onto other, returning a new column.
 
@@ -2025,9 +2036,13 @@ def as_column(
             if isinstance(
                 arbitrary.array, pd.core.arrays.masked.BaseMaskedArray
             ):
-                return as_column(arbitrary.array)
+                col = as_column(arbitrary.array)
+                col._pandas_dtype = arbitrary.dtype
+                return col
             elif PANDAS_GE_150 and isinstance(arbitrary.dtype, pd.ArrowDtype):
-                return as_column(pa.array(arbitrary.array, from_pandas=True))
+                col = as_column(pa.array(arbitrary.array, from_pandas=True))
+                col._pandas_dtype = arbitrary.dtype
+                return col
             elif isinstance(arbitrary.dtype, pd.SparseDtype):
                 raise NotImplementedError(
                     f"{arbitrary.dtype} is not supported. Convert first to "
@@ -2078,6 +2093,7 @@ def as_column(
             else:
                 pyarrow_type = arbitrary.dtype
             data = as_column(pyarrow_array, dtype=pyarrow_type)
+            data._pandas_dtype = arbitrary.dtype
         if dtype is not None:
             data = data.astype(dtype)
 

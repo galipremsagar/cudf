@@ -974,6 +974,8 @@ class CategoricalColumn(column.ColumnBase):
     def to_pandas(
         self, index: Optional[pd.Index] = None, **kwargs
     ) -> pd.Series:
+        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+            return super().to_pandas(index=index, **kwargs)
         if self.categories.dtype.kind == "f":
             new_mask = bools_to_mask(self.notnull())
             col = column.build_categorical_column(
@@ -1411,10 +1413,12 @@ class CategoricalColumn(column.ColumnBase):
         )
 
     def _with_type_metadata(
-        self: CategoricalColumn, dtype: Dtype
+        self: CategoricalColumn,
+        dtype: Dtype,
+        pandas_dtype=None,
     ) -> CategoricalColumn:
         if isinstance(dtype, CategoricalDtype):
-            return column.build_categorical_column(
+            res = column.build_categorical_column(
                 categories=dtype.categories._values,
                 codes=column.build_column(
                     self.codes.base_data, dtype=self.codes.dtype
@@ -1425,6 +1429,11 @@ class CategoricalColumn(column.ColumnBase):
                 offset=self.codes.offset,
                 null_count=self.codes.null_count,
             )
+            if pandas_dtype is not None:
+                res._pandas_dtype = pandas_dtype
+            return res
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
     def set_categories(

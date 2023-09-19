@@ -183,7 +183,9 @@ class ListColumn(ColumnBase):
         return other
 
     def _with_type_metadata(
-        self: "cudf.core.column.ListColumn", dtype: Dtype
+        self: "cudf.core.column.ListColumn",
+        dtype: Dtype,
+        pandas_dtype=None,
     ) -> "cudf.core.column.ListColumn":
         if isinstance(dtype, ListDtype):
             return column.build_list_column(
@@ -196,7 +198,8 @@ class ListColumn(ColumnBase):
                 offset=self.offset,
                 null_count=self.null_count,
             )
-
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
     def copy(self, deep: bool = True):
