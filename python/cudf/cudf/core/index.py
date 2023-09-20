@@ -486,7 +486,7 @@ class RangeIndex(BaseIndex, BinaryOperand):
         return _maybe_convert_to_default_type(dtype)
 
     @_cudf_nvtx_annotate
-    def to_pandas(self, nullable=False):
+    def to_pandas(self, nullable=no_default):
         return pd.RangeIndex(
             start=self._start,
             stop=self._stop,
@@ -1540,7 +1540,7 @@ class GenericIndex(SingleColumnFrame, BaseIndex):
     def any(self):
         return self._values.any()
 
-    def to_pandas(self, nullable=False):
+    def to_pandas(self, nullable=no_default):
         return pd.Index(
             self._values.to_pandas(nullable=nullable), name=self.name
         )
@@ -2486,7 +2486,7 @@ class DatetimeIndex(GenericIndex):
         return cudf.core.tools.datetimes._to_iso_calendar(self)
 
     @_cudf_nvtx_annotate
-    def to_pandas(self, nullable=False):
+    def to_pandas(self, nullable=no_default):
         # TODO: no need to convert to nanos with Pandas 2.x
         if isinstance(self.dtype, pd.DatetimeTZDtype):
             nanos = self._values.astype(
@@ -2810,7 +2810,7 @@ class TimedeltaIndex(GenericIndex):
         return value
 
     @_cudf_nvtx_annotate
-    def to_pandas(self, nullable=False):
+    def to_pandas(self, nullable=no_default):
         return pd.TimedeltaIndex(
             self._values.to_pandas(),
             name=self.name,
@@ -3277,11 +3277,21 @@ class StringIndex(GenericIndex):
         super().__init__(values, **kwargs)
 
     @_cudf_nvtx_annotate
-    def to_pandas(self, nullable=False):
+    def to_pandas(self, nullable=no_default):
+
+        if (
+            nullable in (True, no_default)
+            and self._values._pandas_dtype is not None
+        ):
+            dtype = self._values._pandas_dtype
+        elif nullable is True:
+            dtype = pd.StringDtype()
+        else:
+            dtype = "object"
         return pd.Index(
             self.to_numpy(na_value=None),
             name=self.name,
-            dtype=pd.StringDtype() if nullable else "object",
+            dtype=dtype,
         )
 
     @_cudf_nvtx_annotate

@@ -12,6 +12,7 @@ import pyarrow as pa
 import cudf
 from cudf import _lib as libcudf
 from cudf._typing import ColumnBinaryOperand, DatetimeLikeScalar, Dtype
+from cudf.api.extensions import no_default
 from cudf.api.types import is_scalar, is_timedelta64_dtype
 from cudf.core.buffer import Buffer, acquire_spill_lock
 from cudf.core.column import ColumnBase, column, string
@@ -144,11 +145,13 @@ class TimeDeltaColumn(ColumnBase):
         )
 
     def to_pandas(
-        self, index=None, nullable: bool = False, **kwargs
+        self, index=None, nullable: bool = no_default, **kwargs
     ) -> pd.Series:
         # Workaround until following issue is fixed:
         # https://issues.apache.org/jira/browse/ARROW-9772
-        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+        if nullable is no_default and isinstance(
+            self._pandas_dtype, pd.ArrowDtype
+        ):
             return super().to_pandas(index=index, **kwargs)
 
         # Pandas supports only `timedelta64[ns]`, hence the cast.

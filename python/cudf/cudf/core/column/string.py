@@ -28,6 +28,7 @@ from cudf import _lib as libcudf
 from cudf._lib import string_casting as str_cast, strings as libstrings
 from cudf._lib.column import Column
 from cudf._lib.types import size_type_dtype
+from cudf.api.extensions import no_default
 from cudf.api.types import (
     is_integer,
     is_list_dtype,
@@ -5736,14 +5737,19 @@ class StringColumn(column.ColumnBase):
     def to_pandas(
         self,
         index: Optional[pd.Index] = None,
-        nullable: bool = False,
+        nullable: bool = no_default,
         **kwargs,
     ) -> pd.Series:
-        if nullable or (
-            self._pandas_dtype in pandas_dtypes_to_np_dtypes
-            or isinstance(self._pandas_dtype, pd.ArrowDtype)
+        if (nullable is True) or (
+            nullable is no_default
+            and (
+                self._pandas_dtype in pandas_dtypes_to_np_dtypes
+                or isinstance(
+                    self._pandas_dtype, (pd.ArrowDtype, pd.StringDtype)
+                )
+            )
         ):
-            if isinstance(self._pandas_dtype, pd.ArrowDtype):
+            if isinstance(self._pandas_dtype, (pd.ArrowDtype, pd.StringDtype)):
                 pd_dtype = self._pandas_dtype
             else:
                 pd_dtype = pd.StringDtype()

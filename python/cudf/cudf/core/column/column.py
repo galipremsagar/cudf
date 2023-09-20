@@ -984,13 +984,23 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if is_categorical_dtype(dtype):
             return self.as_categorical_column(dtype, **kwargs)
 
+        if (
+            isinstance(dtype, str)
+            and dtype in pandas_dtypes_alias_to_cudf_alias
+        ) or isinstance(dtype, pd.core.dtypes.base.ExtensionDtype):
+            pandas_dtype = pd.api.types.pandas_dtype(dtype)
+        else:
+            pandas_dtype = None
         dtype = (
             pandas_dtypes_alias_to_cudf_alias.get(dtype, dtype)
             if isinstance(dtype, str)
             else pandas_dtypes_to_np_dtypes.get(dtype, dtype)
         )
         if _is_non_decimal_numeric_dtype(dtype):
-            return self.as_numerical_column(dtype, **kwargs)
+            res = self.as_numerical_column(dtype, **kwargs)
+            if pandas_dtype is not None:
+                res._pandas_dtype = pandas_dtype
+            return res
         elif is_categorical_dtype(dtype):
             return self.as_categorical_column(dtype, **kwargs)
         elif cudf.dtype(dtype).type in {
@@ -1005,7 +1015,14 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
                     f"Casting to {dtype} is not supported, use "
                     "`.astype('str')` instead."
                 )
-            return self.as_string_column(dtype, **kwargs)
+            str_col = self.as_string_column(dtype, **kwargs)
+            if (
+                isinstance(dtype, str) and dtype.startswith("string")
+            ) or isinstance(dtype, pd.StringDtype):
+                str_col._pandas_dtype = pd.api.types.pandas_dtype(dtype)
+            if pandas_dtype is not None:
+                str_col._pandas_dtype = pandas_dtype
+            return str_col
         elif is_list_dtype(dtype):
             if not self.dtype == dtype:
                 raise NotImplementedError(
@@ -1933,6 +1950,7 @@ def as_column(
     * pyarrow array
     * pandas.Categorical objects
     """
+    # import pdb;pdb.set_trace()
     if isinstance(arbitrary, ColumnBase):
         if dtype is not None:
             return arbitrary.astype(dtype)
@@ -2269,6 +2287,7 @@ def as_column(
             ):
                 raise MixedTypeError("Cannot create column with mixed types")
             data = as_column(pyarrow_array, dtype=arb_dtype)
+            data._pandas_dtype = arbitrary.dtype
         else:
             data = as_column(
                 pa.array(
@@ -2357,6 +2376,7 @@ def as_column(
 
             pa_type = None
             np_type = None
+            pandas_dtype = None
             try:
                 if dtype is not None:
                     if is_categorical_dtype(dtype) or is_interval_dtype(dtype):
@@ -2424,6 +2444,7 @@ def as_column(
                         # Need this special case handling for bool dtypes,
                         # since 'boolean' & 'pd.BooleanDtype' are not
                         # understood by np.dtype below.
+                        pandas_dtype = pd.api.types.pandas_dtype(dtype)
                         dtype = "bool"
                     np_type = np.dtype(dtype).type
                     pa_type = np_to_pa_dtype(np.dtype(dtype))
@@ -2488,6 +2509,13 @@ def as_column(
                     dtype=dtype,
                     nan_as_null=nan_as_null,
                 )
+                if isinstance(
+                    arbitrary,
+                    (pd.arrays.DatetimeArray, pd.arrays.TimedeltaArray),
+                ):
+                    data._pandas_dtype = arbitrary.dtype
+                if pandas_dtype is not None:
+                    data._pandas_dtype = pandas_dtype
             except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as e:
                 if isinstance(e, MixedTypeError):
                     raise TypeError(str(e))

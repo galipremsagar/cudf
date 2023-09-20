@@ -28,6 +28,7 @@ from cudf._typing import (
     DtypeObj,
     ScalarLike,
 )
+from cudf.api.extensions import no_default
 from cudf.api.types import (
     is_bool_dtype,
     is_float_dtype,
@@ -677,12 +678,15 @@ class NumericalColumn(NumericalBaseColumn):
     def to_pandas(
         self,
         index: Optional[pd.Index] = None,
-        nullable: bool = False,
+        nullable: bool = no_default,
         **kwargs,
     ) -> pd.Series:
-        if (nullable and self.dtype in np_dtypes_to_pandas_dtypes) or (
-            self._pandas_dtype in pandas_dtypes_to_np_dtypes
-            or isinstance(self._pandas_dtype, pd.ArrowDtype)
+        if (nullable is True and self.dtype in np_dtypes_to_pandas_dtypes) or (
+            nullable is no_default
+            and (
+                self._pandas_dtype in pandas_dtypes_to_np_dtypes
+                or isinstance(self._pandas_dtype, pd.ArrowDtype)
+            )
         ):
             if isinstance(self._pandas_dtype, pd.ArrowDtype):
                 pandas_nullable_dtype = self._pandas_dtype

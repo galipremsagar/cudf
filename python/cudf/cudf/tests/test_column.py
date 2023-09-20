@@ -548,4 +548,7 @@ def test_astype_with_aliases(alias, expect_dtype, data):
     pd_data = pd.Series(data)
     gd_data = cudf.Series.from_pandas(pd_data)
 
-    assert_eq(pd_data.astype(expect_dtype), gd_data.astype(alias))
+    assert_eq(
+        pd_data.astype(expect_dtype),
+        gd_data.astype(alias).to_pandas(nullable=False),
+    )

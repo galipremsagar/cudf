@@ -4165,7 +4165,7 @@ def test_series_astype_pandas_nullable(dtype, np_dtype, pd_dtype):
     expect = source.astype(np_dtype)
     got = source.astype(pd_dtype)
 
-    assert_eq(expect, got)
+    assert_eq(expect.to_pandas(nullable=True), got)
 
 
 @pytest.mark.parametrize("dtype", NUMERIC_TYPES)

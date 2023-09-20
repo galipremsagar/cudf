@@ -21,6 +21,7 @@ from cudf._typing import (
     DtypeObj,
     ScalarLike,
 )
+from cudf.api.extensions import no_default
 from cudf.api.types import (
     is_datetime64_dtype,
     is_datetime64tz_dtype,
@@ -204,12 +205,14 @@ class DatetimeColumn(column.ColumnBase):
     def to_pandas(
         self,
         index: Optional[pd.Index] = None,
-        nullable: bool = False,
+        nullable: bool = no_default,
         **kwargs,
     ) -> "cudf.Series":
         # Workaround until following issue is fixed:
         # https://issues.apache.org/jira/browse/ARROW-9772
-        if isinstance(self._pandas_dtype, pd.ArrowDtype):
+        if nullable is no_default and isinstance(
+            self._pandas_dtype, pd.ArrowDtype
+        ):
             return super().to_pandas(index=index, **kwargs)
 
         # Pandas supports only `datetime64[ns]`, hence the cast.
@@ -345,9 +348,15 @@ class DatetimeColumn(column.ColumnBase):
         self, dtype: Dtype, format=None, **kwargs
     ) -> "cudf.core.column.StringColumn":
         if format is None:
-            format = _dtype_to_format_conversion.get(
-                self.dtype.name, "%Y-%m-%d %H:%M:%S"
-            )
+            if cudf.get_option("mode.pandas_compatible"):
+                format = _get_datetime_format(
+                    self, dtype=self.dtype, time_unit=self.time_unit
+                )
+            else:
+                format = _dtype_to_format_conversion.get(
+                    self.dtype.name, "%Y-%m-%d %H:%M:%S"
+                )
+
         if format in _DATETIME_SPECIAL_FORMATS:
             names = as_column(_DATETIME_NAMES)
         else:
@@ -579,7 +588,7 @@ class DatetimeTZColumn(DatetimeColumn):
     def to_pandas(
         self,
         index: Optional[pd.Index] = None,
-        nullable: bool = False,
+        nullable: bool = no_default,
         **kwargs,
     ) -> "cudf.Series":
         return self._local_time.to_pandas().dt.tz_localize(
@@ -690,3 +699,40 @@ def _resolve_mixed_dtypes(
     rhs_time_unit = cudf.utils.dtypes.get_time_unit(rhs)
     rhs_unit = units.index(rhs_time_unit)
     return cudf.dtype(f"{base_type}[{units[max(lhs_unit, rhs_unit)]}]")
+
+
+def _get_datetime_format(col, dtype, time_unit):
+    format = _dtype_to_format_conversion.get(dtype.name, "%Y-%m-%d %H:%M:%S")
+    if format.endswith("f"):
+        sub_second_res_len = 3
+    else:
+        sub_second_res_len = 0
+
+    has_nanos = time_unit in {"ns"} and col.get_dt_field("nanosecond").any()
+    has_micros = (
+        time_unit in {"ns", "us"} and col.get_dt_field("microsecond").any()
+    )
+    has_millis = (
+        time_unit in {"ns", "us", "ms"}
+        and col.get_dt_field("millisecond").any()
+    )
+    has_seconds = col.get_dt_field("second").any()
+    has_minutes = col.get_dt_field("minute").any()
+    has_hours = col.get_dt_field("hour").any()
+    if sub_second_res_len:
+        if has_nanos:
+            # format should be intact and rest of the
+            # following conditions shouldn't execute.
+            pass
+        elif has_micros:
+            format = format[:-sub_second_res_len] + ".%6f"
+        elif has_millis:
+            format = format[:-sub_second_res_len] + ".%3f"
+        elif has_seconds or has_minutes or has_hours:
+            format = format[:-4]
+        else:
+            format = format.split(" ")[0]
+    else:
+        if not (has_seconds or has_minutes or has_hours):
+            format = format.split(" ")[0]
+    return format
