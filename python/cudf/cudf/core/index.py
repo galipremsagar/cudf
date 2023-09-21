@@ -3353,10 +3353,13 @@ def as_index(arbitrary, nan_as_null=None, **kwargs) -> BaseIndex:
     if isinstance(arbitrary, cudf.MultiIndex):
         return arbitrary
     elif isinstance(arbitrary, BaseIndex):
-        if _is_same_name(arbitrary.name, kwargs["name"]):
+        dtype = kwargs.get("dtype", None)
+        if _is_same_name(arbitrary.name, kwargs["name"]) and dtype is not None:
             return arbitrary
         idx = arbitrary.copy(deep=False)
         idx.rename(kwargs["name"], inplace=True)
+        if dtype is not None:
+            idx = idx.astype(dtype)
         return idx
     elif isinstance(arbitrary, ColumnBase):
         res = _index_from_data({kwargs.get("name", None): arbitrary})
