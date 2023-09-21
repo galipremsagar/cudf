@@ -243,7 +243,7 @@ cdef class Column:
                 f"got {type(value).__name__}"
             )
 
-        return cudf.core.column.build_column(
+        result_col = cudf.core.column.build_column(
             data=self.data,
             dtype=self.dtype,
             mask=mask,
@@ -251,6 +251,8 @@ cdef class Column:
             offset=0,
             children=self.children
         )
+        result_col._pandas_dtype = self._pandas_dtype
+        return result_col
 
     @property
     def null_count(self):

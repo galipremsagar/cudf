@@ -1169,9 +1169,17 @@ class Frame(BinaryOperand, Scannable):
             dtype if dtype is not None else col.dtype
             for (dtype, col) in zip(override_dtypes, other._data.values())
         )
-        for (name, col), dtype in zip(self._data.items(), dtypes):
+        pandas_dtypes = (
+            dtype if dtype is not None else col._pandas_dtype
+            for (dtype, col) in zip(override_dtypes, other._data.values())
+        )
+        for (name, col), dtype, pandas_dtype in zip(
+            self._data.items(), dtypes, pandas_dtypes
+        ):
             self._data.set_by_label(
-                name, col._with_type_metadata(dtype), validate=False
+                name,
+                col._with_type_metadata(dtype, pandas_dtype=pandas_dtype),
+                validate=False,
             )
 
         return self

@@ -62,6 +62,19 @@ pyarrow_dtypes_to_pandas_dtypes = {
     pa.string(): pd.StringDtype(),
 }
 
+np_dtypes_to_pandas_arrow_dtypes = {
+    np.dtype("uint8"): pd.ArrowDtype(pa.uint8()),
+    np.dtype("uint16"): pd.ArrowDtype(pa.uint16()),
+    np.dtype("uint32"): pd.ArrowDtype(pa.uint32()),
+    np.dtype("uint64"): pd.ArrowDtype(pa.uint64()),
+    np.dtype("int8"): pd.ArrowDtype(pa.int8()),
+    np.dtype("int16"): pd.ArrowDtype(pa.int16()),
+    np.dtype("int32"): pd.ArrowDtype(pa.int32()),
+    np.dtype("int64"): pd.ArrowDtype(pa.int64()),
+    np.dtype("bool_"): pd.ArrowDtype(pa.bool_()),
+    np.dtype("object"): pd.ArrowDtype(pa.string()),
+}
+
 pandas_dtypes_to_np_dtypes = {
     pd.UInt8Dtype(): np.dtype("uint8"),
     pd.UInt16Dtype(): np.dtype("uint16"),
@@ -756,6 +769,15 @@ def _dtype_can_hold_element(dtype: np.dtype, element) -> bool:
         return False
 
     raise NotImplementedError(f"Unsupported dtype: {dtype}")
+
+
+def _get_pandas_dtype(result_dtype, original_dtype):
+    if isinstance(original_dtype, pd.ArrowDtype):
+        return np_dtypes_to_pandas_arrow_dtypes[result_dtype]
+    elif isinstance(original_dtype, pd.api.extensions.ExtensionDtype):
+        return np_dtypes_to_pandas_dtypes[result_dtype]
+    else:
+        raise TypeError("hi")
 
 
 def _get_base_dtype(dtype: DtypeObj) -> DtypeObj:

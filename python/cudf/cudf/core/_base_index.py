@@ -1835,7 +1835,9 @@ class BaseIndex(Serializable):
         >>> cudf.Index.from_pandas(pdi, nan_as_null=False)
         Float64Index([10.0, 20.0, 30.0, nan], dtype='float64')
         """
-        if not isinstance(index, pd.Index):
+        if not isinstance(index, pd.Index) or isinstance(
+            index, pd.PeriodIndex
+        ):
             raise TypeError("not a pandas.Index")
 
         ind = cudf.Index(column.as_column(index, nan_as_null=nan_as_null))

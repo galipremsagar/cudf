@@ -13,6 +13,7 @@ from cudf._typing import ScalarLike
 from cudf.core.column import ColumnBase
 from cudf.core.missing import NA
 from cudf.core.mixins import Scannable
+from cudf.utils.dtypes import _get_pandas_dtype
 
 
 class NumericalBaseColumn(ColumnBase, Scannable):
@@ -109,10 +110,13 @@ class NumericalBaseColumn(ColumnBase, Scannable):
                 NumericalBaseColumn,
                 cudf.core.column.column_empty(
                     row_count=len(q), dtype=self.dtype, masked=True
-                ),
+                )._with_type_metadata(self.dtype, self._pandas_dtype),
             )
         else:
             result = self._numeric_quantile(q, interpolation, exact)
+            result._pandas_dtype = _get_pandas_dtype(
+                result.dtype, self._pandas_dtype
+            )
         if return_scalar:
             scalar_result = result.element_indexing(0)
             if interpolation in {"lower", "higher", "nearest"}:

@@ -478,22 +478,24 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if deep:
             return self.force_deep_copy()
         else:
+            res_col = build_column(
+                data=self.base_data
+                if self.base_data is None
+                else self.base_data.copy(deep=False),
+                dtype=self.dtype,
+                mask=self.base_mask
+                if self.base_mask is None
+                else self.base_mask.copy(deep=False),
+                size=self.size,
+                offset=self.offset,
+                children=tuple(
+                    col.copy(deep=False) for col in self.base_children
+                ),
+            )
+            res_col._pandas_dtype = self._pandas_dtype
             return cast(
                 Self,
-                build_column(
-                    data=self.base_data
-                    if self.base_data is None
-                    else self.base_data.copy(deep=False),
-                    dtype=self.dtype,
-                    mask=self.base_mask
-                    if self.base_mask is None
-                    else self.base_mask.copy(deep=False),
-                    size=self.size,
-                    offset=self.offset,
-                    children=tuple(
-                        col.copy(deep=False) for col in self.base_children
-                    ),
-                ),
+                res_col,
             )
 
     def view(self, dtype: Dtype) -> ColumnBase:
@@ -1356,6 +1358,8 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         When ``self`` is a nested column, recursively apply this function on
         the children of ``self``.
         """
+        if pandas_dtype is not None:
+            self._pandas_dtype = pandas_dtype
         return self
 
     def _label_encoding(
@@ -1949,7 +1953,6 @@ def as_column(
     * pyarrow array
     * pandas.Categorical objects
     """
-    # import pdb;pdb.set_trace()
     if isinstance(arbitrary, ColumnBase):
         if dtype is not None:
             return arbitrary.astype(dtype)
@@ -1991,6 +1994,8 @@ def as_column(
             arbitrary = arbitrary.astype(arb_dtype)
             current_dtype = arb_dtype
 
+        if desc["shape"] is not None and len(desc["shape"]) > 1:
+            raise TypeError("Unable to create a column from a 2-d array")
         if (
             desc["strides"] is not None
             and not (arbitrary.itemsize,) == arbitrary.strides
@@ -2310,6 +2315,7 @@ def as_column(
         data = ColumnBase.from_scalar(arbitrary, length if length else 1)
     elif isinstance(arbitrary, pd.core.arrays.masked.BaseMaskedArray):
         data = as_column(pa.Array.from_pandas(arbitrary), dtype=dtype)
+        data._pandas_dtype = arbitrary.dtype
     elif (
         (
             isinstance(arbitrary, pd.DatetimeIndex)
@@ -2511,6 +2517,14 @@ def as_column(
                 if isinstance(
                     arbitrary,
                     (pd.arrays.DatetimeArray, pd.arrays.TimedeltaArray),
+                ):
+                    data._pandas_dtype = arbitrary.dtype
+                elif (
+                    isinstance(arbitrary, pd.Index)
+                    and not isinstance(arbitrary, pd.MultiIndex)
+                    and isinstance(
+                        arbitrary.dtype, pd.core.dtypes.base.ExtensionDtype
+                    )
                 ):
                     data._pandas_dtype = arbitrary.dtype
                 if pandas_dtype is not None:

@@ -54,6 +54,7 @@ from cudf.utils.dtypes import (
     np_dtypes_to_pandas_dtypes,
     pandas_dtypes_to_np_dtypes,
     numeric_normalize_types,
+    _get_pandas_dtype,
 )
 
 from .numerical_base import NumericalBaseColumn
@@ -284,7 +285,19 @@ class NumericalColumn(NumericalBaseColumn):
 
         lhs, rhs = (other, self) if reflect else (self, other)
 
-        return libcudf.binaryop.binaryop(lhs, rhs, op, out_dtype)
+        res = libcudf.binaryop.binaryop(lhs, rhs, op, out_dtype)
+        if getattr(lhs, "_pandas_dtype", None) is not None:
+            pandas_dtype = _get_pandas_dtype(
+                out_dtype, getattr(lhs, "_pandas_dtype", None)
+            )
+        elif getattr(rhs, "_pandas_dtype", None) is not None:
+            pandas_dtype = _get_pandas_dtype(
+                out_dtype, getattr(rhs, "_pandas_dtype", None)
+            )
+        else:
+            pandas_dtype = None
+        res._pandas_dtype = pandas_dtype
+        return res
 
     def nans_to_nulls(self: NumericalColumn) -> NumericalColumn:
         # Only floats can contain nan.
