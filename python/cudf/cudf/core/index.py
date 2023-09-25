@@ -3480,6 +3480,8 @@ class Index(BaseIndex, metaclass=IndexMeta):
             raise NotImplementedError(
                 "tupleize_cols != True is not yet supported"
             )
+        if isinstance(data, pd.PeriodIndex):
+            raise NotImplementedError("hi")
 
         res = as_index(
             data,

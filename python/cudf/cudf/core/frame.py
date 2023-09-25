@@ -1165,14 +1165,18 @@ class Frame(BinaryOperand, Scannable):
         """
         if override_dtypes is None:
             override_dtypes = itertools.repeat(None)
+            pandas_dtypes = (
+                dtype if dtype is not None else col._pandas_dtype
+                for (dtype, col) in zip(override_dtypes, other._data.values())
+            )
+        else:
+            override_dtypes = list(override_dtypes)
+            pandas_dtypes = itertools.repeat(None)
         dtypes = (
             dtype if dtype is not None else col.dtype
             for (dtype, col) in zip(override_dtypes, other._data.values())
         )
-        pandas_dtypes = (
-            dtype if dtype is not None else col._pandas_dtype
-            for (dtype, col) in zip(override_dtypes, other._data.values())
-        )
+
         for (name, col), dtype, pandas_dtype in zip(
             self._data.items(), dtypes, pandas_dtypes
         ):

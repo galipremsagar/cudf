@@ -460,7 +460,11 @@ class NumericalColumn(NumericalBaseColumn):
         skipna = True if skipna is None else skipna
 
         if self._can_return_nan(skipna=skipna):
-            return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+            if is_float_dtype(self.dtype):
+                return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+            else:
+                return cudf.Scalar(None, dtype=self.dtype).value
+            # return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
 
         col = self.nans_to_nulls() if skipna else self
         return super(NumericalColumn, col)._process_for_reduction(
@@ -709,7 +713,7 @@ class NumericalColumn(NumericalBaseColumn):
             pandas_array = pandas_nullable_dtype.__from_arrow__(arrow_array)
             pd_series = pd.Series(pandas_array, copy=False)
         elif str(self.dtype) in NUMERIC_TYPES and not self.has_nulls():
-            pd_series = pd.Series(self.values_host, copy=False)
+            pd_series = pd.Series(self.values_host, copy=False, dtype=self.dtype)
         else:
             pd_series = self.to_arrow().to_pandas(**kwargs)
 

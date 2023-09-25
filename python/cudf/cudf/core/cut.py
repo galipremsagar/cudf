@@ -111,6 +111,8 @@ def cut(
     ...        index=['a', 'b', 'c', 'd', 'e'])
     >>> cudf.cut(s, 3)
     """
+    if cudf.get_option("mode.pandas_compatible"):
+        raise NotImplementedError("hi")
     left_inclusive = False
     right_inclusive = True
     # saving the original input x for use in case its a series

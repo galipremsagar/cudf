@@ -137,7 +137,10 @@ class SingleColumnFrame(Frame, NotIterable):
         copy: bool = True,
         na_value=None,
     ) -> numpy.ndarray:  # noqa: D102
-        return super().to_numpy(dtype, copy, na_value).flatten()
+        res = super().to_numpy(dtype, copy, na_value).flatten()
+        if self._column._pandas_dtype is not None:
+            return res.astype("object")
+        return res
 
     @classmethod
     @_cudf_nvtx_annotate

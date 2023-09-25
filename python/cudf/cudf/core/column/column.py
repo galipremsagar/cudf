@@ -52,6 +52,7 @@ from cudf.api.types import (
     _is_non_decimal_numeric_dtype,
     infer_dtype,
     is_bool_dtype,
+    is_float_dtype,
     is_categorical_dtype,
     is_datetime64_dtype,
     is_datetime64tz_dtype,
@@ -230,13 +231,16 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         Return a numpy representation of the Column.
         """
         if len(self) == 0:
-            return np.array([], dtype=self.dtype)
+            res = np.array([], dtype=self.dtype)
 
         if self.has_nulls():
             raise ValueError("Column must have no nulls.")
 
         with acquire_spill_lock():
-            return self.data_array_view(mode="read").copy_to_host()
+            res = self.data_array_view(mode="read").copy_to_host()
+        if self._pandas_dtype is not None:
+            return res.astype("object")
+        return res
 
     @property
     def values(self) -> "cupy.ndarray":
@@ -1049,10 +1053,14 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             return self.as_numerical_column(dtype, **kwargs)
 
     def as_categorical_column(self, dtype, **kwargs) -> ColumnBase:
+        # import pdb;pdb.set_trace()
         if "ordered" in kwargs:
             ordered = kwargs["ordered"]
         else:
-            ordered = False
+            if isinstance(dtype, (cudf.CategoricalDtype, pd.CategoricalDtype)):
+                ordered = dtype.ordered
+            else:
+                ordered = False
 
         # Re-label self w.r.t. the provided categories
         if (
@@ -1308,11 +1316,20 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             The minimum number of entries for the reduction, otherwise the
             reduction returns NaN.
         """
+        # import pdb;pdb.set_trace()
         preprocessed = self._process_for_reduction(
             skipna=skipna, min_count=min_count
         )
+
         if isinstance(preprocessed, ColumnBase):
-            return libcudf.reduce.reduce(op, preprocessed, **kwargs)
+            result = libcudf.reduce.reduce(op, preprocessed, **kwargs)
+            if isinstance(result, (np.floating, float)) and np.isnan(result):
+                if is_float_dtype(self.dtype):
+                    return result
+                else:
+                    return cudf.Scalar(None, dtype=self.dtype).value
+                # return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+            return result
         return preprocessed
 
     @property
@@ -1329,7 +1346,10 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
                 result_col = self.dropna()
         else:
             if self.has_nulls():
-                return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+                if is_float_dtype(self.dtype):
+                    return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+                else:
+                    return cudf.Scalar(None, dtype=self.dtype).value
 
         result_col = self
 
@@ -1339,7 +1359,10 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if min_count > 0:
             valid_count = len(result_col) - result_col.null_count
             if valid_count < min_count:
-                return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+                if is_float_dtype(self.dtype):
+                    return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+                else:
+                    return cudf.Scalar(None, dtype=self.dtype).value
         return result_col
 
     def _reduction_result_dtype(self, reduction_op: str) -> Dtype:
@@ -1953,6 +1976,8 @@ def as_column(
     * pyarrow array
     * pandas.Categorical objects
     """
+    if isinstance(arbitrary, pd.core.arrays.period.PeriodArray):
+        raise NotImplementedError("hi")
     if isinstance(arbitrary, ColumnBase):
         if dtype is not None:
             return arbitrary.astype(dtype)
@@ -2005,11 +2030,13 @@ def as_column(
         data = as_buffer(arbitrary, exposed=cudf.get_option("copy_on_write"))
         col = build_column(data, dtype=current_dtype, mask=mask)
 
-        if dtype is not None:
-            col = col.astype(dtype)
+        # if dtype is not None:
+        #     col = col.astype(dtype)
 
-        if isinstance(col, cudf.core.column.CategoricalColumn):
-            return col
+        if is_categorical_dtype(dtype):
+            # isinstance(col, cudf.core.column.CategoricalColumn):
+            # return col
+            pass
         elif np.issubdtype(col.dtype, np.floating):
             if nan_as_null or (mask is None and nan_as_null is None):
                 mask = libcudf.transform.nans_to_nulls(col.fillna(np.nan))
@@ -2017,6 +2044,8 @@ def as_column(
         elif np.issubdtype(col.dtype, np.datetime64):
             if nan_as_null or (mask is None and nan_as_null is None):
                 col = _make_copy_replacing_NaT_with_null(col)
+        if dtype is not None:
+            col = col.astype(dtype)
         return col
 
     elif isinstance(arbitrary, (pa.Array, pa.ChunkedArray)):
@@ -2172,16 +2201,16 @@ def as_column(
             arbitrary = np.ascontiguousarray(arbitrary)
 
         delayed_cast = False
-        if dtype is not None:
-            try:
-                dtype = np.dtype(dtype)
-            except TypeError:
-                # Some `dtype`'s can't be parsed by `np.dtype`
-                # for which we will have to cast after the column
-                # has been constructed.
-                delayed_cast = True
-            else:
-                arbitrary = arbitrary.astype(dtype)
+        # if dtype is not None:
+        #     try:
+        #         dtype = np.dtype(dtype)
+        #     except TypeError:
+        #         # Some `dtype`'s can't be parsed by `np.dtype`
+        #         # for which we will have to cast after the column
+        #         # has been constructed.
+        #         delayed_cast = True
+        #     else:
+        #         arbitrary = arbitrary.astype(dtype)
 
         if arb_dtype.kind == "M":
             time_unit = get_time_unit(arbitrary)
@@ -2241,16 +2270,25 @@ def as_column(
         elif arb_dtype.kind in ("f"):
             if arb_dtype == np.dtype("float16"):
                 arb_dtype = np.dtype("float32")
-            arb_dtype = cudf.dtype(arb_dtype if dtype is None else dtype)
+            # arb_dtype = cudf.dtype(arb_dtype if dtype is None else dtype)
             data = as_column(
                 cupy.asarray(arbitrary, dtype=arb_dtype),
                 nan_as_null=nan_as_null,
+                dtype=cudf.dtype(arb_dtype if dtype is None else dtype),
             )
         else:
             data = as_column(cupy.asarray(arbitrary), nan_as_null=nan_as_null)
 
-        if delayed_cast:
-            data = data.astype(cudf.dtype(dtype))
+
+        if dtype is not None:
+            try:
+                dtype = np.dtype(dtype)
+            except TypeError:
+                # Some `dtype`'s can't be parsed by `np.dtype`
+                    # for which we will have to cast after the column
+                    # has been constructed.
+                dtype = cudf.dtype(dtype)
+            data = data.astype(dtype)
 
     elif isinstance(arbitrary, pd.arrays.PandasArray):
         if is_categorical_dtype(arbitrary.dtype):
@@ -2509,6 +2547,14 @@ def as_column(
                     raise MixedTypeError(
                         "Cannot create column with mixed types"
                     )
+                if (
+                    isinstance(pyarrow_array, pa.NullArray)
+                    and pa_type is None
+                    and dtype is None
+                ):
+                    inferred = infer_dtype(arbitrary)
+                    if inferred == "datetime":
+                        dtype = "datetime64[ns]"
                 data = as_column(
                     pyarrow_array,
                     dtype=dtype,

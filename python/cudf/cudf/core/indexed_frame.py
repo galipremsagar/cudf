@@ -4050,13 +4050,15 @@ class IndexedFrame(Frame):
             out = self
         else:
             out = self.copy()
-
+        # import pdb;pdb.set_trace()
         if axis in (1, "columns"):
             target = _get_host_unique(target)
 
             _drop_columns(out, target, errors)
         elif axis in (0, "index"):
             dropped = _drop_rows_by_labels(out, target, level, errors)
+            if isinstance(self._index, cudf.Index):
+                dropped._index.name = self._index.name
 
             if columns is not None:
                 columns = _get_host_unique(columns)
@@ -5423,10 +5425,11 @@ def _drop_rows_by_labels(
     else:
         if errors == "raise" and not labels.isin(obj.index).all():
             raise KeyError("One or more values not found in axis")
-
+        # import pdb;pdb.set_trace()
         key_df = cudf.DataFrame(index=labels)
         if isinstance(obj, cudf.DataFrame):
-            return obj.join(key_df, how="leftanti")
+            res = obj.join(key_df, how="leftanti")
+            res.index = res.index.astype(obj.index)
         else:
             res = obj.to_frame(name="tmp").join(key_df, how="leftanti")["tmp"]
             res.name = obj.name

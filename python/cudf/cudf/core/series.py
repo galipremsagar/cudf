@@ -78,6 +78,7 @@ from cudf.core.indexed_frame import (
     _get_label_range_or_mask,
     _indices_from_labels,
     doc_reset_index_template,
+    _is_same_dtype,
 )
 from cudf.core.resample import SeriesResampler
 from cudf.core.single_column_frame import SingleColumnFrame
@@ -211,6 +212,9 @@ class _SeriesIlocIndexer(_FrameIndexer):
         # coerce value into a scalar or column
         if is_scalar(value):
             value = to_cudf_compatible_scalar(value)
+            if cudf.utils.utils._isnat(value) and not isinstance(self._frame._column, (cudf.core.column.DatetimeColumn, cudf.core.column.TimedeltaColumn)):
+                raise TypeError("hi")
+
         elif not (
             isinstance(value, (list, dict))
             and isinstance(
@@ -227,6 +231,8 @@ class _SeriesIlocIndexer(_FrameIndexer):
             and hasattr(value, "dtype")
             and _is_non_decimal_numeric_dtype(value.dtype)
         ):
+            if cudf.get_option("mode.pandas_compatible") and _is_non_decimal_numeric_dtype(self._frame._column.dtype) and not _is_same_dtype(self._frame._column.dtype, getattr(value, "dtype", None)):
+                raise TypeError("hi")
             # normalize types if necessary:
             # In contrast to Column.__setitem__ (which downcasts the value to
             # the dtype of the column) here we upcast the series to the
@@ -238,6 +244,8 @@ class _SeriesIlocIndexer(_FrameIndexer):
                     self._frame._column.astype(to_dtype), inplace=True
                 )
 
+        if _is_non_decimal_numeric_dtype(self._frame._column.dtype) and value is not None and not _is_same_dtype(self._frame._column.dtype, getattr(value, "dtype", None)) and value is not cudf.NA:
+            raise TypeError("hi")
         self._frame._column[key] = value
 
 

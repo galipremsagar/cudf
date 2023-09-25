@@ -5957,9 +5957,14 @@ class DataFrame(IndexedFrame, Serializable, GetAttrGetItemMixin):
             if axis == 2:
                 return getattr(as_column(result), op)(**kwargs)
             else:
-                return Series._from_data(
+                
+                if len(self._data.columns) > 0 and any(c.dtype != self._data.columns[0].dtype for c in self._data.columns):
+                    raise ValueError("Columns must all have the same dtype")
+                res = Series._from_data(
                     {None: result}, as_index(source._data.names)
                 )
+                res = res.astype(self._data.columns[0].dtype)
+                return res
         elif axis == 1:
             return source._apply_cupy_method_axis_1(op, **kwargs)
         else:

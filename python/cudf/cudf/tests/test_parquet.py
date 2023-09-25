@@ -1333,7 +1333,7 @@ def test_delta_binary(nrows, add_nulls, tmpdir):
     )
     cdf = cudf.read_parquet(pdf_fname)
     pcdf = cudf.from_pandas(test_pdf)
-    assert_eq(cdf, pcdf)
+    assert_eq(cdf.to_pandas(nullable=True), pcdf)
 
 
 @pytest.mark.parametrize(

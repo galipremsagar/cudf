@@ -9,6 +9,7 @@ import warnings
 from functools import partial
 from typing import FrozenSet, Set, Union
 
+import pandas as pd
 import numpy as np
 from nvtx import annotate
 
@@ -264,10 +265,15 @@ def pa_mask_buffer_to_mask(mask_buf, size):
 
 def _isnat(val):
     """Wraps np.isnat to return False instead of error on invalid inputs."""
+    if val is pd.NaT:
+        return True
     if not isinstance(val, (np.datetime64, np.timedelta64, str)):
         return False
     else:
-        return val in {"NaT", "NAT"} or np.isnat(val)
+        try:
+            return val in {"NaT", "NAT"} or np.isnat(val)
+        except TypeError:
+            return False
 
 
 def _fillna_natwise(col):

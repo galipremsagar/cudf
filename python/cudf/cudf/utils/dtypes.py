@@ -469,7 +469,7 @@ def _get_nan_for_dtype(dtype):
         dtype
     ) or pd.api.types.is_timedelta64_dtype(dtype):
         time_unit, _ = np.datetime_data(dtype)
-        return dtype.type("nat", time_unit)
+        return cudf.Scalar(None, dtype=dtype).value#dtype.type("nat", time_unit)
     elif dtype.kind == "f":
         return dtype.type("nan")
     else:
@@ -772,10 +772,15 @@ def _dtype_can_hold_element(dtype: np.dtype, element) -> bool:
 
 
 def _get_pandas_dtype(result_dtype, original_dtype):
+    if original_dtype is None:
+        return None
     if isinstance(original_dtype, pd.ArrowDtype):
         return np_dtypes_to_pandas_arrow_dtypes[result_dtype]
     elif isinstance(original_dtype, pd.api.extensions.ExtensionDtype):
-        return np_dtypes_to_pandas_dtypes[result_dtype]
+        try:
+            return np_dtypes_to_pandas_dtypes[result_dtype]
+        except KeyError:
+            return np_dtypes_to_pandas_dtypes[np.dtype(result_dtype)]
     else:
         raise TypeError("hi")
 
