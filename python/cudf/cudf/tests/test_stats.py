@@ -40,8 +40,8 @@ def test_series_reductions(method, dtype, skipna):
         arr[[2, 5, 14, 19, 50, 70]] = np.nan
     sr = cudf.Series(arr)
     sr[~mask] = None
-    psr = sr.to_pandas()
-    psr[~mask] = np.nan
+    psr = sr.to_pandas(nullable=True)
+    psr[~mask] = None
 
     def call_test(sr, skipna):
         fn = getattr(sr, method)
@@ -49,10 +49,13 @@ def test_series_reductions(method, dtype, skipna):
             return fn(ddof=1, skipna=skipna)
         else:
             return fn(skipna=skipna)
-
+    import pdb;pdb.set_trace()
     expect, got = call_test(psr, skipna=skipna), call_test(sr, skipna=skipna)
-
-    np.testing.assert_approx_equal(expect, got)
+    
+    if expect is pd.NA and got is cudf.NA:
+        pass
+    else:
+        np.testing.assert_approx_equal(expect, got)
 
 
 @pytest.mark.parametrize("method", methods)

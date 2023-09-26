@@ -1316,7 +1316,6 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             The minimum number of entries for the reduction, otherwise the
             reduction returns NaN.
         """
-        # import pdb;pdb.set_trace()
         preprocessed = self._process_for_reduction(
             skipna=skipna, min_count=min_count
         )
@@ -1324,11 +1323,12 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if isinstance(preprocessed, ColumnBase):
             result = libcudf.reduce.reduce(op, preprocessed, **kwargs)
             if isinstance(result, (np.floating, float)) and np.isnan(result):
-                if is_float_dtype(self.dtype):
-                    return result
-                else:
-                    return cudf.Scalar(None, dtype=self.dtype).value
                 # return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+                return cudf.Scalar(None, dtype=self.dtype).value
+            #     if is_float_dtype(self.dtype):
+            #         return result
+            #     else:
+            #         return cudf.Scalar(None, dtype=self.dtype).value
             return result
         return preprocessed
 
@@ -1346,10 +1346,11 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
                 result_col = self.dropna()
         else:
             if self.has_nulls():
-                if is_float_dtype(self.dtype):
-                    return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
-                else:
-                    return cudf.Scalar(None, dtype=self.dtype).value
+                return cudf.Scalar(None, dtype=self.dtype).value
+                # if is_float_dtype(self.dtype):
+                #     return cudf.Scalar(None, dtype=self.dtype).value
+                # else:
+                #     return cudf.Scalar(None, dtype=self.dtype).value
 
         result_col = self
 
@@ -1359,10 +1360,11 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if min_count > 0:
             valid_count = len(result_col) - result_col.null_count
             if valid_count < min_count:
-                if is_float_dtype(self.dtype):
-                    return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
-                else:
-                    return cudf.Scalar(None, dtype=self.dtype).value
+                return cudf.Scalar(None, dtype=self.dtype).value
+                # if is_float_dtype(self.dtype):
+                #     return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+                # else:
+                #     return cudf.Scalar(None, dtype=self.dtype).value
         return result_col
 
     def _reduction_result_dtype(self, reduction_op: str) -> Dtype:

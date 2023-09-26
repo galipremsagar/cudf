@@ -1398,7 +1398,7 @@ def test_timedelta_reductions(data, op, dtype):
     actual = getattr(sr, op)()
     expected = getattr(psr, op)()
 
-    if np.isnat(expected.to_numpy()) and np.isnat(actual):
+    if expected is pd.NaT and actual is cudf.NaT:
         assert True
     else:
         assert_eq(expected.to_numpy(), actual)

@@ -170,7 +170,9 @@ def assert_eq(left, right, **kwargs):
             assert np.array_equal(left, right)
     else:
         # Use the overloaded __eq__ of the operands
-        if left == right:
+        if left is right:
+            return True
+        elif left == right:
             return True
         elif any(np.issubdtype(type(x), np.floating) for x in (left, right)):
             np.testing.assert_almost_equal(left, right)

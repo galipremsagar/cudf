@@ -341,14 +341,16 @@ class TimeDeltaColumn(ColumnBase):
         return libcudf.unary.cast(self, dtype=dtype)
 
     def mean(self, skipna=None, dtype: Dtype = np.float64) -> pd.Timedelta:
+        res = self.as_numerical.mean(skipna=skipna, dtype=dtype)
         return pd.Timedelta(
-            self.as_numerical.mean(skipna=skipna, dtype=dtype),
+            pd.NaT if res is cudf.NA else res,
             unit=self.time_unit,
         )
 
     def median(self, skipna: Optional[bool] = None) -> pd.Timedelta:
+        res = self.as_numerical.median(skipna=skipna)
         return pd.Timedelta(
-            self.as_numerical.median(skipna=skipna), unit=self.time_unit
+            pd.NaT if res is cudf.NA else res, unit=self.time_unit
         )
 
     def isin(self, values: Sequence) -> ColumnBase:
@@ -368,7 +370,7 @@ class TimeDeltaColumn(ColumnBase):
             return_scalar=return_scalar,
         )
         if return_scalar:
-            return pd.Timedelta(result, unit=self.time_unit)
+            return pd.Timedelta(pd.NaT if result is cudf.NA else result, unit=self.time_unit)
         return result.astype(self.dtype)
 
     def sum(
@@ -377,13 +379,14 @@ class TimeDeltaColumn(ColumnBase):
         min_count: int = 0,
         dtype: Optional[Dtype] = None,
     ) -> pd.Timedelta:
+        res = self.as_numerical.sum(  # type: ignore
+                skipna=skipna, min_count=min_count, dtype=dtype
+            )
         return pd.Timedelta(
             # Since sum isn't overridden in Numerical[Base]Column, mypy only
             # sees the signature from Reducible (which doesn't have the extra
             # parameters from ColumnBase._reduce) so we have to ignore this.
-            self.as_numerical.sum(  # type: ignore
-                skipna=skipna, min_count=min_count, dtype=dtype
-            ),
+            pd.NaT if res is cudf.NA else res,
             unit=self.time_unit,
         )
 
@@ -394,10 +397,11 @@ class TimeDeltaColumn(ColumnBase):
         dtype: Dtype = np.float64,
         ddof: int = 1,
     ) -> pd.Timedelta:
+        res = self.as_numerical.std(
+            skipna=skipna, min_count=min_count, ddof=ddof, dtype=dtype
+        )
         return pd.Timedelta(
-            self.as_numerical.std(
-                skipna=skipna, min_count=min_count, ddof=ddof, dtype=dtype
-            ),
+            pd.NaT if res is cudf.NA else res,
             unit=self.time_unit,
         )
 
