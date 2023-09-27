@@ -413,6 +413,7 @@ class IndexedFrame(Frame):
         2   6  24
         3  10  34
         """
+        # import pdb;pdb.set_trace()
         cast_to_int = op in ("cumsum", "cumprod")
         skipna = True if skipna is None else skipna
 

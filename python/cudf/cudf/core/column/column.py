@@ -1316,19 +1316,20 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
             The minimum number of entries for the reduction, otherwise the
             reduction returns NaN.
         """
+        # import pdb;pdb.set_trace()
         preprocessed = self._process_for_reduction(
             skipna=skipna, min_count=min_count
         )
-
+        
         if isinstance(preprocessed, ColumnBase):
             result = libcudf.reduce.reduce(op, preprocessed, **kwargs)
             if isinstance(result, (np.floating, float)) and np.isnan(result):
                 # return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
-                return cudf.Scalar(None, dtype=self.dtype).value
-            #     if is_float_dtype(self.dtype):
-            #         return result
-            #     else:
-            #         return cudf.Scalar(None, dtype=self.dtype).value
+                # return cudf.Scalar(None, dtype=self.dtype).value
+                if is_float_dtype(self.dtype):
+                    return result
+                else:
+                    return cudf.Scalar(None, dtype=self.dtype).value
             return result
         return preprocessed
 
@@ -1344,6 +1345,8 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
         if skipna:
             if self.has_nulls():
                 result_col = self.dropna()
+            else:
+                result_col = self
         else:
             if self.has_nulls():
                 return cudf.Scalar(None, dtype=self.dtype).value
@@ -1352,7 +1355,7 @@ class ColumnBase(Column, Serializable, BinaryOperand, Reducible):
                 # else:
                 #     return cudf.Scalar(None, dtype=self.dtype).value
 
-        result_col = self
+            result_col = self
 
         # TODO: If and when pandas decides to validate that `min_count` >= 0 we
         # should insert comparable behavior.

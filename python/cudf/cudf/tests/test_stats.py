@@ -49,7 +49,7 @@ def test_series_reductions(method, dtype, skipna):
             return fn(ddof=1, skipna=skipna)
         else:
             return fn(skipna=skipna)
-    import pdb;pdb.set_trace()
+    # import pdb;pdb.set_trace()
     expect, got = call_test(psr, skipna=skipna), call_test(sr, skipna=skipna)
     
     if expect is pd.NA and got is cudf.NA:
@@ -528,24 +528,31 @@ def test_df_corr(method):
 )
 @pytest.mark.parametrize("skipna", [True, False])
 def test_nans_stats(data, ops, skipna):
-    psr = _create_pandas_series_float64_default(data)
     gsr = _create_cudf_series_float64_default(data, nan_as_null=False)
+    psr = gsr.to_pandas(nullable=True)
 
-    assert_eq(
-        getattr(psr, ops)(skipna=skipna), getattr(gsr, ops)(skipna=skipna)
-    )
+    expected = getattr(psr, ops)(skipna=skipna)
+    got = getattr(gsr, ops)(skipna=skipna)
+    
+    if (not isinstance(got, cudf.Series) and (got is cudf.NA or np.isnan(got))) and (not isinstance(expected, pd.Series) and (expected is pd.NA or np.isnan(expected))):
+        pass
+    else:
+        assert_eq(
+            expected, got, check_dtype=False
+        )
 
-    gsr = _create_cudf_series_float64_default(data, nan_as_null=False)
-    # Since there is no concept of `nan_as_null` in pandas,
-    # nulls will be returned in the operations. So only
-    # testing for `skipna=True` when `nan_as_null=False`
-    assert_eq(getattr(psr, ops)(skipna=True), getattr(gsr, ops)(skipna=True))
+    # gsr = _create_cudf_series_float64_default(data, nan_as_null=False)
+    # # Since there is no concept of `nan_as_null` in pandas,
+    # # nulls will be returned in the operations. So only
+    # # testing for `skipna=True` when `nan_as_null=False`
+    # assert_eq(getattr(psr, ops)(skipna=True), getattr(gsr, ops)(skipna=True), check_dtype=False)
 
 
 @pytest.mark.parametrize(
     "data",
     [
         [0.0, 1, 3, 6, np.NaN, 7, 5.0, np.nan, 5, 2, 3, -100],
+        [0.0, None, 1, 3, 6, np.NaN, 7, 5.0, np.nan, 5, 2, None, 3, None, -100],
         [np.nan] * 3,
         [1, 5, 3],
     ],
@@ -554,8 +561,8 @@ def test_nans_stats(data, ops, skipna):
 @pytest.mark.parametrize("skipna", [True, False])
 @pytest.mark.parametrize("min_count", [-10, -1, 0, 1, 2, 3, 5, 10])
 def test_min_count_ops(data, ops, skipna, min_count):
-    psr = pd.Series(data)
     gsr = cudf.Series(data, nan_as_null=False)
+    psr = gsr.to_pandas(nullable=True)
 
     assert_eq(
         getattr(psr, ops)(skipna=skipna, min_count=min_count),

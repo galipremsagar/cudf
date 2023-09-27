@@ -459,15 +459,31 @@ class NumericalColumn(NumericalBaseColumn):
     ) -> Union[NumericalColumn, ScalarLike]:
         skipna = True if skipna is None else skipna
 
-        if self._can_return_nan(skipna=skipna):
-            if is_float_dtype(self.dtype):
-                return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
-            else:
+        if skipna:
+            if self.valid_count < min_count:
                 return cudf.Scalar(None, dtype=self.dtype).value
+            if self.has_nulls(include_nan=False):
+                result_col = self.dropna(drop_nan=False)
+            else:
+                result_col = self
+        else:
+            if self.has_nulls(include_nan=False) or len(self) < min_count:
+                return cudf.Scalar(None, dtype=self.dtype).value
+            else:
+                result_col = self
+
+        # if self.has_nulls(include_nan=False) or self.valid_count < min_count:
+        #     return cudf.Scalar(None, dtype=self.dtype).value
+        # if self._can_return_nan(skipna=skipna):
+        #     if is_float_dtype(self.dtype) and self.nan_count != 0:
+        #         return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
+        #     else:
+        #         raise TypeError("hi")
+            
             # return cudf.utils.dtypes._get_nan_for_dtype(self.dtype)
 
-        col = self.nans_to_nulls() if skipna else self
-        return super(NumericalColumn, col)._process_for_reduction(
+        # col = self.nans_to_nulls() if skipna else self
+        return super(NumericalColumn, result_col)._process_for_reduction(
             skipna=skipna, min_count=min_count
         )
 
