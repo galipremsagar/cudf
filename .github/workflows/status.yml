@@ -36,6 +36,8 @@ jobs:
           COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           REPO_NAME: ${{ github.repository }}
+          ATTEMPTS: ${{ github.event.workflow_run.run_attempt }}
+          JOB_ID: ${{ github.event.workflow_run.jobs[0].id }}
         run: |
           CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
           CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
@@ -46,7 +48,7 @@ jobs:
           # Use default values if any field is missing
           if [ -z "$CUSTOM_CONTEXT" ] || [ "$CUSTOM_CONTEXT" = "null" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
           if [ -z "$CUSTOM_DESCRIPTION" ] || [ "$CUSTOM_DESCRIPTION" = "null" ]; then CUSTOM_DESCRIPTION="Custom CI Status description"; fi
-          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID"; fi
+          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/attempts/$ATTEMPTS#summary-$JOB_ID"; fi                                                                                            
           if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
 
 
@@ -54,6 +56,8 @@ jobs:
           echo $CUSTOM_DESCRIPTION
           echo $CUSTOM_TARGET_URL
           echo $CUSTOM_STATE
+          echo $ATTEMPTS
+          echo $JOB_ID
 
           # Create status
           curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
