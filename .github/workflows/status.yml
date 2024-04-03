@@ -42,7 +42,7 @@ jobs:
           COMMIT_SHA="${{ github.event.workflow_run.head_sha }}"
           WORKFLOW_RUN_ID="${{ github.event.workflow_run.id }}"
           REPO_NAME="${{ github.repository }}"
-          DEFAULT_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID"
+          DEFAULT_TARGET_URL="https://www.google.com"
 
           # Use default values if any field is missing
           if [ -z "$CUSTOM_CONTEXT" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
