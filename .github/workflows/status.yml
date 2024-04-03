@@ -45,11 +45,12 @@ jobs:
           DEFAULT_TARGET_URL="https://www.google.com"
 
           # Use default values if any field is missing
-          if [ -z "$CUSTOM_CONTEXT" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
-          if [ -z "$CUSTOM_DESCRIPTION" ]; then CUSTOM_DESCRIPTION="Custom CI Status description"; fi
-          if [ -z "$CUSTOM_TARGET_URL" ]; then CUSTOM_TARGET_URL=$DEFAULT_TARGET_URL; fi
-          if [ -z "$CUSTOM_STATE" ]; then CUSTOM_STATE="success"; fi
-          
+          if [ -z "$CUSTOM_CONTEXT" ] || [ "$CUSTOM_CONTEXT" = "null" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
+          if [ -z "$CUSTOM_DESCRIPTION" ] || [ "$CUSTOM_DESCRIPTION" = "null" ]; then CUSTOM_DESCRIPTION="Custom CI Status description"; fi
+          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL=$DEFAULT_TARGET_URL; fi
+          if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
+
+
           echo $CUSTOM_CONTEXT
           echo $CUSTOM_DESCRIPTION
           echo $CUSTOM_TARGET_URL
