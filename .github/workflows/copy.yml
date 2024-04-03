@@ -12,7 +12,7 @@ jobs:
       - name: Echo abc
         run: echo 'abc'
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -26,10 +26,5 @@ jobs:
         with:
           name: gh-status
           path: gh-status.json
-      - name: Download artifact
-        uses: actions/download-artifact@v3
-        with:
-          name: gh-status
-          path: downloaded_artifacts/
 
 # abc
