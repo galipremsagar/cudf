@@ -20,6 +20,8 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
           name: gh-status
           path: downloaded_artifacts/
       - name: Read artifact JSON
