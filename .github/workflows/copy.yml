@@ -26,5 +26,10 @@ jobs:
         with:
           name: gh-status
           path: gh-status.json
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: gh-status
+          path: downloaded_artifacts/
 
 # abc
