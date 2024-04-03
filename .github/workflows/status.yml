@@ -18,11 +18,12 @@ jobs:
         with:
           python-version: '3.x'
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: dawidd6/action-download-artifact@v3
         with:
           name: gh-status
           path: downloaded_artifacts/
-          token: ${{ secrets.PAT }}
+          workflow: copy.yml
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Read artifact JSON
         id: read_artifact
         run: |
@@ -56,5 +57,3 @@ jobs:
             -d "{\"state\":\"$CUSTOM_STATE\",\"target_url\":\"$CUSTOM_TARGET_URL\",\"description\":\"$CUSTOM_DESCRIPTION\",\"context\":\"$CUSTOM_CONTEXT\"}"
 
 #abc
-permissions:
-   actions: read
