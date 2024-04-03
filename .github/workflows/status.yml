@@ -56,3 +56,5 @@ jobs:
             -d "{\"state\":\"$CUSTOM_STATE\",\"target_url\":\"$CUSTOM_TARGET_URL\",\"description\":\"$CUSTOM_DESCRIPTION\",\"context\":\"$CUSTOM_CONTEXT\"}"
 
 #abc
+permissions:
+   actions: read
