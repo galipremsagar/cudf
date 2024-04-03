@@ -37,7 +37,6 @@ jobs:
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           REPO_NAME: ${{ github.repository }}
           ATTEMPTS: ${{ github.event.workflow_run.run_attempt }}
-          JOB_ID: ${{ github.event.workflow_run.jobs[0].id }}
         run: |
           CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
           CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
@@ -51,7 +50,12 @@ jobs:
           if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/attempts/$ATTEMPTS#summary-$JOB_ID"; fi                                                                                            
           if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
 
+          # Authenticate gh CLI
+          echo "$GITHUB_TOKEN" | gh auth login --with-token
 
+          # Fetch the first job ID from the workflow run
+          JOB_ID=$(gh api repos/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/jobs | jq -r '.jobs[0].id')
+          echo "Job ID: $JOB_ID"
           echo $CUSTOM_CONTEXT
           echo $CUSTOM_DESCRIPTION
           echo $CUSTOM_TARGET_URL
@@ -65,4 +69,4 @@ jobs:
             "https://api.github.com/repos/$REPO_NAME/statuses/$COMMIT_SHA" \
             -d "{\"state\":\"$CUSTOM_STATE\",\"target_url\":\"$CUSTOM_TARGET_URL\",\"description\":\"$CUSTOM_DESCRIPTION\",\"context\":\"$CUSTOM_CONTEXT\"}"
 
-#abc12
+#abc123
