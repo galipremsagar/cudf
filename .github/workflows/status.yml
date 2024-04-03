@@ -51,7 +51,7 @@ jobs:
           if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
 
           # Authenticate gh CLI
-          echo "$GITHUB_TOKEN" | gh auth login --with-token
+          # echo "$GITHUB_TOKEN" | gh auth login --with-token
 
           # Fetch the first job ID from the workflow run
           JOB_ID=$(gh api repos/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/jobs | jq -r '.jobs[0].id')
