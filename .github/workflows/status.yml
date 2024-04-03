@@ -20,10 +20,9 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          run-id: 8542092687
-          github-token: ${{ github.token }}
           name: gh-status
           path: downloaded_artifacts/
+          token: ${{ secrets.PAT }}
       - name: Read artifact JSON
         id: read_artifact
         run: |
