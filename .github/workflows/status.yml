@@ -35,7 +35,7 @@ jobs:
           ARTIFACT_CONTENT: ${{ steps.read_artifact.outputs.content }}
           COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
-          REPO_NAME: ${{ github.repository }}"
+          REPO_NAME: ${{ github.repository }}
         run: |
           CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
           CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
