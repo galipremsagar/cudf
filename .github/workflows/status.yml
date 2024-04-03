@@ -22,7 +22,8 @@ jobs:
         with:
           name: gh-status
           path: downloaded_artifacts/
-          run_id: ${{ github.event.workflow_run.id }}
+        #   run_id: ${{ github.event.workflow_run.id }}
+          search_artifacts: true
           github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Read artifact JSON
         id: read_artifact
