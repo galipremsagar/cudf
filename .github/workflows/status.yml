@@ -13,19 +13,20 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: gh-status
           path: downloaded_artifacts/
-
       - name: Read artifact JSON
         id: read_artifact
         run: |
           CONTENT=$(cat downloaded_artifacts/gh-status.json)
           echo "::set-output name=content::$CONTENT"
-
       - name: Create status
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
