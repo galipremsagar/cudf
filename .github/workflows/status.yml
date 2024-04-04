@@ -17,6 +17,7 @@ jobs:
           name: gh-status
           path: downloaded_artifacts/
           # workflow: copy.yml
+          run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Read artifact JSON
         id: read_artifact
