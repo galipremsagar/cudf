@@ -63,7 +63,10 @@ jobs:
         run: |
           # Assuming you have the job ID from somewhere or it's not needed anymore
           # If you still need to fetch the job ID, you would insert the logic here
-
+          JOB_ID=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" | jq -r '.jobs[] | select(.name == "echo_job") | .id')
           CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
           CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
           CUSTOM_DESCRIPTION=$(echo $CONTENT_JSON | jq -r .description)
