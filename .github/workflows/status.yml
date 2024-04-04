@@ -10,6 +10,20 @@ jobs:
   process_artifacts:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      deployments: read
+      id-token: read
+      issues: read
+      discussions: read
+      packages: read
+      pages: read
+      pull-requests: read
+      repository-projects: read
+      security-events: read
+      statuses: write
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
