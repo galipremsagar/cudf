@@ -19,21 +19,15 @@ jobs:
           # workflow: copy.yml
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Read artifact JSON
-        id: read_artifact
-        run: |
-          CONTENT=$(cat downloaded_artifacts/gh-status.json)
-          echo "content=$CONTENT" >> $GITHUB_OUTPUT
       - name: Create status
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ARTIFACT_CONTENT: ${{ steps.read_artifact.outputs.content }}
           COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           REPO_NAME: ${{ github.repository }}
           ATTEMPTS: ${{ github.event.workflow_run.run_attempt }}
         run: |
-          CONTENT_JSON=$(echo "$ARTIFACT_CONTENT" | jq .)
+          CONTENT_JSON=$(jq . < downloaded_artifacts/gh-status.json)
           JOB_NAME=$(echo "$CONTENT_JSON" | jq -r .job_name)
           JOB_ID=$(gh api repos/"$REPO_NAME"/actions/runs/"$WORKFLOW_RUN_ID"/jobs --paginate --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")
           CUSTOM_CONTEXT=$(echo "$CONTENT_JSON" | jq -r .context)
