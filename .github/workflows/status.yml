@@ -33,8 +33,9 @@ jobs:
           REPO_NAME: ${{ github.repository }}
           ATTEMPTS: ${{ github.event.workflow_run.run_attempt }}
         run: |
-          JOB_ID=$(gh api repos/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/jobs --paginate --jq '.jobs[] | select(.name == "echo_job") | .id')
           CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
+          JOB_NAME=$(echo $CONTENT_JSON | jq -r .job_name)
+          JOB_ID=$(gh api repos/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/jobs --paginate --jq '.jobs[] | select(.name == $JOB_NAME) | .id')
           CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
           CUSTOM_DESCRIPTION=$(echo $CONTENT_JSON | jq -r .description)
           CUSTOM_TARGET_URL=$(echo $CONTENT_JSON | jq -r .target_url)
@@ -51,6 +52,7 @@ jobs:
           # Fetch the first job ID from the workflow run
 
           echo "Job ID: $JOB_ID"
+          echo $JOB_NAME
           echo $CUSTOM_CONTEXT
           echo $CUSTOM_DESCRIPTION
           echo $CUSTOM_TARGET_URL
