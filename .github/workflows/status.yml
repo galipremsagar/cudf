@@ -35,7 +35,7 @@ jobs:
         run: |
           CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
           JOB_NAME=$(echo $CONTENT_JSON | jq -r .job_name)
-          JOB_ID=$(gh api repos/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/jobs --paginate --jq '.jobs[] | select(.name == \"$JOB_NAME\") | .id')
+          JOB_ID=$(gh api repos/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/jobs --paginate --jq ".jobs[] | select(.name == \"$JOB_NAME\") | .id")
           CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
           CUSTOM_DESCRIPTION=$(echo $CONTENT_JSON | jq -r .description)
           CUSTOM_TARGET_URL=$(echo $CONTENT_JSON | jq -r .target_url)
