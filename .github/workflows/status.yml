@@ -12,12 +12,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifact
-        uses: dawidd6/action-download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: gh-status
           path: downloaded_artifacts/
-          workflow: copy.yml
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # workflow: copy.yml
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Read artifact JSON
         id: read_artifact
         run: |
