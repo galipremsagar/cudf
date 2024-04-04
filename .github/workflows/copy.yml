@@ -8,6 +8,9 @@ on:
 jobs:
   echo_job:
     runs-on: ubuntu-latest
+    outputs:
+      workflow_run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
     steps:
       - name: Echo abc
         run: echo 'abc'
@@ -54,7 +57,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ARTIFACT_CONTENT: ${{ steps.read_artifact.outputs.content }}
           COMMIT_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ needs.echo_job.outputs.workflow_run_id }}
           REPO_NAME: ${{ github.repository }}
+          ATTEMPTS: ${{ needs.echo_job.outputs.run_attempt }}
         run: |
           # Assuming you have the job ID from somewhere or it's not needed anymore
           # If you still need to fetch the job ID, you would insert the logic here
@@ -68,7 +73,7 @@ jobs:
           # Use default values if any field is missing
           if [ -z "$CUSTOM_CONTEXT" ] || [ "$CUSTOM_CONTEXT" = "null" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
           if [ -z "$CUSTOM_DESCRIPTION" ] || [ "$CUSTOM_DESCRIPTION" = "null" ]; then CUSTOM_DESCRIPTION="Custom CI Status description"; fi
-          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/commit/$COMMIT_SHA/checks"; fi
+          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/attempts/$ATTEMPTS#summary-$JOB_ID"; fi
           if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
 
           echo "Job ID: $JOB_ID"
