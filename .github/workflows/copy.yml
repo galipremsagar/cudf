@@ -8,9 +8,6 @@ on:
 jobs:
   echo_job:
     runs-on: ubuntu-latest
-    outputs:
-      workflow_run_id: ${{ github.run_id }}
-      run_attempt: ${{ github.run_attempt }}
     steps:
       - name: Echo abc
         run: echo 'abc'
@@ -34,61 +31,3 @@ jobs:
         with:
           name: gh-status
           path: downloaded_artifacts/
-  pandas-test-reporting:
-    needs: echo_job
-    if: ${{ needs.echo_job.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifact
-        uses: dawidd6/action-download-artifact@v3
-        with:
-          name: gh-status
-          path: downloaded_artifacts/
-          # Assuming 'copy.yml' is the workflow filename that produced the artifact
-          workflow: copy.yml
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Read artifact JSON
-        id: read_artifact
-        run: |
-          CONTENT=$(cat downloaded_artifacts/gh-status.json)
-          echo "::set-output name=content::$CONTENT"
-      - name: Create status
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ARTIFACT_CONTENT: ${{ steps.read_artifact.outputs.content }}
-          COMMIT_SHA: ${{ github.sha }}
-          WORKFLOW_RUN_ID: ${{ needs.echo_job.outputs.workflow_run_id }}
-          REPO_NAME: ${{ github.repository }}
-          ATTEMPTS: ${{ needs.echo_job.outputs.run_attempt }}
-        run: |
-          # Assuming you have the job ID from somewhere or it's not needed anymore
-          # If you still need to fetch the job ID, you would insert the logic here
-          JOB_ID=$(curl -s \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" | jq -r '.jobs[] | select(.name == "echo_job") | .id')
-          CONTENT_JSON=$(echo $ARTIFACT_CONTENT | jq .)
-          CUSTOM_CONTEXT=$(echo $CONTENT_JSON | jq -r .context)
-          CUSTOM_DESCRIPTION=$(echo $CONTENT_JSON | jq -r .description)
-          CUSTOM_TARGET_URL=$(echo $CONTENT_JSON | jq -r .target_url)
-          CUSTOM_STATE=$(echo $CONTENT_JSON | jq -r .state)
-
-          # Use default values if any field is missing
-          if [ -z "$CUSTOM_CONTEXT" ] || [ "$CUSTOM_CONTEXT" = "null" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
-          if [ -z "$CUSTOM_DESCRIPTION" ] || [ "$CUSTOM_DESCRIPTION" = "null" ]; then CUSTOM_DESCRIPTION="Custom CI Status description"; fi
-          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/attempts/$ATTEMPTS#summary-$JOB_ID"; fi
-          if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
-
-          echo "Job ID: $JOB_ID"
-          echo $CUSTOM_CONTEXT
-          echo $CUSTOM_DESCRIPTION
-          echo $CUSTOM_TARGET_URL
-          echo $CUSTOM_STATE
-
-          # Create status
-          curl -X POST -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$REPO_NAME/statuses/$COMMIT_SHA" \
-            -d "{\"state\":\"$CUSTOM_STATE\",\"target_url\":\"$CUSTOM_TARGET_URL\",\"description\":\"$CUSTOM_DESCRIPTION\",\"context\":\"$CUSTOM_CONTEXT\"}"
-
-# abc
