@@ -22,7 +22,7 @@ jobs:
         id: read_artifact
         run: |
           CONTENT=$(cat downloaded_artifacts/gh-status.json)
-          echo "::set-output name=content::$CONTENT"
+          echo "content=$CONTENT" >> $GITHUB_OUTPUT
       - name: Create status
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -42,7 +42,7 @@ jobs:
           # Use default values if any field is missing
           if [ -z "$CUSTOM_CONTEXT" ] || [ "$CUSTOM_CONTEXT" = "null" ]; then CUSTOM_CONTEXT="Custom CI Status Check"; fi
           if [ -z "$CUSTOM_DESCRIPTION" ] || [ "$CUSTOM_DESCRIPTION" = "null" ]; then CUSTOM_DESCRIPTION="Custom CI Status description"; fi
-          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/attempts/$ATTEMPTS#summary-$JOB_ID"; fi                                                                                            
+          if [ -z "$CUSTOM_TARGET_URL" ] || [ "$CUSTOM_TARGET_URL" = "null" ]; then CUSTOM_TARGET_URL="https://github.com/$REPO_NAME/actions/runs/$WORKFLOW_RUN_ID/attempts/$ATTEMPTS#summary-$JOB_ID"; fi
           if [ -z "$CUSTOM_STATE" ] || [ "$CUSTOM_STATE" = "null" ]; then CUSTOM_STATE="success"; fi
 
 
