@@ -37,8 +37,6 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const { context } = github;
-
             const CONTENT_JSON = require('./downloaded_artifacts/gh-status.json');
             const JOB_NAME = CONTENT_JSON.job_name;
             const CUSTOM_CONTEXT = CONTENT_JSON.context || "Custom CI Status Check";
