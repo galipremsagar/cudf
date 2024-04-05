@@ -60,7 +60,10 @@ jobs:
 
             // Set default target URL if not defined
             const targetUrl = CUSTOM_TARGET_URL || `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.WORKFLOW_RUN_ID}/attempts/${process.env.ATTEMPTS}#summary-${JOB_ID}`;
-
+            console.log(CUSTOM_STATE);
+            console.log(targetUrl);
+            console.log(CUSTOM_DESCRIPTION);
+            console.log(CUSTOM_CONTEXT);
             // Create status
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
