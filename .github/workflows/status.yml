@@ -36,7 +36,6 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             const artifactName = 'gh-status';
-            const artifactsPath = 'downloaded_artifacts';
 
             const allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
                 owner: context.repo.owner,
@@ -60,12 +59,11 @@ jobs:
             });
 
             // Write the artifact to a file
-            const artifactPath = path.join(artifactsPath, `${artifactName}.zip`);
-            fs.writeFileSync(artifactPath, Buffer.from(download.data));
+            fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/${artifactName}.zip`/, Buffer.from(download.data));
 
       - name: 'Unzip artifact'
         if: ${{ needs.process_artifacts.outputs.artifact_downloaded == 'true' }}
-        run: unzip './downloaded_artifacts/gh-status.zip'
+        run: unzip 'gh-status.zip'
 
       - name: Create status
         if: ${{ needs.process_artifacts.outputs.artifact_downloaded == 'true' }}
@@ -78,7 +76,7 @@ jobs:
           retries: 3
           script: |
             // Load the JSON content
-            const contentJSON = require('./downloaded_artifacts/gh-status.json');
+            const contentJSON = require('./gh-status.json');
             const {
                 job_name: JOB_NAME,
                 context: CUSTOM_CONTEXT = 'Custom CI Status Check',
