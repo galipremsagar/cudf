@@ -35,41 +35,39 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Create status
         uses: actions/github-script@v7
+        env:
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+          ATTEMPTS: ${{ github.event.workflow_run.run_attempt }}
         with:
           script: |
-            const CONTENT_JSON = require('./downloaded_artifacts/gh-status.json');
-            const JOB_NAME = CONTENT_JSON.job_name;
-            const CUSTOM_CONTEXT = CONTENT_JSON.context || "Custom CI Status Check";
-            const CUSTOM_DESCRIPTION = CONTENT_JSON.description || "Custom CI Status description";
-            const CUSTOM_TARGET_URL = CONTENT_JSON.target_url || `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/attempts/${context.runAttempt}#summary-${context.job}`;
-            const CUSTOM_STATE = CONTENT_JSON.state || "success";
+            const fs = require('fs');
+            const path = require('path');
+
+            // Load the JSON content
+            const contentPath = path.join(process.env.GITHUB_WORKSPACE, 'downloaded_artifacts', 'gh-status.json');
+            const contentJSON = JSON.parse(fs.readFileSync(contentPath));
+            const { job_name: JOB_NAME, context: CUSTOM_CONTEXT = 'Custom CI Status Check', description: CUSTOM_DESCRIPTION = 'Custom CI Status description', target_url: CUSTOM_TARGET_URL, state: CUSTOM_STATE = 'success' } = contentJSON;
 
             // Fetch the first job ID from the workflow run
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              run_id: context.runId,
+              run_id: process.env.WORKFLOW_RUN_ID,
             });
-
             const job = jobs.data.jobs.find(job => job.name === JOB_NAME);
             const JOB_ID = job ? job.id : null;
 
-            console.log(`Job ID: ${JOB_ID}`);
-            console.log(JOB_NAME);
-            console.log(CUSTOM_CONTEXT);
-            console.log(CUSTOM_DESCRIPTION);
-            console.log(CUSTOM_TARGET_URL);
-            console.log(CUSTOM_STATE);
-            console.log(context.runAttempt);
-            console.log(JOB_ID);
+            // Set default target URL if not defined
+            const targetUrl = CUSTOM_TARGET_URL || `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.WORKFLOW_RUN_ID}/attempts/${process.env.ATTEMPTS}#summary-${JOB_ID}`;
 
             // Create status
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha: context.sha,
+              sha: process.env.COMMIT_SHA,
               state: CUSTOM_STATE,
-              target_url: CUSTOM_TARGET_URL,
+              target_url: targetUrl,
               description: CUSTOM_DESCRIPTION,
               context: CUSTOM_CONTEXT,
             });
