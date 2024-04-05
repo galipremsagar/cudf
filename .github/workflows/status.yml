@@ -40,16 +40,23 @@ jobs:
           COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
           ATTEMPTS: ${{ github.event.workflow_run.run_attempt }}
         with:
+          retries: 3
           script: |
             // Load the JSON content
             const contentJSON = require('./downloaded_artifacts/gh-status.json');
-            const { job_name: JOB_NAME, context: CUSTOM_CONTEXT = 'Custom CI Status Check', description: CUSTOM_DESCRIPTION = 'Custom CI Status description', target_url: CUSTOM_TARGET_URL, state: CUSTOM_STATE = 'success' } = contentJSON;
+            const {
+                job_name: JOB_NAME,
+                context: CUSTOM_CONTEXT = 'Custom CI Status Check',
+                description: CUSTOM_DESCRIPTION = 'Custom CI Status description',
+                target_url: CUSTOM_TARGET_URL,
+                state: CUSTOM_STATE = 'success'
+            } = contentJSON;
 
             // Fetch the first job ID from the workflow run
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: process.env.WORKFLOW_RUN_ID,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: process.env.WORKFLOW_RUN_ID,
             });
             const job = jobs.data.jobs.find(job => job.name === JOB_NAME);
             const JOB_ID = job ? job.id : null;
@@ -65,14 +72,13 @@ jobs:
 
             // Create status
             await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: process.env.COMMIT_SHA,
-              state: CUSTOM_STATE,
-              target_url: targetUrl,
-              description: CUSTOM_DESCRIPTION,
-              context: CUSTOM_CONTEXT,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: process.env.COMMIT_SHA,
+                state: CUSTOM_STATE,
+                target_url: targetUrl,
+                description: CUSTOM_DESCRIPTION,
+                context: CUSTOM_CONTEXT,
             });
-          retries: 4
 
 #abc123
