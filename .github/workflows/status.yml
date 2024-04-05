@@ -44,7 +44,7 @@ jobs:
                 run_id: context.payload.workflow_run.id,
               });
             // Find the specific artifact
-            const artifact = artifacts.data.artifacts.find(artifact => artifact.name === artifactName);
+            const artifact = allArtifacts.data.artifacts.find(artifact => artifact.name === artifactName);
             if (!artifact) {
               core.info(`Artifact "${artifactName}" not found. Exiting safely.`);
               core.setOutput('artifact_downloaded', 'false');
