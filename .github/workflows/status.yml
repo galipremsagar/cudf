@@ -103,6 +103,7 @@ jobs:
                 allJobs = allJobs.concat(response.data.jobs);
                 console.log(allJobs);
                 if (response.data.jobs.length < perPage) {
+                  console.log("break");
                   break; // No more jobs to fetch, exit the loop
                 }
 
@@ -114,7 +115,7 @@ jobs:
             const jobs = await fetchAllJobs(context.repo.owner, context.repo.repo, process.env.WORKFLOW_RUN_ID);
 
             //console.log(JSON.stringify(jobs.data.jobs, undefined, 2));
-            const job = jobs.data.jobs.find(job => job.name === JOB_NAME);
+            const job = jobs.find(job => job.name === JOB_NAME);
             const JOB_ID = job ? job.id : null;
 
             // Set default target URL if not defined
