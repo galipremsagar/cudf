@@ -91,7 +91,7 @@ jobs:
                 repo: context.repo.repo,
                 run_id: process.env.WORKFLOW_RUN_ID,
             });
-            console.log(SON.stringify(jobs.data.jobs, undefined, 2));
+            console.log(JSON.stringify(jobs.data.jobs, undefined, 2));
             const job = jobs.data.jobs.find(job => job.name === JOB_NAME);
             const JOB_ID = job ? job.id : null;
 
