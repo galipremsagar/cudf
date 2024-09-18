@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2024, NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -40,7 +40,7 @@ comment = (
     "Merging this PR would result in "
     f"{pr_passed}/{pr_total} ({passing_percentage:.2f}%) "
     "Pandas tests passing, "
-    f"{rate_change_type} in the test pass rate by "
+    f"{rate_change_type} by "
     f"{pass_rate_change:.2f}%. "
     f"Trunk stats: {main_passed}/{main_total}."
 )
@@ -68,8 +68,20 @@ def emoji_failed(x):
 pr_df = pd.DataFrame.from_dict(pr_results, orient="index").sort_index()
 main_df = pd.DataFrame.from_dict(main_results, orient="index").sort_index()
 diff_df = pr_df - main_df
+pr_df['CPU Usage'] = ((pr_df['_slow_function_call']/(pr_df['_slow_function_call'] + pr_df['_fast_function_call']))*100.0).round(1)
+pr_df['GPU Usage'] = ((pr_df['_fast_function_call']/(pr_df['_slow_function_call'] + pr_df['_fast_function_call']))*100.0).round(1)
 
-pr_df = pr_df[["total", "passed", "failed", "skipped"]]
+cpu_usage_mean = pr_df['CPU Usage'].mean().round(2)
+gpu_usage_mean = pr_df['GPU Usage'].mean().round(2)
+
+# Add '%' suffix to 'CPU Usage' and 'GPU Usage' columns
+pr_df['CPU Usage'] = pr_df['CPU Usage'].astype(str) + '%'
+pr_df['GPU Usage'] = pr_df['GPU Usage'].astype(str) + '%'
+
+pr_df['CPU Usage'] = pr_df['CPU Usage'].replace('nan%', '0%')
+pr_df['GPU Usage'] = pr_df['GPU Usage'].replace('nan%', '0%')
+
+pr_df = pr_df[["total", "passed", "failed", "skipped", 'CPU Usage', 'GPU Usage']]
 diff_df = diff_df[["total", "passed", "failed", "skipped"]]
 diff_df.columns = diff_df.columns + "_diff"
 diff_df["passed_diff"] = diff_df["passed_diff"].map(emoji_passed)
@@ -94,6 +106,8 @@ df = df.rename(
 df = df.sort_values(by=["Failed tests", "Skipped tests"], ascending=False)
 
 print(comment)
+print()
+print(f"Average CPU and GPU usage for the tests: {cpu_usage_mean}% and {gpu_usage_mean}%")
 print()
 print("Here are the results of running the Pandas tests against this PR:")
 print()

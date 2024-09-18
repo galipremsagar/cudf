@@ -23,6 +23,7 @@
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -119,7 +120,7 @@ std::unique_ptr<column> allocate_like(column_view const& input,
                                       size_type size,
                                       mask_allocation_policy mask_alloc,
                                       rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(
@@ -141,6 +142,12 @@ std::unique_ptr<column> allocate_like(column_view const& input,
 std::unique_ptr<column> empty_like(column_view const& input)
 {
   CUDF_FUNC_RANGE();
+
+  // test_dataframe.py passes an EMPTY column type here;
+  // this causes is_nested to throw an error since it uses the type-dispatcher
+  if ((input.type().id() == type_id::EMPTY) || !cudf::is_nested(input.type())) {
+    return make_empty_column(input.type());
+  }
 
   std::vector<std::unique_ptr<column>> children;
   std::transform(input.child_begin(),
@@ -177,7 +184,7 @@ std::unique_ptr<table> empty_like(table_view const& input_table)
 std::unique_ptr<column> allocate_like(column_view const& input,
                                       mask_allocation_policy mask_alloc,
                                       rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::allocate_like(input, input.size(), mask_alloc, stream, mr);
@@ -187,7 +194,7 @@ std::unique_ptr<column> allocate_like(column_view const& input,
                                       size_type size,
                                       mask_allocation_policy mask_alloc,
                                       rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::allocate_like(input, size, mask_alloc, stream, mr);

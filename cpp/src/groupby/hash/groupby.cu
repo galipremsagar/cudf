@@ -16,7 +16,6 @@
 
 #include "groupby/common/utils.hpp"
 #include "groupby/hash/groupby_kernels.cuh"
-#include "hash/concurrent_unordered_map.cuh"
 
 #include <cudf/aggregation.hpp>
 #include <cudf/column/column.hpp>
@@ -40,6 +39,7 @@
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.cuh>
 #include <cudf/utilities/traits.hpp>
 
@@ -190,7 +190,7 @@ class hash_compound_agg_finalizer final : public cudf::detail::aggregation_final
   SetType set;
   bitmask_type const* __restrict__ row_bitmask;
   rmm::cuda_stream_view stream;
-  rmm::mr::device_memory_resource* mr;
+  rmm::device_async_resource_ref mr;
 
  public:
   using cudf::detail::aggregation_finalizer::visit;
@@ -202,7 +202,7 @@ class hash_compound_agg_finalizer final : public cudf::detail::aggregation_final
                               SetType set,
                               bitmask_type const* row_bitmask,
                               rmm::cuda_stream_view stream,
-                              rmm::mr::device_memory_resource* mr)
+                              rmm::device_async_resource_ref mr)
     : col(col),
       sparse_results(sparse_results),
       dense_results(dense_results),
@@ -398,10 +398,10 @@ void sparse_to_dense_results(table_view const& keys,
                              bool keys_have_nulls,
                              null_policy include_null_keys,
                              rmm::cuda_stream_view stream,
-                             rmm::mr::device_memory_resource* mr)
+                             rmm::device_async_resource_ref mr)
 {
   auto row_bitmask =
-    cudf::detail::bitmask_and(keys, stream, rmm::mr::get_current_device_resource()).first;
+    cudf::detail::bitmask_and(keys, stream, cudf::get_current_device_resource_ref()).first;
   bool skip_key_rows_with_nulls = keys_have_nulls and include_null_keys == null_policy::EXCLUDE;
   bitmask_type const* row_bitmask_ptr =
     skip_key_rows_with_nulls ? static_cast<bitmask_type*>(row_bitmask.data()) : nullptr;
@@ -475,13 +475,13 @@ void compute_single_pass_aggs(table_view const& keys,
   auto d_sparse_table = mutable_table_device_view::create(sparse_table, stream);
   auto d_values       = table_device_view::create(flattened_values, stream);
   auto const d_aggs   = cudf::detail::make_device_uvector_async(
-    agg_kinds, stream, rmm::mr::get_current_device_resource());
+    agg_kinds, stream, cudf::get_current_device_resource_ref());
   auto const skip_key_rows_with_nulls =
     keys_have_nulls and include_null_keys == null_policy::EXCLUDE;
 
   auto row_bitmask =
     skip_key_rows_with_nulls
-      ? cudf::detail::bitmask_and(keys, stream, rmm::mr::get_current_device_resource()).first
+      ? cudf::detail::bitmask_and(keys, stream, cudf::get_current_device_resource_ref()).first
       : rmm::device_buffer{};
 
   thrust::for_each_n(
@@ -551,9 +551,10 @@ std::unique_ptr<table> groupby(table_view const& keys,
                                bool const keys_have_nulls,
                                null_policy const include_null_keys,
                                rmm::cuda_stream_view stream,
-                               rmm::mr::device_memory_resource* mr)
+                               rmm::device_async_resource_ref mr)
 {
-  auto const num_keys            = keys.num_rows();
+  // convert to int64_t to avoid potential overflow with large `keys`
+  auto const num_keys            = static_cast<int64_t>(keys.num_rows());
   auto const null_keys_are_equal = null_equality::EQUAL;
   auto const has_null            = nullate::DYNAMIC{cudf::has_nested_nulls(keys)};
 
@@ -567,15 +568,16 @@ std::unique_ptr<table> groupby(table_view const& keys,
   cudf::detail::result_cache sparse_results(requests.size());
 
   auto const comparator_helper = [&](auto const d_key_equal) {
-    auto const set = cuco::static_set{num_keys,
-                                      0.5,  // desired load factor
-                                      cuco::empty_key{cudf::detail::CUDF_SIZE_TYPE_SENTINEL},
-                                      d_key_equal,
-                                      probing_scheme_type{d_row_hash},
-                                      cuco::thread_scope_device,
-                                      cuco::storage<1>{},
-                                      cudf::detail::cuco_allocator{stream},
-                                      stream.value()};
+    auto const set = cuco::static_set{
+      num_keys,
+      0.5,  // desired load factor
+      cuco::empty_key{cudf::detail::CUDF_SIZE_TYPE_SENTINEL},
+      d_key_equal,
+      probing_scheme_type{d_row_hash},
+      cuco::thread_scope_device,
+      cuco::storage<1>{},
+      cudf::detail::cuco_allocator<char>{rmm::mr::polymorphic_allocator<char>{}, stream},
+      stream.value()};
 
     // Compute all single pass aggs first
     compute_single_pass_aggs(keys,
@@ -654,7 +656,7 @@ std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby(
   host_span<aggregation_request const> requests,
   null_policy include_null_keys,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   cudf::detail::result_cache cache(requests.size());
 

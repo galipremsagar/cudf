@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#include "special_chars.h"
 
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
@@ -31,7 +33,7 @@ struct StringsFindallTests : public cudf::test::BaseFixture {};
 
 TEST_F(StringsFindallTests, FindallTest)
 {
-  bool valids[] = {1, 1, 1, 1, 1, 0, 1, 1};
+  bool valids[] = {true, true, true, true, true, false, true, true};
   cudf::test::strings_column_wrapper input(
     {"3-A", "4-May 5-Day 6-Hay", "12-Dec-2021-Jan", "Feb-March", "4 ABC", "", "", "25-9000-Hal"},
     valids);
@@ -80,10 +82,36 @@ TEST_F(StringsFindallTests, DotAll)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(results->view(), expected);
 }
 
+TEST_F(StringsFindallTests, SpecialNewLines)
+{
+  auto input = cudf::test::strings_column_wrapper({"zzé" PARAGRAPH_SEPARATOR "qqq\nzzé",
+                                                   "qqq\nzzé" PARAGRAPH_SEPARATOR "lll",
+                                                   "zzé",
+                                                   "",
+                                                   "zzé\r",
+                                                   "zzé" LINE_SEPARATOR "zzé" NEXT_LINE});
+  auto view  = cudf::strings_column_view(input);
+
+  auto prog =
+    cudf::strings::regex_program::create("(^zzé$)", cudf::strings::regex_flags::EXT_NEWLINE);
+  auto results = cudf::strings::findall(view, *prog);
+  using LCW    = cudf::test::lists_column_wrapper<cudf::string_view>;
+  LCW expected({LCW{}, LCW{}, LCW{"zzé"}, LCW{}, LCW{"zzé"}, LCW{}});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(results->view(), expected);
+
+  auto both_flags = static_cast<cudf::strings::regex_flags>(
+    cudf::strings::regex_flags::EXT_NEWLINE | cudf::strings::regex_flags::MULTILINE);
+  auto prog_ml = cudf::strings::regex_program::create("^(zzé)$", both_flags);
+  results      = cudf::strings::findall(view, *prog_ml);
+  LCW expected_ml(
+    {LCW{"zzé", "zzé"}, LCW{"zzé"}, LCW{"zzé"}, LCW{}, LCW{"zzé"}, LCW{"zzé", "zzé"}});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(results->view(), expected_ml);
+}
+
 TEST_F(StringsFindallTests, MediumRegex)
 {
   // This results in 15 regex instructions and falls in the 'medium' range.
-  std::string medium_regex = "(\\w+) (\\w+) (\\d+)";
+  std::string medium_regex = R"((\w+) (\w+) (\d+))";
   auto prog                = cudf::strings::regex_program::create(medium_regex);
 
   cudf::test::strings_column_wrapper input({"first words 1234 and just numbers 9876", "neither"});

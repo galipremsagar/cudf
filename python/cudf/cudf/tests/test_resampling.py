@@ -5,7 +5,8 @@ import pandas as pd
 import pytest
 
 import cudf
-from cudf.testing._utils import assert_eq
+from cudf.core._compat import PANDAS_CURRENT_SUPPORTED_VERSION, PANDAS_VERSION
+from cudf.testing import assert_eq
 
 
 def assert_resample_results_equal(lhs, rhs, **kwargs):
@@ -147,6 +148,10 @@ def test_dataframe_resample_level():
         ("10D", "1D", "s"),
     ],
 )
+@pytest.mark.skipif(
+    PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+    reason="Fails in older versions of pandas",
+)
 def test_resampling_frequency_conversion(in_freq, sampling_freq, out_freq):
     # test that we cast to the appropriate frequency
     # when resampling:
@@ -162,3 +167,21 @@ def test_resampling_frequency_conversion(in_freq, sampling_freq, out_freq):
     assert_resample_results_equal(expect, got)
 
     assert got.index.dtype == np.dtype(f"datetime64[{out_freq}]")
+
+
+@pytest.mark.skipif(
+    PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+    reason="Fails in older versions of pandas",
+)
+def test_resampling_downsampling_ms():
+    pdf = pd.DataFrame(
+        {
+            "time": pd.date_range("2020-01-01", periods=5, freq="1ns"),
+            "sign": range(5),
+        }
+    )
+    gdf = cudf.from_pandas(pdf)
+    expected = pdf.resample("10ms", on="time").mean()
+    result = gdf.resample("10ms", on="time").mean()
+    result.index = result.index.astype("datetime64[ns]")
+    assert_eq(result, expected, check_freq=False)

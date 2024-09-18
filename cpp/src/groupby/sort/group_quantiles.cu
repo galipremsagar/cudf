@@ -24,6 +24,7 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/dictionary/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -90,7 +91,7 @@ struct quantiles_functor {
     device_span<double const> quantile,
     interpolation interpolation,
     rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr)
+    rmm::device_async_resource_ref mr)
   {
     using ResultType = cudf::detail::target_type_t<T, aggregation::QUANTILE>;
 
@@ -161,10 +162,10 @@ std::unique_ptr<column> group_quantiles(column_view const& values,
                                         std::vector<double> const& quantiles,
                                         interpolation interp,
                                         rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::device_async_resource_ref mr)
 {
   auto dv_quantiles = cudf::detail::make_device_uvector_async(
-    quantiles, stream, rmm::mr::get_current_device_resource());
+    quantiles, stream, cudf::get_current_device_resource_ref());
 
   auto values_type = cudf::is_dictionary(values.type())
                        ? dictionary_column_view(values).keys().type()

@@ -1,4 +1,4 @@
-# Copyright (c) 2019-2023, NVIDIA CORPORATION.
+# Copyright (c) 2019-2024, NVIDIA CORPORATION.
 
 import random
 import string
@@ -9,7 +9,7 @@ import pytest
 import cudf
 from cudf.core.byte_pair_encoding import BytePairEncoder
 from cudf.core.tokenize_vocabulary import TokenizeVocabulary
-from cudf.testing._utils import assert_eq
+from cudf.testing import assert_eq
 
 
 def test_tokenize():
@@ -330,9 +330,8 @@ def test_ngrams(n, separator, expected_values):
                 "he",
                 "er",
                 "re",
-                cudf.NA,
             ],
-            [1, 1, 1, 2, 3, 4, 4, 4, 5, 5, 5, 6],
+            [1, 1, 1, 2, 3, 4, 4, 4, 5, 5, 5],
             False,
         ),
         (
@@ -340,15 +339,12 @@ def test_ngrams(n, separator, expected_values):
             [
                 "thi",
                 "his",
-                cudf.NA,
-                cudf.NA,
                 "boo",
                 "ook",
                 "her",
                 "ere",
-                cudf.NA,
             ],
-            [1, 1, 2, 3, 4, 4, 5, 5, 6],
+            [1, 1, 4, 4, 5, 5],
             False,
         ),
         (
@@ -430,7 +426,6 @@ def test_character_tokenize_series():
         [
             "hello world",
             "sdf",
-            None,
             (
                 "goodbye, one-two:three~four+five_six@sev"
                 "en#eight^nine heŒŽ‘•™œ$µ¾ŤƠé Ǆ"
@@ -543,18 +538,17 @@ def test_character_tokenize_series():
 
 
 def test_character_tokenize_index():
-    sr = cudf.core.index.as_index(
+    sr = cudf.Index(
         [
             "hello world",
             "sdf",
-            None,
             (
                 "goodbye, one-two:three~four+five_six@sev"
                 "en#eight^nine heŒŽ‘•™œ$µ¾ŤƠé Ǆ"
             ),
         ]
     )
-    expected = cudf.core.index.as_index(
+    expected = cudf.Index(
         [
             "h",
             "e",
@@ -652,8 +646,8 @@ def test_character_tokenize_index():
     actual = sr.str.character_tokenize()
     assert_eq(expected, actual)
 
-    sr = cudf.core.index.as_index(["a"])
-    expected = cudf.core.index.as_index(["a"])
+    sr = cudf.Index(["a"])
+    expected = cudf.Index(["a"])
 
     actual = sr.str.character_tokenize()
     assert_eq(expected, actual)
@@ -950,6 +944,66 @@ def test_minhash():
     with pytest.raises(ValueError):
         seeds = cudf.Series([0, 1, 2], dtype=np.uint32)
         strings.str.minhash64(seeds=seeds)
+
+
+def test_word_minhash():
+    ls = cudf.Series([["this", "is", "my"], ["favorite", "book"]])
+
+    expected = cudf.Series(
+        [
+            cudf.Series([21141582], dtype=np.uint32),
+            cudf.Series([962346254], dtype=np.uint32),
+        ]
+    )
+    actual = ls.str.word_minhash()
+    assert_eq(expected, actual)
+    seeds = cudf.Series([0, 1, 2], dtype=np.uint32)
+    expected = cudf.Series(
+        [
+            cudf.Series([21141582, 1232889953, 1268336794], dtype=np.uint32),
+            cudf.Series([962346254, 2321233602, 1354839212], dtype=np.uint32),
+        ]
+    )
+    actual = ls.str.word_minhash(seeds=seeds)
+    assert_eq(expected, actual)
+
+    expected = cudf.Series(
+        [
+            cudf.Series([2603139454418834912], dtype=np.uint64),
+            cudf.Series([5240044617220523711], dtype=np.uint64),
+        ]
+    )
+    actual = ls.str.word_minhash64()
+    assert_eq(expected, actual)
+    seeds = cudf.Series([0, 1, 2], dtype=np.uint64)
+    expected = cudf.Series(
+        [
+            cudf.Series(
+                [
+                    2603139454418834912,
+                    8644371945174847701,
+                    5541030711534384340,
+                ],
+                dtype=np.uint64,
+            ),
+            cudf.Series(
+                [5240044617220523711, 5847101123925041457, 153762819128779913],
+                dtype=np.uint64,
+            ),
+        ]
+    )
+    actual = ls.str.word_minhash64(seeds=seeds)
+    assert_eq(expected, actual)
+
+    # test wrong seed types
+    with pytest.raises(ValueError):
+        ls.str.word_minhash(seeds="a")
+    with pytest.raises(ValueError):
+        seeds = cudf.Series([0, 1, 2], dtype=np.int32)
+        ls.str.word_minhash(seeds=seeds)
+    with pytest.raises(ValueError):
+        seeds = cudf.Series([0, 1, 2], dtype=np.uint32)
+        ls.str.word_minhash64(seeds=seeds)
 
 
 def test_jaccard_index():

@@ -42,11 +42,11 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
 
 #include <cuda/functional>
 #include <thrust/for_each.h>
@@ -77,8 +77,9 @@ namespace {
 struct escape_strings_fn {
   column_device_view const d_column;
   bool const append_colon{false};
-  size_type* d_offsets{};
+  size_type* d_sizes{};
   char* d_chars{};
+  cudf::detail::input_offsetalator d_offsets;
 
   __device__ void write_char(char_utf8 chr, char*& d_buffer, size_type& bytes)
   {
@@ -122,7 +123,7 @@ struct escape_strings_fn {
   __device__ void operator()(size_type idx)
   {
     if (d_column.is_null(idx)) {
-      if (!d_chars) d_offsets[idx] = 0;
+      if (!d_chars) { d_sizes[idx] = 0; }
       return;
     }
 
@@ -162,12 +163,12 @@ struct escape_strings_fn {
     constexpr char_utf8 const colon = ':';  // append colon
     if (append_colon) write_char(colon, d_buffer, bytes);
 
-    if (!d_chars) d_offsets[idx] = bytes;
+    if (!d_chars) { d_sizes[idx] = bytes; }
   }
 
   std::unique_ptr<column> get_escaped_strings(column_view const& column_v,
                                               rmm::cuda_stream_view stream,
-                                              rmm::mr::device_memory_resource* mr)
+                                              rmm::device_async_resource_ref mr)
   {
     auto [offsets_column, chars] =
       cudf::strings::detail::make_strings_children(*this, column_v.size(), stream, mr);
@@ -256,7 +257,7 @@ std::unique_ptr<column> struct_to_strings(table_view const& strings_columns,
                                           string_scalar const& narep,
                                           bool include_nulls,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(column_names.type().id() == type_id::STRING, "Column names must be of type string");
@@ -373,7 +374,7 @@ std::unique_ptr<column> join_list_of_strings(lists_column_view const& lists_stri
                                              string_view const element_separator,
                                              string_view const element_narep,
                                              rmm::cuda_stream_view stream,
-                                             rmm::mr::device_memory_resource* mr)
+                                             rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
 
@@ -435,7 +436,7 @@ std::unique_ptr<column> join_list_of_strings(lists_column_view const& lists_stri
 
   // scatter string and separator
   auto labels = cudf::lists::detail::generate_labels(
-    lists_strings, num_strings, stream, rmm::mr::get_current_device_resource());
+    lists_strings, num_strings, stream, cudf::get_current_device_resource_ref());
   auto d_strings_children = cudf::column_device_view::create(strings_children, stream);
   thrust::for_each(rmm::exec_policy(stream),
                    thrust::make_counting_iterator<size_type>(0),
@@ -497,7 +498,7 @@ struct column_to_strings_fn {
 
   explicit column_to_strings_fn(json_writer_options const& options,
                                 rmm::cuda_stream_view stream,
-                                rmm::mr::device_memory_resource* mr)
+                                rmm::device_async_resource_ref mr)
     : options_(options),
       stream_(stream),
       mr_(mr),
@@ -643,13 +644,13 @@ struct column_to_strings_fn {
       }
     };
     auto new_offsets = cudf::lists::detail::get_normalized_offsets(
-      lists_column_view(column), stream_, rmm::mr::get_current_device_resource());
+      lists_column_view(column), stream_, cudf::get_current_device_resource_ref());
     auto const list_child_string = make_lists_column(
       column.size(),
       std::move(new_offsets),
-      std::move(child_string_with_null()),
+      child_string_with_null(),
       column.null_count(),
-      cudf::detail::copy_bitmask(column, stream_, rmm::mr::get_current_device_resource()),
+      cudf::detail::copy_bitmask(column, stream_, cudf::get_current_device_resource_ref()),
       stream_);
     return join_list_of_strings(lists_column_view(*list_child_string),
                                 list_row_begin_wrap.value(stream_),
@@ -734,13 +735,13 @@ struct column_to_strings_fn {
                              narep,
                              options_.is_enabled_include_nulls(),
                              stream_,
-                             rmm::mr::get_current_device_resource());
+                             cudf::get_current_device_resource_ref());
   }
 
  private:
   json_writer_options const& options_;
   rmm::cuda_stream_view stream_;
-  rmm::mr::device_memory_resource* mr_;
+  rmm::device_async_resource_ref mr_;
   string_scalar const narep;  // "null"
   // struct convert constants
   string_scalar const struct_value_separator;  // ","
@@ -763,17 +764,18 @@ std::unique_ptr<column> make_strings_column_from_host(host_span<std::string cons
   std::string const host_chars =
     std::accumulate(host_strings.begin(), host_strings.end(), std::string(""));
   auto d_chars = cudf::detail::make_device_uvector_async(
-    host_chars, stream, rmm::mr::get_current_device_resource());
+    host_chars, stream, cudf::get_current_device_resource_ref());
   std::vector<cudf::size_type> offsets(host_strings.size() + 1, 0);
   std::transform_inclusive_scan(host_strings.begin(),
                                 host_strings.end(),
                                 offsets.begin() + 1,
                                 std::plus<cudf::size_type>{},
                                 [](auto& str) { return str.size(); });
-  auto d_offsets = std::make_unique<cudf::column>(
-    cudf::detail::make_device_uvector_sync(offsets, stream, rmm::mr::get_current_device_resource()),
-    rmm::device_buffer{},
-    0);
+  auto d_offsets =
+    std::make_unique<cudf::column>(cudf::detail::make_device_uvector_sync(
+                                     offsets, stream, cudf::get_current_device_resource_ref()),
+                                   rmm::device_buffer{},
+                                   0);
   return cudf::make_strings_column(
     host_strings.size(), std::move(d_offsets), d_chars.release(), 0, {});
 }
@@ -796,15 +798,14 @@ std::unique_ptr<column> make_column_names_column(host_span<column_name_info cons
   auto unescaped_string_col = make_strings_column_from_host(unescaped_column_names, stream);
   auto d_column             = column_device_view::create(*unescaped_string_col, stream);
   return escape_strings_fn{*d_column, true}.get_escaped_strings(
-    *unescaped_string_col, stream, rmm::mr::get_current_device_resource());
+    *unescaped_string_col, stream, cudf::get_current_device_resource_ref());
 }
 
 void write_chunked(data_sink* out_sink,
                    strings_column_view const& str_column_view,
                    int const skip_last_chars,
                    json_writer_options const& options,
-                   rmm::cuda_stream_view stream,
-                   rmm::mr::device_memory_resource* mr)
+                   rmm::cuda_stream_view stream)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(str_column_view.size() > 0, "Unexpected empty strings column.");
@@ -827,8 +828,7 @@ void write_chunked(data_sink* out_sink,
 void write_json(data_sink* out_sink,
                 table_view const& table,
                 json_writer_options const& options,
-                rmm::cuda_stream_view stream,
-                rmm::mr::device_memory_resource* mr)
+                rmm::cuda_stream_view stream)
 {
   CUDF_FUNC_RANGE();
   std::vector<column_name_info> user_column_names = [&]() {
@@ -893,7 +893,7 @@ void write_json(data_sink* out_sink,
     }
 
     // convert each chunk to JSON:
-    column_to_strings_fn converter{options, stream, rmm::mr::get_current_device_resource()};
+    column_to_strings_fn converter{options, stream, cudf::get_current_device_resource_ref()};
 
     for (auto&& sub_view : vector_views) {
       // Skip if the table has no rows
@@ -910,7 +910,7 @@ void write_json(data_sink* out_sink,
       bool const include_line_terminator =
         (&sub_view != &vector_views.back()) or options.is_enabled_lines();
       auto const skip_last_chars = (include_line_terminator ? 0 : line_terminator.size());
-      write_chunked(out_sink, str_concat_col->view(), skip_last_chars, options, stream, mr);
+      write_chunked(out_sink, str_concat_col->view(), skip_last_chars, options, stream);
     }
   } else {
     if (options.is_enabled_lines()) {

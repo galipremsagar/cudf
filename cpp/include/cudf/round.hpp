@@ -17,10 +17,10 @@
 #pragma once
 
 #include <cudf/column/column.hpp>
+#include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/mr/device/per_device_resource.hpp>
-
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @addtogroup transformation_unaryops
@@ -72,9 +72,9 @@ enum class rounding_method : int32_t { HALF_UP, HALF_EVEN };
  */
 std::unique_ptr<column> round(
   column_view const& input,
-  int32_t decimal_places              = 0,
-  rounding_method method              = rounding_method::HALF_UP,
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  int32_t decimal_places            = 0,
+  rounding_method method            = rounding_method::HALF_UP,
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

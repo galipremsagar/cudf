@@ -28,6 +28,8 @@
 #include <cudf/detail/tdigest/tdigest.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/unary.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -73,7 +75,7 @@ struct make_centroid {
   centroid operator() __device__(size_type index) const
   {
     auto const is_valid = col.is_valid(index);
-    auto const mean     = is_valid ? static_cast<double>(col.element<T>(index)) : 0.0;
+    auto const mean     = is_valid ? convert_to_floating<double>(col.element<T>(index)) : 0.0;
     auto const weight   = is_valid ? 1.0 : 0.0;
     return {mean, weight, is_valid};
   }
@@ -87,7 +89,7 @@ struct make_centroid_no_nulls {
 
   centroid operator() __device__(size_type index) const
   {
-    return {static_cast<double>(col.element<T>(index)), 1.0, true};
+    return {convert_to_floating<double>(col.element<T>(index)), 1.0, true};
   }
 };
 
@@ -332,7 +334,7 @@ __device__ double scale_func_k1(double quantile, double delta_norm)
 // convert a single-row tdigest column to a scalar.
 std::unique_ptr<scalar> to_tdigest_scalar(std::unique_ptr<column>&& tdigest,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(tdigest->size() == 1,
                "Encountered invalid tdigest column when converting to scalar");
@@ -516,7 +518,7 @@ generate_group_cluster_info(int delta,
                             CumulativeWeight cumulative_weight,
                             bool has_nulls,
                             rmm::cuda_stream_view stream,
-                            rmm::mr::device_memory_resource* mr)
+                            rmm::device_async_resource_ref mr)
 {
   constexpr size_type block_size = 256;
   cudf::detail::grid_1d const grid(num_groups, block_size);
@@ -580,7 +582,7 @@ std::unique_ptr<column> build_output_column(size_type num_rows,
                                             std::unique_ptr<column>&& max_col,
                                             bool has_nulls,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   // whether or not this weight is a stub
   auto is_stub_weight = [weights = weights->view().begin<double>()] __device__(size_type i) {
@@ -731,7 +733,7 @@ std::unique_ptr<column> compute_tdigests(int delta,
                                          size_type total_clusters,
                                          bool has_nulls,
                                          rmm::cuda_stream_view stream,
-                                         rmm::mr::device_memory_resource* mr)
+                                         rmm::device_async_resource_ref mr)
 {
   // the output for each group is a column of data that represents the tdigest. since we want 1 row
   // per group, each row will be a list the length of the tdigest for that group. so our output
@@ -808,8 +810,9 @@ struct get_scalar_minmax_grouped {
     auto const valid_count = group_valid_counts[group_index];
     return valid_count > 0
              ? thrust::make_tuple(
-                 static_cast<double>(col.element<T>(group_offsets[group_index])),
-                 static_cast<double>(col.element<T>(group_offsets[group_index] + valid_count - 1)))
+                 convert_to_floating<double>(col.element<T>(group_offsets[group_index])),
+                 convert_to_floating<double>(
+                   col.element<T>(group_offsets[group_index] + valid_count - 1)))
              : thrust::make_tuple(0.0, 0.0);
   }
 };
@@ -823,8 +826,8 @@ struct get_scalar_minmax {
   __device__ thrust::tuple<double, double> operator()(size_type)
   {
     return valid_count > 0
-             ? thrust::make_tuple(static_cast<double>(col.element<T>(0)),
-                                  static_cast<double>(col.element<T>(valid_count - 1)))
+             ? thrust::make_tuple(convert_to_floating<double>(col.element<T>(0)),
+                                  convert_to_floating<double>(col.element<T>(valid_count - 1)))
              : thrust::make_tuple(0.0, 0.0);
   }
 };
@@ -839,7 +842,7 @@ struct typed_group_tdigest {
                                      size_type num_groups,
                                      int delta,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
   {
     // first, generate cluster weight information for each input group
     auto [group_cluster_wl, group_cluster_offsets, total_clusters] = generate_group_cluster_info(
@@ -905,7 +908,7 @@ struct typed_reduce_tdigest {
   std::unique_ptr<scalar> operator()(column_view const& col,
                                      int delta,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
   {
     // treat this the same as the groupby path with a single group.  Note:  even though
     // there is only 1 group there are still multiple keys within the group that represent
@@ -1027,7 +1030,7 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
                                        size_type num_groups,
                                        int max_centroids,
                                        rmm::cuda_stream_view stream,
-                                       rmm::mr::device_memory_resource* mr)
+                                       rmm::device_async_resource_ref mr)
 {
   // thrust::merge and thrust::merge_by_key don't provide what we need.  What we would need is an
   // algorithm like a super-merge that takes two layers of keys: one which identifies the outer
@@ -1079,7 +1082,7 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
                                               {order::ASCENDING},
                                               {},
                                               stream,
-                                              rmm::mr::get_current_device_resource());
+                                              cudf::get_current_device_resource_ref());
                  });
 
   // generate min and max values
@@ -1140,7 +1143,7 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
                  std::back_inserter(tdigest_views),
                  [](std::unique_ptr<table> const& t) { return t->view(); });
   auto merged =
-    cudf::detail::concatenate(tdigest_views, stream, rmm::mr::get_current_device_resource());
+    cudf::detail::concatenate(tdigest_views, stream, cudf::get_current_device_resource_ref());
 
   // generate cumulative weights
   auto merged_weights     = merged->get_column(1).view();
@@ -1209,7 +1212,7 @@ std::unique_ptr<column> merge_tdigests(tdigest_column_view const& tdv,
 std::unique_ptr<scalar> reduce_tdigest(column_view const& col,
                                        int max_centroids,
                                        rmm::cuda_stream_view stream,
-                                       rmm::mr::device_memory_resource* mr)
+                                       rmm::device_async_resource_ref mr)
 {
   if (col.size() == 0) { return cudf::tdigest::detail::make_empty_tdigest_scalar(stream, mr); }
 
@@ -1217,7 +1220,7 @@ std::unique_ptr<scalar> reduce_tdigest(column_view const& col,
   // order with nulls at the end.
   table_view t({col});
   auto sorted = cudf::detail::sort(
-    t, {order::ASCENDING}, {null_order::AFTER}, stream, rmm::mr::get_current_device_resource());
+    t, {order::ASCENDING}, {null_order::AFTER}, stream, cudf::get_current_device_resource_ref());
 
   auto const delta = max_centroids;
   return cudf::type_dispatcher(
@@ -1232,7 +1235,7 @@ struct group_offsets_fn {
 std::unique_ptr<scalar> reduce_merge_tdigest(column_view const& input,
                                              int max_centroids,
                                              rmm::cuda_stream_view stream,
-                                             rmm::mr::device_memory_resource* mr)
+                                             rmm::device_async_resource_ref mr)
 {
   tdigest_column_view tdv(input);
 
@@ -1262,7 +1265,7 @@ std::unique_ptr<column> group_tdigest(column_view const& col,
                                       size_type num_groups,
                                       int max_centroids,
                                       rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::device_async_resource_ref mr)
 {
   if (col.size() == 0) { return cudf::tdigest::detail::make_empty_tdigest_column(stream, mr); }
 
@@ -1285,7 +1288,7 @@ std::unique_ptr<column> group_merge_tdigest(column_view const& input,
                                             size_type num_groups,
                                             int max_centroids,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   tdigest_column_view tdv(input);
 

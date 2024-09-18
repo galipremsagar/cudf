@@ -28,8 +28,13 @@
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/structs/structs_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+
+#include <utility>
 
 namespace cudf {
 namespace reduction {
@@ -38,15 +43,15 @@ struct reduce_dispatch_functor {
   column_view const col;
   data_type output_dtype;
   std::optional<std::reference_wrapper<scalar const>> init;
-  rmm::mr::device_memory_resource* mr;
+  rmm::device_async_resource_ref mr;
   rmm::cuda_stream_view stream;
 
-  reduce_dispatch_functor(column_view const& col,
+  reduce_dispatch_functor(column_view col,
                           data_type output_dtype,
                           std::optional<std::reference_wrapper<scalar const>> init,
                           rmm::cuda_stream_view stream,
-                          rmm::mr::device_memory_resource* mr)
-    : col(col), output_dtype(output_dtype), init(init), mr(mr), stream(stream)
+                          rmm::device_async_resource_ref mr)
+    : col(std::move(col)), output_dtype(output_dtype), init(init), mr(mr), stream(stream)
   {
   }
 
@@ -73,7 +78,7 @@ struct reduce_dispatch_functor {
         return standard_deviation(col, output_dtype, var_agg._ddof, stream, mr);
       }
       case aggregation::MEDIAN: {
-        auto current_mr     = rmm::mr::get_current_device_resource();
+        auto current_mr     = cudf::get_current_device_resource_ref();
         auto sorted_indices = cudf::detail::sorted_order(
           table_view{{col}}, {}, {null_order::AFTER}, stream, current_mr);
         auto valid_sorted_indices =
@@ -86,7 +91,7 @@ struct reduce_dispatch_functor {
         auto quantile_agg = static_cast<cudf::detail::quantile_aggregation const&>(agg);
         CUDF_EXPECTS(quantile_agg._quantiles.size() == 1,
                      "Reduction quantile accepts only one quantile value");
-        auto current_mr     = rmm::mr::get_current_device_resource();
+        auto current_mr     = cudf::get_current_device_resource_ref();
         auto sorted_indices = cudf::detail::sorted_order(
           table_view{{col}}, {}, {null_order::AFTER}, stream, current_mr);
         auto valid_sorted_indices =
@@ -151,10 +156,11 @@ std::unique_ptr<scalar> reduce(column_view const& col,
                                data_type output_dtype,
                                std::optional<std::reference_wrapper<scalar const>> init,
                                rmm::cuda_stream_view stream,
-                               rmm::mr::device_memory_resource* mr)
+                               rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(!init.has_value() || col.type() == init.value().get().type(),
-               "column and initial value must be the same type");
+  CUDF_EXPECTS(!init.has_value() || cudf::have_same_types(col, init.value().get()),
+               "column and initial value must be the same type",
+               cudf::data_type_error);
   if (init.has_value() && !(agg.kind == aggregation::SUM || agg.kind == aggregation::PRODUCT ||
                             agg.kind == aggregation::MIN || agg.kind == aggregation::MAX ||
                             agg.kind == aggregation::ANY || agg.kind == aggregation::ALL)) {
@@ -204,20 +210,21 @@ std::unique_ptr<scalar> reduce(column_view const& col,
 std::unique_ptr<scalar> reduce(column_view const& col,
                                reduce_aggregation const& agg,
                                data_type output_dtype,
-                               rmm::mr::device_memory_resource* mr)
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return reduction::detail::reduce(
-    col, agg, output_dtype, std::nullopt, cudf::get_default_stream(), mr);
+  return reduction::detail::reduce(col, agg, output_dtype, std::nullopt, stream, mr);
 }
 
 std::unique_ptr<scalar> reduce(column_view const& col,
                                reduce_aggregation const& agg,
                                data_type output_dtype,
                                std::optional<std::reference_wrapper<scalar const>> init,
-                               rmm::mr::device_memory_resource* mr)
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return reduction::detail::reduce(col, agg, output_dtype, init, cudf::get_default_stream(), mr);
+  return reduction::detail::reduce(col, agg, output_dtype, init, stream, mr);
 }
 }  // namespace cudf

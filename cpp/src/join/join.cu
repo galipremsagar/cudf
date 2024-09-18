@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -33,14 +34,14 @@ inner_join(table_view const& left_input,
            table_view const& right_input,
            null_equality compare_nulls,
            rmm::cuda_stream_view stream,
-           rmm::mr::device_memory_resource* mr)
+           rmm::device_async_resource_ref mr)
 {
   // Make sure any dictionary columns have matched key sets.
   // This will return any new dictionary columns created as well as updated table_views.
   auto matched = cudf::dictionary::detail::match_dictionaries(
     {left_input, right_input},
     stream,
-    rmm::mr::get_current_device_resource());  // temporary objects returned
+    cudf::get_current_device_resource_ref());  // temporary objects returned
 
   // now rebuild the table views with the updated ones
   auto const left      = matched.second.front();
@@ -68,14 +69,14 @@ left_join(table_view const& left_input,
           table_view const& right_input,
           null_equality compare_nulls,
           rmm::cuda_stream_view stream,
-          rmm::mr::device_memory_resource* mr)
+          rmm::device_async_resource_ref mr)
 {
   // Make sure any dictionary columns have matched key sets.
   // This will return any new dictionary columns created as well as updated table_views.
   auto matched = cudf::dictionary::detail::match_dictionaries(
     {left_input, right_input},  // these should match
     stream,
-    rmm::mr::get_current_device_resource());  // temporary objects returned
+    cudf::get_current_device_resource_ref());  // temporary objects returned
   // now rebuild the table views with the updated ones
   table_view const left  = matched.second.front();
   table_view const right = matched.second.back();
@@ -93,14 +94,14 @@ full_join(table_view const& left_input,
           table_view const& right_input,
           null_equality compare_nulls,
           rmm::cuda_stream_view stream,
-          rmm::mr::device_memory_resource* mr)
+          rmm::device_async_resource_ref mr)
 {
   // Make sure any dictionary columns have matched key sets.
   // This will return any new dictionary columns created as well as updated table_views.
   auto matched = cudf::dictionary::detail::match_dictionaries(
     {left_input, right_input},  // these should match
     stream,
-    rmm::mr::get_current_device_resource());  // temporary objects returned
+    cudf::get_current_device_resource_ref());  // temporary objects returned
   // now rebuild the table views with the updated ones
   table_view const left  = matched.second.front();
   table_view const right = matched.second.back();
@@ -119,7 +120,7 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
 inner_join(table_view const& left,
            table_view const& right,
            null_equality compare_nulls,
-           rmm::mr::device_memory_resource* mr)
+           rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::inner_join(left, right, compare_nulls, cudf::get_default_stream(), mr);
@@ -130,7 +131,7 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
 left_join(table_view const& left,
           table_view const& right,
           null_equality compare_nulls,
-          rmm::mr::device_memory_resource* mr)
+          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::left_join(left, right, compare_nulls, cudf::get_default_stream(), mr);
@@ -141,7 +142,7 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
 full_join(table_view const& left,
           table_view const& right,
           null_equality compare_nulls,
-          rmm::mr::device_memory_resource* mr)
+          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::full_join(left, right, compare_nulls, cudf::get_default_stream(), mr);

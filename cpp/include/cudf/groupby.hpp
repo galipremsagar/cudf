@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,16 +21,17 @@
 #include <cudf/replace.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
 
 #include <memory>
 #include <utility>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 //! `groupby` APIs
 namespace groupby {
 namespace detail {
@@ -184,17 +185,17 @@ class groupby {
    */
   std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> aggregate(
     host_span<aggregation_request const> requests,
-    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
-   * @copydoc aggregate(host_span<aggregation_request const>, rmm::mr::device_memory_resource*)
+   * @copydoc aggregate(host_span<aggregation_request const>, rmm::device_async_resource_ref)
    *
    * @param stream CUDA stream used for device memory operations and kernel launches.
    */
   std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> aggregate(
     host_span<aggregation_request const> requests,
     rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
   /**
    * @brief Performs grouped scans on the specified values.
    *
@@ -248,7 +249,7 @@ class groupby {
    */
   std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> scan(
     host_span<scan_request const> requests,
-    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Performs grouped shifts for specified values.
@@ -304,7 +305,7 @@ class groupby {
     table_view const& values,
     host_span<size_type const> offsets,
     std::vector<std::reference_wrapper<scalar const>> const& fill_values,
-    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief The grouped data corresponding to a groupby operation on a set of values.
@@ -332,8 +333,8 @@ class groupby {
    * returned groups
    * @return A `groups` object representing grouped keys and values
    */
-  groups get_groups(cudf::table_view values             = {},
-                    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  groups get_groups(cudf::table_view values           = {},
+                    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Performs grouped replace nulls on @p value
@@ -373,7 +374,7 @@ class groupby {
   std::pair<std::unique_ptr<table>, std::unique_ptr<table>> replace_nulls(
     table_view const& values,
     host_span<cudf::replace_policy const> replace_policies,
-    rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
  private:
   table_view _keys;                                      ///< Keys that determine grouping
@@ -404,19 +405,19 @@ class groupby {
   std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> dispatch_aggregation(
     host_span<aggregation_request const> requests,
     rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr);
+    rmm::device_async_resource_ref mr);
 
   // Sort-based groupby
   std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> sort_aggregate(
     host_span<aggregation_request const> requests,
     rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr);
+    rmm::device_async_resource_ref mr);
 
   std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> sort_scan(
     host_span<scan_request const> requests,
     rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr);
+    rmm::device_async_resource_ref mr);
 };
 /** @} */
 }  // namespace groupby
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

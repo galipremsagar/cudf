@@ -28,6 +28,7 @@
 #include <cudf/copying.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/filling.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/device_buffer.hpp>
 
@@ -116,8 +117,7 @@ std::vector<std::vector<bool>> create_expected_validity(std::vector<cudf::size_t
   std::vector<cudf::size_type> indices  = splits_to_indices(splits, validity.size());
 
   for (unsigned long index = 0; index < indices.size(); index += 2) {
-    result.push_back(
-      std::vector<bool>(validity.begin() + indices[index], validity.begin() + indices[index + 1]));
+    result.emplace_back(validity.begin() + indices[index], validity.begin() + indices[index + 1]);
   }
 
   return result;
@@ -914,12 +914,12 @@ void split_structs(bool include_validity, SplitFunc Split, CompareFunc Compare, 
   // 1. String "names" column.
   std::vector<std::string> names{
     "Vimes", "Carrot", "Angua", "Cheery", "Detritus", "Slant", "Fred", "Todd", "Kevin"};
-  std::vector<bool> names_validity{1, 1, 1, 1, 1, 1, 1, 1, 1};
+  std::vector<bool> names_validity{true, true, true, true, true, true, true, true, true};
   cudf::test::strings_column_wrapper names_column(names.begin(), names.end());
 
   // 2. Numeric "ages" column.
   std::vector<int> ages{5, 10, 15, 20, 25, 30, 100, 101, 102};
-  std::vector<bool> ages_validity = {1, 1, 1, 1, 0, 1, 0, 0, 1};
+  std::vector<bool> ages_validity = {true, true, true, true, false, true, false, false, true};
   auto ages_column =
     include_validity
       ? cudf::test::fixed_width_column_wrapper<int>(ages.begin(), ages.end(), ages_validity.begin())
@@ -927,7 +927,7 @@ void split_structs(bool include_validity, SplitFunc Split, CompareFunc Compare, 
 
   // 3. Boolean "is_human" column.
   std::vector<bool> is_human{true, true, false, false, false, false, true, true, true};
-  std::vector<bool> is_human_validity{1, 1, 1, 0, 1, 1, 1, 1, 0};
+  std::vector<bool> is_human_validity{true, true, true, false, true, true, true, true, false};
   auto is_human_col =
     include_validity
       ? cudf::test::fixed_width_column_wrapper<bool>(
@@ -935,7 +935,8 @@ void split_structs(bool include_validity, SplitFunc Split, CompareFunc Compare, 
       : cudf::test::fixed_width_column_wrapper<bool>(is_human.begin(), is_human.end());
 
   // Assemble struct column.
-  auto const struct_validity = std::vector<bool>{1, 1, 1, 1, 1, 0, 0, 1, 0};
+  auto const struct_validity =
+    std::vector<bool>{true, true, true, true, true, false, false, true, false};
   auto struct_column =
     include_validity
       ? cudf::test::structs_column_wrapper({names_column, ages_column, is_human_col},
@@ -1084,17 +1085,17 @@ void split_nested_struct_of_list(SplitFunc Split, CompareFunc Compare, bool spli
   // 1. String "names" column.
   std::vector<std::string> names{
     "Vimes", "Carrot", "Angua", "Cheery", "Detritus", "Slant", "Fred", "Todd", "Kevin"};
-  std::vector<bool> names_validity{1, 1, 1, 1, 1, 1, 1, 1, 1};
+  std::vector<bool> names_validity{true, true, true, true, true, true, true, true, true};
   cudf::test::strings_column_wrapper names_column(names.begin(), names.end());
 
   // 2. Numeric "ages" column.
   std::vector<int> ages{5, 10, 15, 20, 25, 30, 100, 101, 102};
-  std::vector<bool> ages_validity = {1, 1, 1, 1, 0, 1, 0, 0, 1};
+  std::vector<bool> ages_validity = {true, true, true, true, false, true, false, false, true};
   auto ages_column =
     cudf::test::fixed_width_column_wrapper<int>(ages.begin(), ages.end(), ages_validity.begin());
 
   // 3. List column
-  std::vector<bool> list_validity{1, 1, 1, 1, 1, 0, 1, 0, 1};
+  std::vector<bool> list_validity{true, true, true, true, true, false, true, false, true};
   cudf::test::lists_column_wrapper<float> list({{{1, 2, 3}, {4}},
                                                 {{-1, -2}, LCW{}},
                                                 LCW{},
@@ -1107,7 +1108,8 @@ void split_nested_struct_of_list(SplitFunc Split, CompareFunc Compare, bool spli
                                                list_validity.begin());
 
   // Assemble struct column.
-  auto const struct_validity = std::vector<bool>{1, 1, 1, 1, 1, 0, 0, 1, 0};
+  auto const struct_validity =
+    std::vector<bool>{true, true, true, true, true, false, false, true, false};
   auto struct_column =
     cudf::test::structs_column_wrapper({names_column, ages_column, list}, struct_validity.begin());
 
@@ -1120,7 +1122,7 @@ void split_nested_struct_of_list(SplitFunc Split, CompareFunc Compare, bool spli
     std::vector<cudf::test::lists_column_wrapper<float>> expected_lists;
     expected_lists.push_back(LCW({{{1, 2, 3}, {4}}}));
     expected_lists.push_back(LCW({{{-1, -2}, LCW{}}, LCW{}}));
-    std::vector<bool> ex_v{1, 1, 0, 1, 0};
+    std::vector<bool> ex_v{true, true, false, true, false};
     expected_lists.push_back(LCW({{{10}, {20, 30, 40}, {100, -100}},
                                   {LCW{}, LCW{}, {8, 9}},
                                   LCW{},
@@ -1169,17 +1171,68 @@ void split_nested_list_of_structs(SplitFunc Split, CompareFunc Compare, bool spl
                                  "Mark",
                                  "Herman",
                                  "Will"};
-  std::vector<bool> names_validity{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+  std::vector<bool> names_validity{true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true,
+                                   true};
   cudf::test::strings_column_wrapper names_column(names.begin(), names.end());
 
   // 2. Numeric "ages" column.
   std::vector<int> ages{5, 10, 15, 20, 25, 30, 100, 101, 102, 26, 64, 12, 17, 16, 120, 44, 23, 50};
-  std::vector<bool> ages_validity = {1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 0};
+  std::vector<bool> ages_validity = {true,
+                                     true,
+                                     true,
+                                     true,
+                                     false,
+                                     true,
+                                     false,
+                                     false,
+                                     true,
+                                     true,
+                                     true,
+                                     false,
+                                     false,
+                                     false,
+                                     true,
+                                     true,
+                                     true,
+                                     false};
   auto ages_column =
     cudf::test::fixed_width_column_wrapper<int>(ages.begin(), ages.end(), ages_validity.begin());
 
   // 3. List column
-  std::vector<bool> list_validity{1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1};
+  std::vector<bool> list_validity{true,
+                                  true,
+                                  true,
+                                  true,
+                                  true,
+                                  false,
+                                  true,
+                                  false,
+                                  true,
+                                  true,
+                                  true,
+                                  true,
+                                  true,
+                                  true,
+                                  true,
+                                  false,
+                                  true,
+                                  true};
   cudf::test::lists_column_wrapper<cudf::string_view> list(
     {{"ab", "cd", "ef"},
      LCW{"gh"},
@@ -1202,8 +1255,24 @@ void split_nested_list_of_structs(SplitFunc Split, CompareFunc Compare, bool spl
     list_validity.begin());
 
   // Assembly struct column
-  auto const struct_validity =
-    std::vector<bool>{1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1};
+  auto const struct_validity = std::vector<bool>{true,
+                                                 true,
+                                                 true,
+                                                 true,
+                                                 true,
+                                                 false,
+                                                 false,
+                                                 true,
+                                                 false,
+                                                 false,
+                                                 false,
+                                                 false,
+                                                 true,
+                                                 true,
+                                                 true,
+                                                 true,
+                                                 false,
+                                                 true};
   auto struct_column =
     cudf::test::structs_column_wrapper({names_column, ages_column, list}, struct_validity.begin());
 
@@ -1211,7 +1280,7 @@ void split_nested_list_of_structs(SplitFunc Split, CompareFunc Compare, bool spl
   std::vector<int> outer_offsets{0, 3, 4, 8, 13, 16, 17, 18};
   cudf::test::fixed_width_column_wrapper<int> outer_offsets_col(outer_offsets.begin(),
                                                                 outer_offsets.end());
-  std::vector<bool> outer_validity{1, 1, 1, 0, 1, 1, 0};
+  std::vector<bool> outer_validity{true, true, true, false, true, true, false};
   auto [outer_null_mask, outer_null_count] =
     cudf::test::detail::make_null_mask(outer_validity.begin(), outer_validity.end());
   auto outer_list = make_lists_column(static_cast<cudf::size_type>(outer_validity.size()),
@@ -1315,7 +1384,7 @@ struct ContiguousSplitTest : public cudf::test::BaseFixture {};
 
 std::vector<cudf::packed_table> do_chunked_pack(cudf::table_view const& input)
 {
-  auto mr = rmm::mr::get_current_device_resource();
+  auto mr = cudf::get_current_device_resource_ref();
 
   rmm::device_buffer bounce_buff(1 * 1024 * 1024, cudf::get_default_stream(), mr);
   auto bounce_buff_span =
@@ -1713,8 +1782,8 @@ TEST_F(ContiguousSplitStringTableTest, EmptyInputColumn)
     auto result = cudf::contiguous_split(src_table, splits);
     ASSERT_EQ(result.size(), 5);
 
-    for (size_t idx = 0; idx < result.size(); idx++) {
-      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(src_table, result[idx].table);
+    for (auto& idx : result) {
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(src_table, idx.table);
     }
   }
 }
@@ -1953,7 +2022,7 @@ TEST_F(ContiguousSplitTableCornerCases, PreSplitTable)
 
   cudf::test::lists_column_wrapper<int> col0{{{1, 2, 3}, {4, 5}},
                                              {{LCW{}, LCW{}, {7, 8}, LCW{}}, valids},
-                                             {{{6}}},
+                                             {{{6}}},  // NOLINT
                                              {{{7, 8}, LCW{}, {{9, 10, 11}, valids}}, valids},
                                              {{{-1, -2, -3, -4, -5}, LCW{}}, valids},
                                              {LCW{}},
@@ -2098,12 +2167,13 @@ TEST_F(ContiguousSplitTableCornerCases, PreSplitStructs)
   // includes struct<list>
   {
     cudf::test::fixed_width_column_wrapper<int> a{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-    cudf::test::fixed_width_column_wrapper<float> b{{0, -1, -2, -3, -4, -5, -6, -7, -8, -9},
-                                                    {1, 1, 1, 0, 0, 0, 0, 1, 1, 1}};
+    cudf::test::fixed_width_column_wrapper<float> b{
+      {0, -1, -2, -3, -4, -5, -6, -7, -8, -9},
+      {true, true, true, false, false, false, false, true, true, true}};
     cudf::test::strings_column_wrapper c{
       {"abc", "def", "ghi", "jkl", "mno", "", "st", "uvwx", "yy", "zzzz"},
-      {0, 0, 1, 1, 1, 1, 1, 1, 1, 1}};
-    std::vector<bool> list_validity{1, 0, 1, 0, 1, 0, 1, 1, 1, 1};
+      {false, false, true, true, true, true, true, true, true, true}};
+    std::vector<bool> list_validity{true, false, true, false, true, false, true, true, true, true};
     cudf::test::lists_column_wrapper<int16_t> d{
       {{0, 1}, {2, 3, 4}, {5, 6}, {7}, {8, 9, 10}, {11, 12}, {}, {15, 16, 17}, {18, 19}, {20}},
       list_validity.begin()};
@@ -2112,8 +2182,10 @@ TEST_F(ContiguousSplitTableCornerCases, PreSplitStructs)
       -10, -20, -30, -40, -50, -60, -70, -80, -90, -100};
     cudf::test::strings_column_wrapper _c{
       "aa", "", "ccc", "dddd", "eeeee", "f", "gg", "hhh", "i", "jjj"};
-    cudf::test::structs_column_wrapper e({_a, _b, _c}, {1, 1, 1, 0, 1, 1, 1, 0, 1, 1});
-    cudf::test::structs_column_wrapper s({a, b, c, d, e}, {1, 1, 0, 1, 1, 1, 1, 1, 1, 1});
+    cudf::test::structs_column_wrapper e(
+      {_a, _b, _c}, {true, true, true, false, true, true, true, false, true, true});
+    cudf::test::structs_column_wrapper s(
+      {a, b, c, d, e}, {true, true, false, true, true, true, true, true, true, true});
 
     auto pre_split = cudf::split(s, {4});
 
@@ -2312,7 +2384,7 @@ TEST_F(ContiguousSplitTableCornerCases, ChunkSpanTooSmall)
 {
   auto chunked_pack = cudf::chunked_pack::create({}, 1 * 1024 * 1024);
   rmm::device_buffer buff(
-    1 * 1024, cudf::test::get_default_stream(), rmm::mr::get_current_device_resource());
+    1 * 1024, cudf::test::get_default_stream(), cudf::get_current_device_resource_ref());
   cudf::device_span<uint8_t> too_small(static_cast<uint8_t*>(buff.data()), buff.size());
   std::size_t copied = 0;
   // throws because we created chunked_contig_split with 1MB, but we are giving
@@ -2325,7 +2397,7 @@ TEST_F(ContiguousSplitTableCornerCases, EmptyTableHasNextFalse)
 {
   auto chunked_pack = cudf::chunked_pack::create({}, 1 * 1024 * 1024);
   rmm::device_buffer buff(
-    1 * 1024 * 1024, cudf::test::get_default_stream(), rmm::mr::get_current_device_resource());
+    1 * 1024 * 1024, cudf::test::get_default_stream(), cudf::get_current_device_resource_ref());
   cudf::device_span<uint8_t> bounce_buff(static_cast<uint8_t*>(buff.data()), buff.size());
   EXPECT_EQ(chunked_pack->has_next(), false);  // empty input table
   std::size_t copied = 0;
@@ -2338,7 +2410,7 @@ TEST_F(ContiguousSplitTableCornerCases, ExhaustedHasNextFalse)
   cudf::test::strings_column_wrapper a{"abc", "def", "ghi", "jkl", "mno", "", "st", "uvwx"};
   cudf::table_view t({a});
   rmm::device_buffer buff(
-    1 * 1024 * 1024, cudf::test::get_default_stream(), rmm::mr::get_current_device_resource());
+    1 * 1024 * 1024, cudf::test::get_default_stream(), cudf::get_current_device_resource_ref());
   cudf::device_span<uint8_t> bounce_buff(static_cast<uint8_t*>(buff.data()), buff.size());
   auto chunked_pack = cudf::chunked_pack::create(t, buff.size());
   EXPECT_EQ(chunked_pack->has_next(), true);

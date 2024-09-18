@@ -80,7 +80,7 @@ std::array<char, 33> const escapable_chars{
  */
 std::vector<char32_t> string_to_char32_vector(std::string_view pattern)
 {
-  size_type size  = static_cast<size_type>(pattern.size());
+  auto size       = static_cast<size_type>(pattern.size());
   size_type count = std::count_if(pattern.cbegin(), pattern.cend(), [](char ch) {
     return is_begin_utf8_char(static_cast<uint8_t>(ch));
   });
@@ -165,8 +165,8 @@ class regex_parser {
         int16_t m;
       } count;
     } d;
-    Item(int32_t type, char32_t chr) : type{type}, d{chr} {}
-    Item(int32_t type, int32_t id) : type{type}, d{.cclass_id{id}} {}
+    Item(int32_t type, char32_t chr) : type{type}, d{.chr = chr} {}
+    Item(int32_t type, int32_t id) : type{type}, d{.cclass_id = id} {}
     Item(int32_t type, int16_t n, int16_t m) : type{type}, d{.count{n, m}} {}
   };
 
@@ -539,15 +539,26 @@ class regex_parser {
                                                          : static_cast<int32_t>(LBRA);
       case ')': return RBRA;
       case '^': {
-        _chr = is_multiline(_flags) ? chr : '\n';
+        if (is_ext_newline(_flags)) {
+          _chr = is_multiline(_flags) ? 'S' : 'N';
+        } else {
+          _chr = is_multiline(_flags) ? chr : '\n';
+        }
         return BOL;
       }
       case '$': {
-        _chr = is_multiline(_flags) ? chr : '\n';
+        if (is_ext_newline(_flags)) {
+          _chr = is_multiline(_flags) ? 'S' : 'N';
+        } else {
+          _chr = is_multiline(_flags) ? chr : '\n';
+        }
         return EOL;
       }
       case '[': return build_cclass();
-      case '.': return dot_type;
+      case '.': {
+        _chr = is_ext_newline(_flags) ? 'N' : chr;
+        return dot_type;
+      }
     }
 
     if (std::find(quantifiers.begin(), quantifiers.end(), static_cast<char>(chr)) ==
@@ -692,7 +703,7 @@ class regex_parser {
     return CHAR;
   }
 
-  std::vector<regex_parser::Item> expand_counted_items() const
+  [[nodiscard]] std::vector<regex_parser::Item> expand_counted_items() const
   {
     std::vector<regex_parser::Item> const& in = _items;
     std::vector<regex_parser::Item> out;
@@ -738,20 +749,20 @@ class regex_parser {
         // optional maximum repeats (m)
         if (m >= 0) {
           for (int j = n; j < m; j++) {
-            out.push_back(regex_parser::Item{LBRA_NC, 0});
+            out.emplace_back(LBRA_NC, 0);
             out.insert(out.end(), begin, end);
           }
           for (int j = n; j < m; j++) {
-            out.push_back(regex_parser::Item{RBRA, 0});
-            out.push_back(regex_parser::Item{item.type == COUNTED ? QUEST : QUEST_LAZY, 0});
+            out.emplace_back(RBRA, 0);
+            out.emplace_back(item.type == COUNTED ? QUEST : QUEST_LAZY, 0);
           }
         } else {
           // infinite repeats
           if (n > 0) {  // append '+' after last repetition
-            out.push_back(regex_parser::Item{item.type == COUNTED ? PLUS : PLUS_LAZY, 0});
+            out.emplace_back(item.type == COUNTED ? PLUS : PLUS_LAZY, 0);
           } else {  // copy it once then append '*'
             out.insert(out.end(), begin, end);
-            out.push_back(regex_parser::Item{item.type == COUNTED ? STAR : STAR_LAZY, 0});
+            out.emplace_back(item.type == COUNTED ? STAR : STAR_LAZY, 0);
           }
         }
       }
@@ -780,7 +791,7 @@ class regex_parser {
     }
   }
 
-  std::vector<regex_parser::Item> get_items() const
+  [[nodiscard]] std::vector<regex_parser::Item> get_items() const
   {
     return _has_counted ? expand_counted_items() : _items;
   }
@@ -803,8 +814,8 @@ class regex_compiler {
   reprog& _prog;
   std::stack<and_node> _and_stack;
   std::stack<re_operator> _operator_stack;
-  bool _last_was_and;
-  int _bracket_count;
+  bool _last_was_and{false};
+  int _bracket_count{0};
   regex_flags _flags;
 
   inline void push_and(int first, int last) { _and_stack.push({first, last}); }
@@ -959,7 +970,7 @@ class regex_compiler {
       _prog.inst_at(inst_id).u1.cls_id = class_id;
     } else if (token == CHAR) {
       _prog.inst_at(inst_id).u1.c = yy;
-    } else if (token == BOL || token == EOL) {
+    } else if (token == BOL || token == EOL || token == ANY) {
       _prog.inst_at(inst_id).u1.c = yy;
     }
     push_and(inst_id, inst_id);
@@ -971,7 +982,7 @@ class regex_compiler {
                  regex_flags const flags,
                  capture_groups const capture,
                  reprog& prog)
-    : _prog(prog), _last_was_and(false), _bracket_count(0), _flags(flags)
+    : _prog(prog), _flags(flags)
   {
     // Parse pattern into items
     auto const items = regex_parser(pattern, _flags, capture, _prog).get_items();
@@ -1194,7 +1205,7 @@ void reprog::print(regex_flags const flags)
       case STAR: printf("   STAR next=%d", inst.u2.next_id); break;
       case PLUS: printf("   PLUS next=%d", inst.u2.next_id); break;
       case QUEST: printf("  QUEST next=%d", inst.u2.next_id); break;
-      case ANY: printf("    ANY next=%d", inst.u2.next_id); break;
+      case ANY: printf("    ANY '%c', next=%d", inst.u1.c, inst.u2.next_id); break;
       case ANYNL: printf("  ANYNL next=%d", inst.u2.next_id); break;
       case NOP: printf("    NOP next=%d", inst.u2.next_id); break;
       case BOL: {

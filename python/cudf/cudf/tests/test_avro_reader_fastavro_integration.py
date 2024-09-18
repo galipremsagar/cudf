@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import datetime
 import io
 import pathlib
-from typing import Optional
 
 import fastavro
 import numpy as np
@@ -22,7 +23,8 @@ import pandas as pd
 import pytest
 
 import cudf
-from cudf.testing._utils import assert_eq
+from cudf.core._compat import PANDAS_CURRENT_SUPPORTED_VERSION, PANDAS_VERSION
+from cudf.testing import assert_eq
 from cudf.testing.dataset_generator import rand_dataframe
 
 
@@ -292,7 +294,7 @@ def test_can_detect_dtypes_from_avro_logical_type(
     assert_eq(expected, actual)
 
 
-def get_days_from_epoch(date: Optional[datetime.date]) -> Optional[int]:
+def get_days_from_epoch(date: datetime.date | None) -> int | None:
     if date is None:
         return None
     return (date - datetime.date(1970, 1, 1)).days
@@ -301,6 +303,10 @@ def get_days_from_epoch(date: Optional[datetime.date]) -> Optional[int]:
 @pytest.mark.parametrize("namespace", [None, "root_ns"])
 @pytest.mark.parametrize("nullable", [True, False])
 @pytest.mark.parametrize("prepend_null", [True, False])
+@pytest.mark.skipif(
+    PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+    reason="Fails in older versions of pandas (datetime(9999, ...) too large)",
+)
 def test_can_parse_avro_date_logical_type(namespace, nullable, prepend_null):
     avro_type = {"logicalType": "date", "type": "int"}
     if nullable:

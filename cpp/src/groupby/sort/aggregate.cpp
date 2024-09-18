@@ -35,6 +35,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -434,7 +435,7 @@ void aggregate_result_functor::operator()<aggregation::COLLECT_SET>(aggregation 
                                                     helper.num_groups(stream),
                                                     null_handling,
                                                     stream,
-                                                    rmm::mr::get_current_device_resource());
+                                                    cudf::get_current_device_resource_ref());
   auto const nulls_equal =
     dynamic_cast<cudf::detail::collect_set_aggregation const&>(agg)._nulls_equal;
   auto const nans_equal =
@@ -506,7 +507,7 @@ void aggregate_result_functor::operator()<aggregation::MERGE_SETS>(aggregation c
                                                        helper.group_offsets(stream),
                                                        helper.num_groups(stream),
                                                        stream,
-                                                       rmm::mr::get_current_device_resource());
+                                                       cudf::get_current_device_resource_ref());
   auto const& merge_sets_agg = dynamic_cast<cudf::detail::merge_sets_aggregation const&>(agg);
   cache.add_result(values,
                    agg,
@@ -797,7 +798,7 @@ void aggregate_result_functor::operator()<aggregation::MERGE_TDIGEST>(aggregatio
 std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby::sort_aggregate(
   host_span<aggregation_request const> requests,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   // We're going to start by creating a cache of results so that aggs that
   // depend on other aggs will not have to be recalculated. e.g. mean depends on

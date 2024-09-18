@@ -21,6 +21,8 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/io/detail/batched_memset.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/exec_policy.hpp>
 
@@ -77,23 +79,30 @@ void print_pages(cudf::detail::hostdevice_vector<PageInfo>& pages, rmm::cuda_str
  * is indicated when adding new values.  This function generates the mappings of
  * the R/D levels to those start/end bounds
  *
- * @param remap Maps column schema index to the R/D remapping vectors for that column
- * @param src_col_schema The column schema to generate the new mapping for
+ * @param remap Maps column schema index to the R/D remapping vectors for that column for a
+ *              particular input source file
+ * @param src_col_schema The source column schema to generate the new mapping for
+ * @param mapped_src_col_schema Mapped column schema for src_file_idx'th file
+ * @param src_file_idx The input source file index for the column schema
  * @param md File metadata information
  */
-void generate_depth_remappings(std::map<int, std::pair<std::vector<int>, std::vector<int>>>& remap,
-                               int src_col_schema,
-                               aggregate_reader_metadata const& md)
+void generate_depth_remappings(
+  std::map<std::pair<int, int>, std::pair<std::vector<int>, std::vector<int>>>& remap,
+  int const src_col_schema,
+  int const mapped_src_col_schema,
+  int const src_file_idx,
+  aggregate_reader_metadata const& md)
 {
   // already generated for this level
-  if (remap.find(src_col_schema) != remap.end()) { return; }
-  auto schema   = md.get_schema(src_col_schema);
-  int max_depth = md.get_output_nesting_depth(src_col_schema);
+  if (remap.find({src_col_schema, src_file_idx}) != remap.end()) { return; }
+  auto const& schema   = md.get_schema(mapped_src_col_schema, src_file_idx);
+  auto const max_depth = md.get_output_nesting_depth(src_col_schema);
 
-  CUDF_EXPECTS(remap.find(src_col_schema) == remap.end(),
+  CUDF_EXPECTS(remap.find({src_col_schema, src_file_idx}) == remap.end(),
                "Attempting to remap a schema more than once");
   auto inserted =
-    remap.insert(std::pair<int, std::pair<std::vector<int>, std::vector<int>>>{src_col_schema, {}});
+    remap.insert(std::pair<std::pair<int, int>, std::pair<std::vector<int>, std::vector<int>>>{
+      {src_col_schema, src_file_idx}, {}});
   auto& depth_remap = inserted.first->second;
 
   std::vector<int>& rep_depth_remap = (depth_remap.first);
@@ -134,15 +143,15 @@ void generate_depth_remappings(std::map<int, std::pair<std::vector<int>, std::ve
     auto find_shallowest = [&](int r) {
       int shallowest = -1;
       int cur_depth  = max_depth - 1;
-      int schema_idx = src_col_schema;
+      int schema_idx = mapped_src_col_schema;
       while (schema_idx > 0) {
-        auto cur_schema = md.get_schema(schema_idx);
+        auto& cur_schema = md.get_schema(schema_idx, src_file_idx);
         if (cur_schema.max_repetition_level == r) {
           // if this is a repeated field, map it one level deeper
           shallowest = cur_schema.is_stub() ? cur_depth + 1 : cur_depth;
         }
         // if it's one-level encoding list
-        else if (cur_schema.is_one_level_list(md.get_schema(cur_schema.parent_idx))) {
+        else if (cur_schema.is_one_level_list(md.get_schema(cur_schema.parent_idx, src_file_idx))) {
           shallowest = cur_depth - 1;
         }
         if (!cur_schema.is_stub()) { cur_depth--; }
@@ -157,10 +166,10 @@ void generate_depth_remappings(std::map<int, std::pair<std::vector<int>, std::ve
   for (int s_idx = schema.max_definition_level; s_idx >= 0; s_idx--) {
     auto find_deepest = [&](int d) {
       SchemaElement prev_schema;
-      int schema_idx = src_col_schema;
+      int schema_idx = mapped_src_col_schema;
       int r1         = 0;
       while (schema_idx > 0) {
-        SchemaElement cur_schema = md.get_schema(schema_idx);
+        SchemaElement cur_schema = md.get_schema(schema_idx, src_file_idx);
         if (cur_schema.max_definition_level == d) {
           // if this is a repeated field, map it one level deeper
           r1 = cur_schema.is_stub() ? prev_schema.max_repetition_level
@@ -173,10 +182,10 @@ void generate_depth_remappings(std::map<int, std::pair<std::vector<int>, std::ve
 
       // we now know R1 from above. return the deepest nesting level that has the
       // same repetition level
-      schema_idx = src_col_schema;
+      schema_idx = mapped_src_col_schema;
       int depth  = max_depth - 1;
       while (schema_idx > 0) {
-        SchemaElement cur_schema = md.get_schema(schema_idx);
+        SchemaElement cur_schema = md.get_schema(schema_idx, src_file_idx);
         if (cur_schema.max_repetition_level == r1) {
           // if this is a repeated field, map it one level deeper
           depth = cur_schema.is_stub() ? depth + 1 : depth;
@@ -370,7 +379,7 @@ void fill_in_page_info(host_span<ColumnChunkDesc> chunks,
                        rmm::cuda_stream_view stream)
 {
   auto const num_pages = pages.size();
-  std::vector<page_index_info> page_indexes(num_pages);
+  auto page_indexes    = cudf::detail::make_host_vector<page_index_info>(num_pages, stream);
 
   for (size_t c = 0, page_count = 0; c < chunks.size(); c++) {
     auto const& chunk = chunks[c];
@@ -391,7 +400,7 @@ void fill_in_page_info(host_span<ColumnChunkDesc> chunks,
   }
 
   auto d_page_indexes = cudf::detail::make_device_uvector_async(
-    page_indexes, stream, rmm::mr::get_current_device_resource());
+    page_indexes, stream, cudf::get_current_device_resource_ref());
 
   auto iter = thrust::make_counting_iterator<size_type>(0);
   thrust::for_each(
@@ -452,9 +461,9 @@ std::string encoding_to_string(Encoding encoding)
 [[nodiscard]] std::string list_unsupported_encodings(device_span<PageInfo const> pages,
                                                      rmm::cuda_stream_view stream)
 {
-  auto const to_mask = [] __device__(auto const& page) {
+  auto const to_mask = cuda::proclaim_return_type<uint32_t>([] __device__(auto const& page) {
     return is_supported_encoding(page.encoding) ? 0U : encoding_to_mask(page.encoding);
-  };
+  });
   uint32_t const unsupported = thrust::transform_reduce(
     rmm::exec_policy(stream), pages.begin(), pages.end(), to_mask, 0U, thrust::bit_or<uint32_t>());
   return encoding_bitmask_to_str(unsupported);
@@ -636,15 +645,24 @@ void decode_page_headers(pass_intermediate_data& pass,
   stream.synchronize();
 }
 
+constexpr bool is_string_chunk(ColumnChunkDesc const& chunk)
+{
+  auto const is_decimal =
+    chunk.logical_type.has_value() and chunk.logical_type->type == LogicalType::DECIMAL;
+  auto const is_binary =
+    chunk.physical_type == BYTE_ARRAY or chunk.physical_type == FIXED_LEN_BYTE_ARRAY;
+  return is_binary and not is_decimal;
+}
+
 struct set_str_dict_index_count {
   device_span<size_t> str_dict_index_count;
-  device_span<const ColumnChunkDesc> chunks;
+  device_span<ColumnChunkDesc const> chunks;
 
   __device__ void operator()(PageInfo const& page)
   {
     auto const& chunk = chunks[page.chunk_idx];
-    if ((page.flags & PAGEINFO_FLAGS_DICTIONARY) && chunk.physical_type == BYTE_ARRAY &&
-        (chunk.num_dict_pages > 0)) {
+    if ((page.flags & PAGEINFO_FLAGS_DICTIONARY) != 0 and chunk.num_dict_pages > 0 and
+        is_string_chunk(chunk)) {
       // there is only ever one dictionary page per chunk, so this is safe to do in parallel.
       str_dict_index_count[page.chunk_idx] = page.num_input_values;
     }
@@ -653,13 +671,13 @@ struct set_str_dict_index_count {
 
 struct set_str_dict_index_ptr {
   string_index_pair* const base;
-  device_span<const size_t> str_dict_index_offsets;
+  device_span<size_t const> str_dict_index_offsets;
   device_span<ColumnChunkDesc> chunks;
 
   __device__ void operator()(size_t i)
   {
     auto& chunk = chunks[i];
-    if (chunk.physical_type == BYTE_ARRAY && (chunk.num_dict_pages > 0)) {
+    if (chunk.num_dict_pages > 0 and is_string_chunk(chunk)) {
       chunk.str_dict_index = base + str_dict_index_offsets[i];
     }
   }
@@ -670,7 +688,7 @@ struct set_str_dict_index_ptr {
  *
  */
 struct set_list_row_count_estimate {
-  device_span<const ColumnChunkDesc> chunks;
+  device_span<ColumnChunkDesc const> chunks;
 
   __device__ void operator()(PageInfo& page)
   {
@@ -699,7 +717,7 @@ struct set_list_row_count_estimate {
  */
 struct set_final_row_count {
   device_span<PageInfo> pages;
-  device_span<const ColumnChunkDesc> chunks;
+  device_span<ColumnChunkDesc const> chunks;
 
   __device__ void operator()(size_t i)
   {
@@ -744,7 +762,7 @@ void reader::impl::build_string_dict_indices()
 
   // allocate and distribute pointers
   pass.str_dict_index = cudf::detail::make_zeroed_device_uvector_async<string_index_pair>(
-    total_str_dict_indexes, _stream, rmm::mr::get_current_device_resource());
+    total_str_dict_indexes, _stream, cudf::get_current_device_resource_ref());
 
   auto iter = thrust::make_counting_iterator(0);
   thrust::for_each(
@@ -772,9 +790,20 @@ void reader::impl::allocate_nesting_info()
   std::vector<int> per_page_nesting_info_size(num_columns);
   auto iter = thrust::make_counting_iterator(size_type{0});
   std::transform(iter, iter + num_columns, per_page_nesting_info_size.begin(), [&](size_type i) {
+    // Schema index of the current input column
     auto const schema_idx = _input_columns[i].schema_idx;
-    auto const& schema    = _metadata->get_schema(schema_idx);
-    return max(schema.max_definition_level + 1, _metadata->get_output_nesting_depth(schema_idx));
+    // Get the max_definition_level of this column across all sources.
+    auto max_definition_level = _metadata->get_schema(schema_idx).max_definition_level + 1;
+    std::for_each(thrust::make_counting_iterator(static_cast<size_t>(1)),
+                  thrust::make_counting_iterator(_sources.size()),
+                  [&](auto const src_file_idx) {
+                    auto const& schema = _metadata->get_schema(
+                      _metadata->map_schema_index(schema_idx, src_file_idx), src_file_idx);
+                    max_definition_level =
+                      std::max(max_definition_level, schema.max_definition_level + 1);
+                  });
+
+    return std::max(max_definition_level, _metadata->get_output_nesting_depth(schema_idx));
   });
 
   // compute total # of page_nesting infos needed and allocate space. doing this in one
@@ -802,6 +831,8 @@ void reader::impl::allocate_nesting_info()
         page_nesting_decode_info.device_ptr() + src_info_index;
 
       pages[target_page_index + p_idx].nesting_info_size = per_page_nesting_info_size[idx];
+      // Set the number of output nesting levels from the zeroth source as nesting must be
+      // identical across sources.
       pages[target_page_index + p_idx].num_output_nesting_levels =
         _metadata->get_output_nesting_depth(src_col_schema);
 
@@ -810,25 +841,36 @@ void reader::impl::allocate_nesting_info()
     target_page_index += subpass.column_page_count[idx];
   }
 
+  // Reset the target_page_index
+  target_page_index = 0;
+
   // fill in
   int nesting_info_index = 0;
-  std::map<int, std::pair<std::vector<int>, std::vector<int>>> depth_remapping;
   for (size_t idx = 0; idx < _input_columns.size(); idx++) {
     auto const src_col_schema = _input_columns[idx].schema_idx;
 
-    // schema of the input column
-    auto& schema = _metadata->get_schema(src_col_schema);
     // real depth of the output cudf column hierarchy (1 == no nesting, 2 == 1 level, etc)
+    // nesting depth must be same across sources so getting it from the zeroth source is ok
     int const max_output_depth = _metadata->get_output_nesting_depth(src_col_schema);
 
+    // Map to store depths if this column has lists
+    std::map<std::pair<int, int>, std::pair<std::vector<int>, std::vector<int>>> depth_remapping;
     // if this column has lists, generate depth remapping
-    std::map<int, std::pair<std::vector<int>, std::vector<int>>> depth_remapping;
-    if (schema.max_repetition_level > 0) {
-      generate_depth_remappings(depth_remapping, src_col_schema, *_metadata);
-    }
+    std::for_each(
+      thrust::make_counting_iterator(static_cast<size_t>(0)),
+      thrust::make_counting_iterator(_sources.size()),
+      [&](auto const src_file_idx) {
+        auto const mapped_schema_idx = _metadata->map_schema_index(src_col_schema, src_file_idx);
+        if (_metadata->get_schema(mapped_schema_idx, src_file_idx).max_repetition_level > 0) {
+          generate_depth_remappings(
+            depth_remapping, src_col_schema, mapped_schema_idx, src_file_idx, *_metadata);
+        }
+      });
 
     // fill in host-side nesting info
-    int schema_idx  = src_col_schema;
+    int schema_idx = src_col_schema;
+    // This is okay as we only use this to check stubness of cur_schema and
+    // to get its parent's indices, both of which are one to one mapped.
     auto cur_schema = _metadata->get_schema(schema_idx);
     int cur_depth   = max_output_depth - 1;
     while (schema_idx > 0) {
@@ -837,6 +879,9 @@ void reader::impl::allocate_nesting_info()
       if (!cur_schema.is_stub()) {
         // initialize each page within the chunk
         for (size_t p_idx = 0; p_idx < subpass.column_page_count[idx]; p_idx++) {
+          // Source file index for the current page.
+          auto const src_file_idx =
+            pass.chunks[pages[target_page_index + p_idx].chunk_idx].src_file_idx;
           PageNestingInfo* pni =
             &page_nesting_info[nesting_info_index + (p_idx * per_page_nesting_info_size[idx])];
 
@@ -844,9 +889,11 @@ void reader::impl::allocate_nesting_info()
             &page_nesting_decode_info[nesting_info_index +
                                       (p_idx * per_page_nesting_info_size[idx])];
 
+          auto const mapped_src_col_schema =
+            _metadata->map_schema_index(src_col_schema, src_file_idx);
           // if we have lists, set our start and end depth remappings
-          if (schema.max_repetition_level > 0) {
-            auto remap = depth_remapping.find(src_col_schema);
+          if (_metadata->get_schema(mapped_src_col_schema, src_file_idx).max_repetition_level > 0) {
+            auto remap = depth_remapping.find({src_col_schema, src_file_idx});
             CUDF_EXPECTS(remap != depth_remapping.end(),
                          "Could not find depth remapping for schema");
             std::vector<int> const& rep_depth_remap = (remap->second.first);
@@ -860,11 +907,15 @@ void reader::impl::allocate_nesting_info()
             }
           }
 
+          // Get the schema from the current input source.
+          auto& actual_cur_schema = _metadata->get_schema(
+            _metadata->map_schema_index(schema_idx, src_file_idx), src_file_idx);
+
           // values indexed by output column index
-          nesting_info[cur_depth].max_def_level = cur_schema.max_definition_level;
+          nesting_info[cur_depth].max_def_level = actual_cur_schema.max_definition_level;
           pni[cur_depth].size                   = 0;
           pni[cur_depth].type =
-            to_type_id(cur_schema, _strings_to_categorical, _timestamp_type.id());
+            to_type_id(actual_cur_schema, _strings_to_categorical, _options.timestamp_type.id());
           pni[cur_depth].nullable = cur_schema.repetition_type == OPTIONAL;
         }
 
@@ -877,6 +928,8 @@ void reader::impl::allocate_nesting_info()
       cur_schema = _metadata->get_schema(schema_idx);
     }
 
+    // Offset the page and nesting info indices
+    target_page_index += subpass.column_page_count[idx];
     nesting_info_index += (per_page_nesting_info_size[idx] * subpass.column_page_count[idx]);
   }
 
@@ -897,7 +950,7 @@ void reader::impl::allocate_level_decode_space()
   size_t const per_page_decode_buf_size = LEVEL_DECODE_BUF_SIZE * 2 * pass.level_type_size;
   auto const decode_buf_size            = per_page_decode_buf_size * pages.size();
   subpass.level_decode_data =
-    rmm::device_buffer(decode_buf_size, _stream, rmm::mr::get_current_device_resource());
+    rmm::device_buffer(decode_buf_size, _stream, cudf::get_current_device_resource_ref());
 
   // distribute the buffers
   uint8_t* buf = static_cast<uint8_t*>(subpass.level_decode_data.data());
@@ -1022,8 +1075,8 @@ struct get_page_num_rows {
 };
 
 struct input_col_info {
-  int const schema_idx;
-  size_type const nesting_depth;
+  int schema_idx;
+  size_type nesting_depth;
 };
 
 /**
@@ -1169,10 +1222,10 @@ struct page_to_string_size {
 struct page_offset_output_iter {
   PageInfo* p;
 
-  using value_type        = size_type;
-  using difference_type   = size_type;
-  using pointer           = size_type*;
-  using reference         = size_type&;
+  using value_type        = size_t;
+  using difference_type   = size_t;
+  using pointer           = size_t*;
+  using reference         = size_t&;
   using iterator_category = thrust::output_device_iterator_tag;
 
   __host__ __device__ page_offset_output_iter operator+(int i) { return {p + i}; }
@@ -1212,30 +1265,44 @@ struct update_pass_num_rows {
 
 }  // anonymous namespace
 
-void reader::impl::preprocess_file(
-  int64_t skip_rows,
-  std::optional<size_type> const& num_rows,
-  host_span<std::vector<size_type> const> row_group_indices,
-  std::optional<std::reference_wrapper<ast::expression const>> filter)
+void reader::impl::preprocess_file(read_mode mode)
 {
   CUDF_EXPECTS(!_file_preprocessed, "Attempted to preprocess file more than once");
 
   // if filter is not empty, then create output types as vector and pass for filtering.
-  std::vector<data_type> output_types;
-  if (filter.has_value()) {
-    std::transform(_output_buffers.cbegin(),
-                   _output_buffers.cend(),
-                   std::back_inserter(output_types),
+
+  std::vector<data_type> output_dtypes;
+  if (_expr_conv.get_converted_expr().has_value()) {
+    std::transform(_output_buffers_template.cbegin(),
+                   _output_buffers_template.cend(),
+                   std::back_inserter(output_dtypes),
                    [](auto const& col) { return col.type; });
   }
-  std::tie(
-    _file_itm_data.global_skip_rows, _file_itm_data.global_num_rows, _file_itm_data.row_groups) =
-    _metadata->select_row_groups(
-      row_group_indices, skip_rows, num_rows, output_types, filter, _stream);
+
+  std::tie(_file_itm_data.global_skip_rows,
+           _file_itm_data.global_num_rows,
+           _file_itm_data.row_groups,
+           _file_itm_data.num_rows_per_source) =
+    _metadata->select_row_groups(_options.row_group_indices,
+                                 _options.skip_rows,
+                                 _options.num_rows,
+                                 output_dtypes,
+                                 _output_column_schemas,
+                                 _expr_conv.get_converted_expr(),
+                                 _stream);
+
+  // Inclusive scan the number of rows per source
+  if (not _expr_conv.get_converted_expr().has_value() and mode == read_mode::CHUNKED_READ) {
+    _file_itm_data.exclusive_sum_num_rows_per_source.resize(
+      _file_itm_data.num_rows_per_source.size());
+    thrust::inclusive_scan(_file_itm_data.num_rows_per_source.cbegin(),
+                           _file_itm_data.num_rows_per_source.cend(),
+                           _file_itm_data.exclusive_sum_num_rows_per_source.begin());
+  }
 
   // check for page indexes
-  _has_page_index = std::all_of(_file_itm_data.row_groups.begin(),
-                                _file_itm_data.row_groups.end(),
+  _has_page_index = std::all_of(_file_itm_data.row_groups.cbegin(),
+                                _file_itm_data.row_groups.cend(),
                                 [](auto const& row_group) { return row_group.has_page_index(); });
 
   if (_file_itm_data.global_num_rows > 0 && not _file_itm_data.row_groups.empty() &&
@@ -1261,7 +1328,7 @@ void reader::impl::preprocess_file(
   printf("# Input columns: %'lu\n", _input_columns.size());
   for (size_t idx = 0; idx < _input_columns.size(); idx++) {
     auto const& schema = _metadata->get_schema(_input_columns[idx].schema_idx);
-    auto const type_id = to_type_id(schema, _strings_to_categorical, _timestamp_type.id());
+    auto const type_id = to_type_id(schema, _strings_to_categorical, _options.timestamp_type.id());
     printf("\tC(%'lu, %s): %s\n",
            idx,
            _input_columns[idx].name.c_str(),
@@ -1315,7 +1382,7 @@ void reader::impl::generate_list_column_row_count_estimates()
   _stream.synchronize();
 }
 
-void reader::impl::preprocess_subpass_pages(bool uses_custom_row_bounds, size_t chunk_read_limit)
+void reader::impl::preprocess_subpass_pages(read_mode mode, size_t chunk_read_limit)
 {
   auto& pass    = *_pass_itm_data;
   auto& subpass = *pass.subpass;
@@ -1424,7 +1491,8 @@ void reader::impl::preprocess_subpass_pages(bool uses_custom_row_bounds, size_t 
     // subpass since we know that will safely completed.
     bool const is_list = chunk.max_level[level_type::REPETITION] > 0;
     if (is_list && max_col_row < last_pass_row) {
-      size_t const min_col_row = static_cast<size_t>(chunk.start_row + last_page.chunk_row);
+      auto const& first_page   = subpass.pages[page_index];
+      size_t const min_col_row = static_cast<size_t>(chunk.start_row + first_page.chunk_row);
       CUDF_EXPECTS((max_col_row - min_col_row) > 1, "Unexpected short subpass");
       max_col_row--;
     }
@@ -1442,7 +1510,7 @@ void reader::impl::preprocess_subpass_pages(bool uses_custom_row_bounds, size_t 
   compute_output_chunks_for_subpass();
 }
 
-void reader::impl::allocate_columns(size_t skip_rows, size_t num_rows, bool uses_custom_row_bounds)
+void reader::impl::allocate_columns(read_mode mode, size_t skip_rows, size_t num_rows)
 {
   auto& pass    = *_pass_itm_data;
   auto& subpass = *pass.subpass;
@@ -1455,7 +1523,7 @@ void reader::impl::allocate_columns(size_t skip_rows, size_t num_rows, bool uses
   // account. PageInfo::skipped_values, which tells us where to start decoding in the input to
   // respect the user bounds. It is only necessary to do this second pass if uses_custom_row_bounds
   // is set (if the user has specified artificial bounds).
-  if (uses_custom_row_bounds) {
+  if (uses_custom_row_bounds(mode)) {
     ComputePageSizes(subpass.pages,
                      pass.chunks,
                      skip_rows,
@@ -1464,14 +1532,17 @@ void reader::impl::allocate_columns(size_t skip_rows, size_t num_rows, bool uses
                      false,  // no need to compute string sizes
                      pass.level_type_size,
                      _stream);
-
-    // print_pages(pages, _stream);
   }
 
   // iterate over all input columns and allocate any associated output
   // buffers if they are not part of a list hierarchy. mark down
   // if we have any list columns that need further processing.
   bool has_lists = false;
+  // Casting to std::byte since data buffer pointer is void *
+  std::vector<cudf::device_span<std::byte>> memset_bufs;
+  // Validity Buffer is a uint32_t pointer
+  std::vector<cudf::device_span<cudf::bitmask_type>> nullmask_bufs;
+
   for (size_t idx = 0; idx < _input_columns.size(); idx++) {
     auto const& input_col  = _input_columns[idx];
     size_t const max_depth = input_col.nesting_depth();
@@ -1489,18 +1560,26 @@ void reader::impl::allocate_columns(size_t skip_rows, size_t num_rows, bool uses
       // if we haven't already processed this column because it is part of a struct hierarchy
       else if (out_buf.size == 0) {
         // add 1 for the offset if this is a list column
-        out_buf.create(
+        // we're going to start null mask as all valid and then turn bits off if necessary
+        out_buf.create_with_mask(
           out_buf.type.id() == type_id::LIST && l_idx < max_depth ? num_rows + 1 : num_rows,
+          cudf::mask_state::UNINITIALIZED,
+          false,
           _stream,
           _mr);
+        memset_bufs.push_back(cudf::device_span<std::byte>(static_cast<std::byte*>(out_buf.data()),
+                                                           out_buf.data_size()));
+        nullmask_bufs.push_back(cudf::device_span<cudf::bitmask_type>(
+          out_buf.null_mask(),
+          cudf::util::round_up_safe(out_buf.null_mask_size(), sizeof(cudf::bitmask_type)) /
+            sizeof(cudf::bitmask_type)));
       }
     }
   }
-
   // compute output column sizes by examining the pages of the -input- columns
   if (has_lists) {
-    std::vector<input_col_info> h_cols_info;
-    h_cols_info.reserve(_input_columns.size());
+    auto h_cols_info =
+      cudf::detail::make_empty_host_vector<input_col_info>(_input_columns.size(), _stream);
     std::transform(_input_columns.cbegin(),
                    _input_columns.cend(),
                    std::back_inserter(h_cols_info),
@@ -1515,7 +1594,7 @@ void reader::impl::allocate_columns(size_t skip_rows, size_t num_rows, bool uses
         .nesting_depth;
 
     auto const d_cols_info = cudf::detail::make_device_uvector_async(
-      h_cols_info, _stream, rmm::mr::get_current_device_resource());
+      h_cols_info, _stream, cudf::get_current_device_resource_ref());
 
     auto const num_keys = _input_columns.size() * max_depth * subpass.pages.size();
     // size iterator. indexes pages by sorted order
@@ -1568,11 +1647,23 @@ void reader::impl::allocate_columns(size_t skip_rows, size_t num_rows, bool uses
           if (out_buf.type.id() == type_id::LIST && l_idx < max_depth) { size++; }
 
           // allocate
-          out_buf.create(size, _stream, _mr);
+          // we're going to start null mask as all valid and then turn bits off if necessary
+          out_buf.create_with_mask(size, cudf::mask_state::UNINITIALIZED, false, _stream, _mr);
+          memset_bufs.push_back(cudf::device_span<std::byte>(
+            static_cast<std::byte*>(out_buf.data()), out_buf.data_size()));
+          nullmask_bufs.push_back(cudf::device_span<cudf::bitmask_type>(
+            out_buf.null_mask(),
+            cudf::util::round_up_safe(out_buf.null_mask_size(), sizeof(cudf::bitmask_type)) /
+              sizeof(cudf::bitmask_type)));
         }
       }
     }
   }
+
+  cudf::io::detail::batched_memset(memset_bufs, static_cast<std::byte>(0), _stream);
+  // Need to set null mask bufs to all high bits
+  cudf::io::detail::batched_memset(
+    nullmask_bufs, std::numeric_limits<cudf::bitmask_type>::max(), _stream);
 }
 
 std::vector<size_t> reader::impl::calculate_page_string_offsets()

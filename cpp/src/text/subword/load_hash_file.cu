@@ -22,6 +22,7 @@
 #include <cudf/strings/detail/utilities.cuh>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <nvtext/detail/load_hash_file.hpp>
 
@@ -180,7 +181,7 @@ uint64_t str_to_uint64(std::string const& str, uint64_t line_no)
 std::unique_ptr<hashed_vocabulary> load_vocabulary_file(
   std::string const& filename_hashed_vocabulary,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   hashed_vocabulary result;
   std::ifstream hash_file(filename_hashed_vocabulary);
@@ -288,7 +289,7 @@ std::unique_ptr<hashed_vocabulary> load_vocabulary_file(
 }  // namespace detail
 
 std::unique_ptr<hashed_vocabulary> load_vocabulary_file(
-  std::string const& filename_hashed_vocabulary, rmm::mr::device_memory_resource* mr)
+  std::string const& filename_hashed_vocabulary, rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::load_vocabulary_file(filename_hashed_vocabulary, cudf::get_default_stream(), mr);

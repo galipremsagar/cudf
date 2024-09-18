@@ -20,15 +20,16 @@
 
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
-
-#include <rmm/mr/device/per_device_resource.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <map>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace io {
 /**
  * @addtogroup io_readers
@@ -100,6 +101,10 @@ class json_reader_options {
   bool _lines = false;
   // Parse mixed types as a string column
   bool _mixed_types_as_string = false;
+  // Delimiter separating records in JSON lines
+  char _delimiter = '\n';
+  // Prune columns on read, selected based on the _dtypes option
+  bool _prune_columns = false;
 
   // Bytes to skip from the start
   size_t _byte_range_offset = 0;
@@ -123,6 +128,19 @@ class json_reader_options {
 
   // Whether to recover after an invalid JSON line
   json_recovery_mode_t _recovery_mode = json_recovery_mode_t::FAIL;
+
+  // Validation checks for spark
+  // Should the json validation be strict or not
+  // Note: strict validation enforces the JSON specification https://www.json.org/json-en.html
+  bool _strict_validation = false;
+  // Allow leading zeros for numeric values.
+  bool _allow_numeric_leading_zeros = true;
+  // Allow non-numeric numbers: NaN, +INF, -INF, +Infinity, Infinity, -Infinity
+  bool _allow_nonnumeric_numbers = true;
+  // Allow unquoted control characters
+  bool _allow_unquoted_control_chars = true;
+  // Additional values to recognize as null values
+  std::vector<std::string> _na_values;
 
   /**
    * @brief Constructor from source info.
@@ -161,9 +179,9 @@ class json_reader_options {
    *
    * @returns Data types of the columns
    */
-  std::variant<std::vector<data_type>,
-               std::map<std::string, data_type>,
-               std::map<std::string, schema_element>> const&
+  [[nodiscard]] std::variant<std::vector<data_type>,
+                             std::map<std::string, data_type>,
+                             std::map<std::string, schema_element>> const&
   get_dtypes() const
   {
     return _dtypes;
@@ -174,28 +192,28 @@ class json_reader_options {
    *
    * @return Compression format of the source
    */
-  compression_type get_compression() const { return _compression; }
+  [[nodiscard]] compression_type get_compression() const { return _compression; }
 
   /**
    * @brief Returns number of bytes to skip from source start.
    *
    * @return Number of bytes to skip from source start
    */
-  size_t get_byte_range_offset() const { return _byte_range_offset; }
+  [[nodiscard]] size_t get_byte_range_offset() const { return _byte_range_offset; }
 
   /**
    * @brief Returns number of bytes to read.
    *
    * @return Number of bytes to read
    */
-  size_t get_byte_range_size() const { return _byte_range_size; }
+  [[nodiscard]] size_t get_byte_range_size() const { return _byte_range_size; }
 
   /**
    * @brief Returns number of bytes to read with padding.
    *
    * @return Number of bytes to read with padding
    */
-  size_t get_byte_range_size_with_padding() const
+  [[nodiscard]] size_t get_byte_range_size_with_padding() const
   {
     if (_byte_range_size == 0) {
       return 0;
@@ -209,7 +227,7 @@ class json_reader_options {
    *
    * @return Number of bytes to pad
    */
-  size_t get_byte_range_padding() const
+  [[nodiscard]] size_t get_byte_range_padding() const
   {
     auto const num_columns = std::visit([](auto const& dtypes) { return dtypes.size(); }, _dtypes);
 
@@ -227,60 +245,121 @@ class json_reader_options {
   }
 
   /**
+   * @brief Returns delimiter separating records in JSON lines
+   *
+   * @return Delimiter separating records in JSON lines
+   */
+  [[nodiscard]] char get_delimiter() const { return _delimiter; }
+
+  /**
    * @brief Whether to read the file as a json object per line.
    *
    * @return `true` if reading the file as a json object per line
    */
-  bool is_enabled_lines() const { return _lines; }
+  [[nodiscard]] bool is_enabled_lines() const { return _lines; }
 
   /**
    * @brief Whether to parse mixed types as a string column.
    *
    * @return `true` if mixed types are parsed as a string column
    */
-  bool is_enabled_mixed_types_as_string() const { return _mixed_types_as_string; }
+  [[nodiscard]] bool is_enabled_mixed_types_as_string() const { return _mixed_types_as_string; }
+
+  /**
+   * @brief Whether to prune columns on read, selected based on the @ref set_dtypes option.
+   *
+   * When set as true, if the reader options include @ref set_dtypes, then
+   * the reader will only return those columns which are mentioned in @ref set_dtypes.
+   * If false, then all columns are returned, independent of the @ref set_dtypes
+   * setting.
+   *
+   * @return True if column pruning is enabled
+   */
+  [[nodiscard]] bool is_enabled_prune_columns() const { return _prune_columns; }
 
   /**
    * @brief Whether to parse dates as DD/MM versus MM/DD.
    *
    * @returns true if dates are parsed as DD/MM, false if MM/DD
    */
-  bool is_enabled_dayfirst() const { return _dayfirst; }
-
-  /**
-   * @brief Whether the legacy reader should be used.
-   *
-   * @returns true if the legacy reader will be used, false otherwise
-   */
-  bool is_enabled_legacy() const { return _legacy; }
+  [[nodiscard]] bool is_enabled_dayfirst() const { return _dayfirst; }
 
   /**
    * @brief Whether the reader should keep quotes of string values.
    *
    * @returns true if the reader should keep quotes, false otherwise
    */
-  bool is_enabled_keep_quotes() const { return _keep_quotes; }
+  [[nodiscard]] bool is_enabled_keep_quotes() const { return _keep_quotes; }
 
   /**
    * @brief Whether the reader should normalize single quotes around strings
    *
    * @returns true if the reader should normalize single quotes, false otherwise
    */
-  bool is_enabled_normalize_single_quotes() const { return _normalize_single_quotes; }
+  [[nodiscard]] bool is_enabled_normalize_single_quotes() const { return _normalize_single_quotes; }
 
   /**
    * @brief Whether the reader should normalize unquoted whitespace characters
    *
    * @returns true if the reader should normalize whitespace, false otherwise
    */
-  bool is_enabled_normalize_whitespace() const { return _normalize_whitespace; }
+  [[nodiscard]] bool is_enabled_normalize_whitespace() const { return _normalize_whitespace; }
 
   /**
    * @brief Queries the JSON reader's behavior on invalid JSON lines.
    *
    * @returns An enum that specifies the JSON reader's behavior on invalid JSON lines.
    */
-  json_recovery_mode_t recovery_mode() const { return _recovery_mode; }
+  [[nodiscard]] json_recovery_mode_t recovery_mode() const { return _recovery_mode; }
+
+  /**
+   * @brief Whether json validation should be enforced strictly or not.
+   *
+   * @return true if it should be.
+   */
+  [[nodiscard]] bool is_strict_validation() const { return _strict_validation; }
+
+  /**
+   * @brief Whether leading zeros are allowed in numeric values.
+   *
+   * @note: This validation is enforced only if strict validation is enabled.
+   *
+   * @return true if leading zeros are allowed in numeric values
+   */
+  [[nodiscard]] bool is_allowed_numeric_leading_zeros() const
+  {
+    return _allow_numeric_leading_zeros;
+  }
+
+  /**
+   * @brief Whether unquoted number values should be allowed NaN, +INF, -INF, +Infinity, Infinity,
+   * and -Infinity.
+   *
+   * @note: This validation is enforced only if strict validation is enabled.
+   *
+   * @return true if leading zeros are allowed in numeric values
+   */
+  [[nodiscard]] bool is_allowed_nonnumeric_numbers() const { return _allow_nonnumeric_numbers; }
+
+  /**
+   * @brief Whether in a quoted string should characters greater than or equal to 0 and less than 32
+   * be allowed without some form of escaping.
+   *
+   * @note: This validation is enforced only if strict validation is enabled.
+   *
+   * @return true if unquoted control chars are allowed.
+   */
+  [[nodiscard]] bool is_allowed_unquoted_control_chars() const
+  {
+    return _allow_unquoted_control_chars;
+  }
+
+  /**
+   * @brief Returns additional values to recognize as null values.
+   *
+   * @return Additional values to recognize as null values
+   */
+  [[nodiscard]] std::vector<std::string> const& get_na_values() const { return _na_values; }
 
   /**
    * @brief Set data types for columns to be read.
@@ -315,14 +394,38 @@ class json_reader_options {
    *
    * @param offset Number of bytes of offset
    */
-  void set_byte_range_offset(size_type offset) { _byte_range_offset = offset; }
+  void set_byte_range_offset(size_t offset) { _byte_range_offset = offset; }
 
   /**
    * @brief Set number of bytes to read.
    *
    * @param size Number of bytes to read
    */
-  void set_byte_range_size(size_type size) { _byte_range_size = size; }
+  void set_byte_range_size(size_t size) { _byte_range_size = size; }
+
+  /**
+   * @brief Set delimiter separating records in JSON lines
+   *
+   * @param delimiter Delimiter separating records in JSON lines
+   */
+  void set_delimiter(char delimiter)
+  {
+    switch (delimiter) {
+      case '{':
+      case '[':
+      case '}':
+      case ']':
+      case ',':
+      case ':':
+      case '"':
+      case '\'':
+      case '\\':
+      case ' ':
+      case '\t':
+      case '\r': CUDF_FAIL("Unsupported delimiter character.", std::invalid_argument); break;
+    }
+    _delimiter = delimiter;
+  }
 
   /**
    * @brief Set whether to read the file as a json object per line.
@@ -340,18 +443,22 @@ class json_reader_options {
   void enable_mixed_types_as_string(bool val) { _mixed_types_as_string = val; }
 
   /**
+   * @brief Set whether to prune columns on read, selected based on the @ref set_dtypes option.
+   *
+   * When set as true, if the reader options include @ref set_dtypes, then
+   * the reader will only return those columns which are mentioned in @ref set_dtypes.
+   * If false, then all columns are returned, independent of the @ref set_dtypes setting.
+   *
+   * @param val Boolean value to enable/disable column pruning
+   */
+  void enable_prune_columns(bool val) { _prune_columns = val; }
+
+  /**
    * @brief Set whether to parse dates as DD/MM versus MM/DD.
    *
    * @param val Boolean value to enable/disable day first parsing format
    */
   void enable_dayfirst(bool val) { _dayfirst = val; }
-
-  /**
-   * @brief Set whether to use the legacy reader.
-   *
-   * @param val Boolean value to enable/disable the legacy reader
-   */
-  void enable_legacy(bool val) { _legacy = val; }
 
   /**
    * @brief Set whether the reader should keep quotes of string values.
@@ -383,6 +490,63 @@ class json_reader_options {
    * @param val An enum value to indicate the JSON reader's behavior on invalid JSON lines.
    */
   void set_recovery_mode(json_recovery_mode_t val) { _recovery_mode = val; }
+
+  /**
+   * @brief Set whether strict validation is enabled or not.
+   *
+   * @param val Boolean value to indicate whether strict validation is enabled.
+   */
+  void set_strict_validation(bool val) { _strict_validation = val; }
+
+  /**
+   * @brief Set whether leading zeros are allowed in numeric values. Strict validation
+   * must be enabled for this to work.
+   *
+   * @throw cudf::logic_error if `strict_validation` is not enabled before setting this option.
+   *
+   * @param val Boolean value to indicate whether leading zeros are allowed in numeric values
+   */
+  void allow_numeric_leading_zeros(bool val)
+  {
+    CUDF_EXPECTS(_strict_validation, "Strict validation must be enabled for this to work.");
+    _allow_numeric_leading_zeros = val;
+  }
+
+  /**
+   * @brief Set whether unquoted number values should be allowed NaN, +INF, -INF, +Infinity,
+   * Infinity, and -Infinity. Strict validation must be enabled for this to work.
+   *
+   * @throw cudf::logic_error if `strict_validation` is not enabled before setting this option.
+   *
+   * @param val Boolean value to indicate whether leading zeros are allowed in numeric values
+   */
+  void allow_nonnumeric_numbers(bool val)
+  {
+    CUDF_EXPECTS(_strict_validation, "Strict validation must be enabled for this to work.");
+    _allow_nonnumeric_numbers = val;
+  }
+
+  /**
+   * @brief Set whether in a quoted string should characters greater than or equal to 0
+   * and less than 32 be allowed without some form of escaping. Strict validation must
+   * be enabled for this to work.
+   *
+   * @throw cudf::logic_error if `strict_validation` is not enabled before setting this option.
+   *
+   * @param val true to indicate whether unquoted control chars are allowed.
+   */
+  void allow_unquoted_control_chars(bool val)
+  {
+    CUDF_EXPECTS(_strict_validation, "Strict validation must be enabled for this to work.");
+    _allow_unquoted_control_chars = val;
+  }
+
+  /**
+   * @brief Sets additional values to recognize as null values.
+   *
+   * @param vals Vector of values to be considered to be null
+   */
+  void set_na_values(std::vector<std::string> vals) { _na_values = std::move(vals); }
 };
 
 /**
@@ -479,6 +643,18 @@ class json_reader_options_builder {
   }
 
   /**
+   * @brief Set delimiter separating records in JSON lines
+   *
+   * @param delimiter Delimiter separating records in JSON lines
+   * @return this for chaining
+   */
+  json_reader_options_builder& delimiter(char delimiter)
+  {
+    options.set_delimiter(delimiter);
+    return *this;
+  }
+
+  /**
    * @brief Set whether to read the file as a json object per line.
    *
    * @param val Boolean value to enable/disable the option to read each line as a json object
@@ -504,6 +680,22 @@ class json_reader_options_builder {
   }
 
   /**
+   * @brief Set whether to prune columns on read, selected based on the @ref dtypes option.
+   *
+   * When set as true, if the reader options include @ref dtypes, then
+   * the reader will only return those columns which are mentioned in @ref dtypes.
+   * If false, then all columns are returned, independent of the @ref dtypes setting.
+   *
+   * @param val Boolean value to enable/disable column pruning
+   * @return this for chaining
+   */
+  json_reader_options_builder& prune_columns(bool val)
+  {
+    options._prune_columns = val;
+    return *this;
+  }
+
+  /**
    * @brief Set whether to parse dates as DD/MM versus MM/DD.
    *
    * @param val Boolean value to enable/disable day first parsing format
@@ -512,18 +704,6 @@ class json_reader_options_builder {
   json_reader_options_builder& dayfirst(bool val)
   {
     options._dayfirst = val;
-    return *this;
-  }
-
-  /**
-   * @brief Set whether to use the legacy reader.
-   *
-   * @param val Boolean value to enable/disable legacy parsing
-   * @return this for chaining
-   */
-  json_reader_options_builder& legacy(bool val)
-  {
-    options._legacy = val;
     return *this;
   }
 
@@ -579,6 +759,76 @@ class json_reader_options_builder {
   }
 
   /**
+   * @brief Set whether json validation should be strict or not.
+   *
+   * @param val Boolean value to indicate whether json validation should be strict or not.
+   * @return this for chaining
+   */
+  json_reader_options_builder& strict_validation(bool val)
+  {
+    options.set_strict_validation(val);
+    return *this;
+  }
+
+  /**
+   * @brief Set Whether leading zeros are allowed in numeric values. Strict validation must
+   * be enabled for this to have any effect.
+   *
+   * @throw cudf::logic_error if `strict_validation` is not enabled before setting this option.
+   *
+   * @param val Boolean value to indicate whether leading zeros are allowed in numeric values
+   * @return this for chaining
+   */
+  json_reader_options_builder& numeric_leading_zeros(bool val)
+  {
+    options.allow_numeric_leading_zeros(val);
+    return *this;
+  }
+
+  /**
+   * @brief Set whether specific unquoted number values are valid JSON. The values are NaN,
+   * +INF, -INF, +Infinity, Infinity, and -Infinity.
+   * Strict validation must be enabled for this to have any effect.
+   *
+   * @throw cudf::logic_error if `strict_validation` is not enabled before setting this option.
+   *
+   * @param val Boolean value to indicate if unquoted nonnumeric values are valid json or not.
+   * @return this for chaining
+   */
+  json_reader_options_builder& nonnumeric_numbers(bool val)
+  {
+    options.allow_nonnumeric_numbers(val);
+    return *this;
+  }
+
+  /**
+   * @brief Set whether chars >= 0 and < 32 are allowed in a quoted string without
+   * some form of escaping. Strict validation must be enabled for this to have any effect.
+   *
+   * @throw cudf::logic_error if `strict_validation` is not enabled before setting this option.
+   *
+   * @param val Boolean value to indicate if unquoted control chars are allowed or not.
+   * @return this for chaining
+   */
+  json_reader_options_builder& unquoted_control_chars(bool val)
+  {
+    options.allow_unquoted_control_chars(val);
+    return *this;
+  }
+
+  /**
+   * @brief Sets additional values to recognize as null values.
+   *
+   * @param vals Vector of values to be considered to be null
+   * @return this for chaining
+   */
+  json_reader_options_builder& na_values(std::vector<std::string> vals)
+  {
+    options.set_na_values(std::move(vals));
+    return *this;
+  }
+
+  /**
    * @brief move json_reader_options member once it's built.
    */
   operator json_reader_options&&() { return std::move(options); }
@@ -612,8 +862,8 @@ class json_reader_options_builder {
  */
 table_with_metadata read_json(
   json_reader_options options,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 
@@ -634,6 +884,8 @@ class json_writer_options_builder;
 class json_writer_options {
   // Specify the sink to use for writer output
   sink_info _sink;
+  // maximum number of rows to write in each chunk (limits memory use)
+  size_type _rows_per_chunk = std::numeric_limits<size_type>::max();
   // Set of columns to output
   table_view _table;
   // string to use for null entries
@@ -642,8 +894,6 @@ class json_writer_options {
   bool _include_nulls = false;
   // Indicates whether to use JSON lines for records format
   bool _lines = false;
-  // maximum number of rows to write in each chunk (limits memory use)
-  size_type _rows_per_chunk = std::numeric_limits<size_type>::max();
   // string to use for values != 0 in INT8 types (default 'true')
   std::string _true_value = std::string{"true"};
   // string to use for values == 0 in INT8 types (default 'false')
@@ -657,8 +907,8 @@ class json_writer_options {
    * @param sink The sink used for writer output
    * @param table Table to be written to output
    */
-  explicit json_writer_options(sink_info const& sink, table_view const& table)
-    : _sink(sink), _table(table), _rows_per_chunk(table.num_rows())
+  explicit json_writer_options(sink_info sink, table_view table)
+    : _sink(std::move(sink)), _rows_per_chunk(table.num_rows()), _table(std::move(table))
   {
   }
 
@@ -956,12 +1206,10 @@ class json_writer_options_builder {
  *
  * @param options Settings for controlling writing behavior
  * @param stream CUDA stream used for device memory operations and kernel launches
- * @param mr Device memory resource to use for device memory allocation
  */
 void write_json(json_writer_options const& options,
-                rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-                rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+                rmm::cuda_stream_view stream = cudf::get_default_stream());
 
 /** @} */  // end of group
 }  // namespace io
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf
