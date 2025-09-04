@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,9 +26,12 @@
 #include <cudf/partitioning.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
+
+#include <numeric>
 
 using cudf::test::fixed_width_column_wrapper;
 using cudf::test::strings_column_wrapper;
@@ -140,7 +143,7 @@ TEST_F(HashPartition, MixedColumnTypes)
 
 TEST_F(HashPartition, NullableStrings)
 {
-  strings_column_wrapper strings({"a", "bb", "ccc", "d"}, {1, 1, 1, 1});
+  strings_column_wrapper strings({"a", "bb", "ccc", "d"}, {true, true, true, true});
   cudf::table_view input({strings});
 
   std::vector<cudf::size_type> const columns_to_hash({0});
@@ -190,21 +193,6 @@ TEST_F(HashPartition, IdentityHashFailure)
   cudf::size_type const num_partitions = 3;
   EXPECT_THROW(
     cudf::hash_partition(input, columns_to_hash, num_partitions, cudf::hash_id::HASH_IDENTITY),
-    cudf::logic_error);
-}
-
-TEST_F(HashPartition, UnsupportedHashFunction)
-{
-  fixed_width_column_wrapper<float> floats({1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f});
-  fixed_width_column_wrapper<int16_t> integers({1, 2, 3, 4, 5, 6, 7, 8});
-  strings_column_wrapper strings({"a", "bb", "ccc", "d", "ee", "fff", "gg", "h"});
-  auto input = cudf::table_view({floats, integers, strings});
-
-  auto columns_to_hash = std::vector<cudf::size_type>({2});
-
-  cudf::size_type const num_partitions = 3;
-  EXPECT_THROW(
-    cudf::hash_partition(input, columns_to_hash, num_partitions, cudf::hash_id::HASH_MD5),
     cudf::logic_error);
 }
 
@@ -304,8 +292,8 @@ void run_fixed_width_test(size_t cols,
 
   // Make a table view of the partition numbers
   constexpr cudf::data_type dtype{cudf::type_id::INT32};
-  auto d_partitions = cudf::detail::make_device_uvector_sync(
-    partitions, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+  auto d_partitions = cudf::detail::make_device_uvector(
+    partitions, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   cudf::column_view partitions_col(dtype, rows, d_partitions.data(), nullptr, 0);
   cudf::table_view partitions_table({partitions_col});
 

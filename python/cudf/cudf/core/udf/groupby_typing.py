@@ -1,5 +1,7 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
-from typing import Any, Dict
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+from __future__ import annotations
+
+from typing import Any
 
 import numba
 from numba import cuda, types
@@ -124,7 +126,7 @@ class GroupModel(models.StructModel):
         super().__init__(dmm, fe_type, members)
 
 
-call_cuda_functions: Dict[Any, Any] = {}
+call_cuda_functions: dict[Any, Any] = {}
 
 
 def _register_cuda_binary_reduction_caller(funcname, lty, rty, retty):
@@ -202,7 +204,8 @@ class GroupOpBase(AbstractTemplate):
         if funcs := call_cuda_functions.get(self.key.__name__):
             for sig in funcs.keys():
                 if all(
-                    arg.group_scalar_type == ty for arg, ty in zip(args, sig)
+                    arg.group_scalar_type == ty
+                    for arg, ty in zip(args, sig, strict=True)
                 ):
                     return nb_signature(sig[0], *args)
         raise UDFError(self.make_error_string(args))
@@ -240,7 +243,7 @@ class GroupAttrBase(AbstractTemplate):
                 retty, selfty, *argtys = sig
                 if self.this.group_scalar_type == selfty and all(
                     arg.group_scalar_type == ty
-                    for arg, ty in zip(args, argtys)
+                    for arg, ty in zip(args, argtys, strict=True)
                 ):
                     return nb_signature(retty, *args, recvr=self.this)
         raise UDFError(self.make_error_string(args))

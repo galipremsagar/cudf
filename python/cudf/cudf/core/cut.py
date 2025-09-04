@@ -1,6 +1,6 @@
-# Copyright (c) 2021-2023, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
 
-from collections import abc
+from collections.abc import Sequence
 
 import cupy
 import numpy as np
@@ -8,7 +8,7 @@ import pandas as pd
 
 import cudf
 from cudf.api.types import is_list_like
-from cudf.core.column import as_column, build_categorical_column
+from cudf.core.column import as_column
 from cudf.core.index import IntervalIndex, interval_range
 
 
@@ -140,11 +140,11 @@ def cut(
                 )
 
     # bins can either be an int, sequence of scalars or an intervalIndex
-    if isinstance(bins, abc.Sequence):
+    if isinstance(bins, Sequence):
         if len(set(bins)) is not len(bins):
             if duplicates == "raise":
                 raise ValueError(
-                    f"Bin edges must be unique: {repr(bins)}.\n"
+                    f"Bin edges must be unique: {bins!r}.\n"
                     f"You can drop duplicate edges by setting the 'duplicates'"
                     "kwarg"
                 )
@@ -158,7 +158,7 @@ def cut(
 
     # create bins if given an int or single scalar
     if not isinstance(bins, pd.IntervalIndex):
-        if not isinstance(bins, (abc.Sequence)):
+        if not isinstance(bins, Sequence):
             if isinstance(
                 x, (pd.Series, cudf.Series, np.ndarray, cupy.ndarray)
             ):
@@ -187,9 +187,6 @@ def cut(
 
         # adjust bin edges decimal precision
         int_label_bins = np.around(bins, precision)
-
-    # the inputs is a column of the values in the array x
-    input_arr = as_column(x)
 
     # checking for the correct inclusivity values
     if right:
@@ -242,6 +239,9 @@ def cut(
                 labels if len(set(labels)) == len(labels) else None
             )
 
+    # the inputs is a column of the values in the array x
+    input_arr = as_column(x)
+
     if isinstance(bins, pd.IntervalIndex):
         # get the left and right edges of the bins as columns
         # we cannot typecast an IntervalIndex, so we need to
@@ -255,8 +255,11 @@ def cut(
         # the input arr must be changed to the same type as the edges
         input_arr = input_arr.astype(left_edges.dtype)
     # get the indexes for the appropriate number
-    index_labels = cudf._lib.labeling.label_bins(
-        input_arr, left_edges, left_inclusive, right_edges, right_inclusive
+    index_labels = input_arr.label_bins(
+        left_edge=left_edges,
+        left_inclusive=left_inclusive,
+        right_edge=right_edges,
+        right_inclusive=right_inclusive,
     )
 
     if labels is False:
@@ -282,17 +285,11 @@ def cut(
             # should allow duplicate categories.
             return interval_labels[index_labels]
 
-    col = build_categorical_column(
+    categorical_index = cudf.CategoricalIndex.from_codes(
         categories=interval_labels,
         codes=index_labels,
-        mask=index_labels.base_mask,
-        offset=index_labels.offset,
-        size=index_labels.size,
         ordered=ordered,
     )
-
-    # we return a categorical index, as we don't have a Categorical method
-    categorical_index = cudf.core.index.as_index(col)
 
     if isinstance(orig_x, (pd.Series, cudf.Series)):
         # if we have a series input we return a series output

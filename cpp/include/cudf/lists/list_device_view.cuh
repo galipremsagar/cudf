@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/pair.h>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @brief A non-owning, immutable view of device data that represents
@@ -315,14 +315,16 @@ class list_device_view {
     }
 
    private:
-    template <typename R, std::enable_if_t<std::is_same_v<R, rep_type>, void>* = nullptr>
+    template <typename R>
     __device__ inline rep_type get_rep(cudf::size_type i) const
+      requires(std::is_same_v<R, rep_type>)
     {
       return list.element<R>(i);
     }
 
-    template <typename R, std::enable_if_t<not std::is_same_v<R, rep_type>, void>* = nullptr>
+    template <typename R>
     __device__ inline rep_type get_rep(cudf::size_type i) const
+      requires(not std::is_same_v<R, rep_type>)
     {
       return list.element<R>(i).value();
     }
@@ -377,4 +379,4 @@ CUDF_HOST_DEVICE auto inline make_list_size_iterator(detail::lists_column_device
   return detail::make_counting_transform_iterator(0, list_size_functor{c});
 }
 
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

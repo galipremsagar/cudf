@@ -1,5 +1,5 @@
 # =============================================================================
-# Copyright (c) 2024, NVIDIA CORPORATION.
+# Copyright (c) 2024-2025, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
 # in compliance with the License. You may obtain a copy of the License at
@@ -14,23 +14,25 @@
 
 # This function finds nanoarrow and sets any additional necessary environment variables.
 function(find_and_configure_nanoarrow)
-  set(oneValueArgs VERSION FORK PINNED_TAG)
-  cmake_parse_arguments(PKG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+  if(NOT BUILD_SHARED_LIBS)
+    set(_exclude_from_all EXCLUDE_FROM_ALL FALSE)
+  else()
+    set(_exclude_from_all EXCLUDE_FROM_ALL TRUE)
+  endif()
 
+  # Currently we need to always build nanoarrow so we don't pickup a previous installed version
+  set(CPM_DOWNLOAD_nanoarrow ON)
   rapids_cpm_find(
-    nanoarrow ${PKG_VERSION}
+    nanoarrow 0.7.0.dev
     GLOBAL_TARGETS nanoarrow
     CPM_ARGS
-    GIT_REPOSITORY https://github.com/${PKG_FORK}/arrow-nanoarrow.git
-    GIT_TAG ${PKG_PINNED_TAG}
-    # TODO: Commit hashes are not supported with shallow clones. Can switch this if and when we pin
-    # to an actual tag.
+    GIT_REPOSITORY https://github.com/apache/arrow-nanoarrow.git
+    GIT_TAG 4bf5a9322626e95e3717e43de7616c0a256179eb
     GIT_SHALLOW FALSE
-    OPTIONS "BUILD_SHARED_LIBS OFF" "NANOARROW_NAMESPACE cudf"
+    OPTIONS "BUILD_SHARED_LIBS OFF" "NANOARROW_NAMESPACE cudf" ${_exclude_from_all}
   )
   set_target_properties(nanoarrow PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  rapids_export_find_package_root(BUILD nanoarrow "${nanoarrow_BINARY_DIR}" EXPORT_SET cudf-exports)
 endfunction()
 
-find_and_configure_nanoarrow(
-  VERSION 0.4.0 FORK apache PINNED_TAG c97720003ff863b81805bcdb9f7c91306ab6b6a8
-)
+find_and_configure_nanoarrow()

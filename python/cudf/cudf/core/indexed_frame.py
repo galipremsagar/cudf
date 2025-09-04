@@ -1,26 +1,19 @@
-# Copyright (c) 2021-2024, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
 """Base class for Frame types that have an index."""
 
 from __future__ import annotations
 
-import numbers
+import itertools
 import operator
 import textwrap
 import warnings
-from collections import Counter, abc
-from functools import cached_property
+from collections import Counter
+from collections.abc import Mapping
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Callable,
-    Dict,
-    List,
     Literal,
-    MutableMapping,
-    Optional,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
     cast,
 )
 from uuid import uuid4
@@ -28,50 +21,85 @@ from uuid import uuid4
 import cupy as cp
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 from typing_extensions import Self
 
+import pylibcudf as plc
+
 import cudf
-import cudf._lib as libcudf
-from cudf._typing import (
-    ColumnLike,
-    DataFrameOrSeries,
-    Dtype,
-    NotImplementedType,
-)
+from cudf._lib import strings_udf
 from cudf.api.extensions import no_default
 from cudf.api.types import (
-    _is_non_decimal_numeric_dtype,
-    is_bool_dtype,
-    is_decimal_dtype,
     is_dict_like,
     is_list_like,
     is_scalar,
+    is_string_dtype,
 )
-from cudf.core._base_index import BaseIndex
 from cudf.core._compat import PANDAS_LT_300
+from cudf.core._internals import copying, stream_compaction
 from cudf.core.buffer import acquire_spill_lock
-from cudf.core.column import ColumnBase, as_column
+from cudf.core.column import (
+    CategoricalColumn,
+    ColumnBase,
+    NumericalColumn,
+    as_column,
+    column_empty,
+)
+from cudf.core.column.column import concat_columns
 from cudf.core.column_accessor import ColumnAccessor
+from cudf.core.common import pipe
 from cudf.core.copy_types import BooleanMask, GatherMap
 from cudf.core.dtypes import ListDtype
 from cudf.core.frame import Frame
 from cudf.core.groupby.groupby import GroupBy
-from cudf.core.index import Index, RangeIndex, _index_from_columns
+from cudf.core.index import Index, RangeIndex, _index_from_data, ensure_index
 from cudf.core.missing import NA
 from cudf.core.multiindex import MultiIndex
 from cudf.core.resample import _Resampler
 from cudf.core.udf.utils import (
-    _compile_or_get,
     _get_input_args_from_frame,
-    _post_process_output_col,
+    _make_free_string_kernel,
     _return_arr_from_dtype,
 )
-from cudf.core.window import Rolling
+from cudf.core.window import ExponentialMovingWindow, Rolling
+from cudf.errors import MixedTypeError
 from cudf.utils import docutils, ioutils
 from cudf.utils._numba import _CUDFNumbaConfig
 from cudf.utils.docutils import copy_docstring
-from cudf.utils.nvtx_annotation import _cudf_nvtx_annotate
+from cudf.utils.dtypes import (
+    CUDF_STRING_DTYPE,
+    SIZE_TYPE_DTYPE,
+    can_convert_to_column,
+    find_common_type,
+    get_dtype_of_same_kind,
+    is_column_like,
+    is_dtype_obj_numeric,
+    is_mixed_with_object_dtype,
+    is_pandas_nullable_extension_dtype,
+)
+from cudf.utils.performance_tracking import _performance_tracking
+from cudf.utils.scalar import pa_scalar_to_plc_scalar
 from cudf.utils.utils import _warn_no_dask_cudf
+
+if TYPE_CHECKING:
+    from collections.abc import (
+        Callable,
+        Hashable,
+        Iterable,
+        MutableMapping,
+        Sequence,
+    )
+
+    from cudf._typing import (
+        ColumnLike,
+        DataFrameOrSeries,
+        Dtype,
+        DtypeObj,
+        NotImplementedType,
+        ScalarLike,
+    )
+    from cudf.core.series import Series
+
 
 doc_reset_index_template = """
         Reset the index of the {klass}, or a level of it.
@@ -87,6 +115,9 @@ doc_reset_index_template = """
 {argument}
         inplace : bool, default False
             Modify the DataFrame in place (do not create a new object).
+        allow_duplicates : bool, default False
+            Allow duplicate column labels to be created.
+            Currently not supported.
 
         Returns
         -------
@@ -148,79 +179,32 @@ doc_binop_template = textwrap.dedent(
 )
 
 
-def _get_host_unique(array):
+def _get_unique_drop_labels(array):
+    """Return labels to be dropped for IndexFrame.drop."""
     if isinstance(array, (cudf.Series, cudf.Index, ColumnBase)):
-        return array.unique.to_pandas()
-    elif isinstance(array, (str, numbers.Number)):
-        return [array]
+        yield from np.unique(as_column(array).values_host)
+    elif is_scalar(array):
+        yield array
     else:
-        return set(array)
-
-
-def _drop_columns(f: Frame, columns: abc.Iterable, errors: str):
-    for c in columns:
-        try:
-            f._drop_column(c)
-        except KeyError as e:
-            if errors == "ignore":
-                pass
-            else:
-                raise e
+        yield from set(array)
 
 
 def _indices_from_labels(obj, labels):
     if not isinstance(labels, cudf.MultiIndex):
-        labels = cudf.core.column.as_column(labels)
-
-        if isinstance(obj.index.dtype, cudf.CategoricalDtype):
-            labels = labels.astype("category")
-            codes = labels.codes.astype(obj.index._values.codes.dtype)
-            labels = cudf.core.column.build_categorical_column(
-                categories=labels.dtype.categories,
-                codes=codes,
-                ordered=labels.dtype.ordered,
-            )
-        else:
-            labels = labels.astype(obj.index.dtype)
+        labels = as_column(labels)
+        labels = labels.astype(obj.index.dtype)
+        idx_labels = cudf.Index._from_column(labels)
+    else:
+        idx_labels = labels
 
     # join is not guaranteed to maintain the index ordering
     # so we will sort it with its initial ordering which is stored
     # in column "__"
-    lhs = cudf.DataFrame({"__": as_column(range(len(labels)))}, index=labels)
+    lhs = cudf.DataFrame(
+        {"__": as_column(range(len(idx_labels)))}, index=idx_labels
+    )
     rhs = cudf.DataFrame({"_": as_column(range(len(obj)))}, index=obj.index)
     return lhs.join(rhs).sort_values(by=["__", "_"])["_"]
-
-
-def _get_label_range_or_mask(index, start, stop, step):
-    if (
-        not (start is None and stop is None)
-        and type(index) is cudf.core.index.DatetimeIndex
-        and index.is_monotonic_increasing is False
-    ):
-        start = pd.to_datetime(start)
-        stop = pd.to_datetime(stop)
-        if start is not None and stop is not None:
-            if start > stop:
-                return slice(0, 0, None)
-            if (start in index) and (stop in index):
-                # when we have a non-monotonic datetime index, return
-                # values in the slice defined by index_of(start) and
-                # index_of(end)
-                start_loc = index.get_loc(start.to_datetime64())
-                stop_loc = index.get_loc(stop.to_datetime64()) + 1
-                return slice(start_loc, stop_loc)
-            else:
-                raise KeyError(
-                    "Value based partial slicing on non-monotonic "
-                    "DatetimeIndexes with non-existing keys is not allowed.",
-                )
-        elif start is not None:
-            boolean_mask = index >= start
-        else:
-            boolean_mask = index <= stop
-        return boolean_mask
-    else:
-        return index.find_label_range(slice(start, stop, step))
 
 
 class _FrameIndexer:
@@ -228,6 +212,36 @@ class _FrameIndexer:
 
     def __init__(self, frame):
         self._frame = frame
+
+    def append_new_row(self, key, value, columns_df=None, column=None):
+        idx = self._frame.index
+
+        # Normalize key for tuple/list or int
+        key_val = key[0] if isinstance(key, (tuple, list)) else key
+
+        if isinstance(idx, RangeIndex):
+            if isinstance(key_val, int) and (key_val == idx[-1] + idx.step):
+                idx_copy = cudf.RangeIndex(
+                    start=idx.start,
+                    stop=idx.stop + idx.step,
+                    step=idx.step,
+                    name=idx.name,
+                )
+            else:
+                idx_copy = idx._as_int_index()
+                _append_new_row_inplace(idx_copy._column, key_val)
+        else:
+            idx_copy = idx.copy(deep=True)
+            _append_new_row_inplace(idx_copy._column, key_val)
+
+        # Append value(s) to column(s)
+        if columns_df is not None:
+            for col in columns_df._column_names:
+                _append_new_row_inplace(self._frame._data[col], value)
+        elif column is not None:
+            _append_new_row_inplace(self._frame._column, value)
+
+        self._frame._index = idx_copy
 
 
 _LocIndexerClass = TypeVar("_LocIndexerClass", bound="_FrameIndexer")
@@ -250,9 +264,8 @@ class IndexedFrame(Frame):
     """
 
     # mypy can't handle bound type variables as class members
-    _loc_indexer_type: Type[_LocIndexerClass]  # type: ignore
-    _iloc_indexer_type: Type[_IlocIndexerClass]  # type: ignore
-    _index: cudf.core.index.BaseIndex
+    _loc_indexer_type: type[_LocIndexerClass]  # type: ignore
+    _iloc_indexer_type: type[_IlocIndexerClass]  # type: ignore
     _groupby = GroupBy
     _resampler = _Resampler
 
@@ -271,56 +284,66 @@ class IndexedFrame(Frame):
         "cummax": {"op_name": "cumulative max"},
     }
 
-    def __init__(self, data=None, index=None):
+    def __init__(
+        self,
+        data: ColumnAccessor | MutableMapping[Any, ColumnBase],
+        index: Index,
+    ):
         super().__init__(data=data)
-        # TODO: Right now it is possible to initialize an IndexedFrame without
-        # an index. The code's correctness relies on the subclass constructors
-        # assigning the attribute after the fact. We should restructure those
-        # to ensure that this constructor is always invoked with an index.
+        if not isinstance(index, Index):
+            raise ValueError(
+                f"index must be a cudf index not {type(index).__name__}"
+            )
+        elif self._data.nrows > 0 and self._data.nrows != len(index):
+            raise ValueError(
+                f"Length of values ({self._data.nrows}) does not "
+                f"match length of index ({len(index)})"
+            )
         self._index = index
 
     @property
     def _num_rows(self) -> int:
         # Important to use the index because the data may be empty.
-        return len(self._index)
+        return len(self.index)
 
     @property
-    def _index_names(self) -> Tuple[Any, ...]:  # TODO: Tuple[str]?
-        return self._index._data.names
+    def _index_names(self) -> tuple[Any, ...]:  # TODO: Tuple[str]?
+        return self.index._column_names
 
     @classmethod
     def _from_data(
         cls,
         data: MutableMapping,
-        index: Optional[BaseIndex] = None,
+        index: Index | None = None,
     ):
         out = super()._from_data(data)
-        out._index = RangeIndex(out._data.nrows) if index is None else index
+        if index is None:
+            # out._num_rows requires .index to be defined
+            index = RangeIndex(out._data.nrows)
+        elif not isinstance(index, Index):
+            raise ValueError(
+                f"index must be a cudf.Index not {type(index).__name__}"
+            )
+        out._index = index
         return out
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _from_data_like_self(self, data: MutableMapping):
-        out = self._from_data(data, self._index)
-        out._data._level_names = self._data._level_names
+        out = super()._from_data_like_self(data)
+        out.index = self.index
         return out
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _from_columns_like_self(
         self,
-        columns: List[ColumnBase],
-        column_names: Optional[abc.Iterable[str]] = None,
-        index_names: Optional[List[str]] = None,
-        *,
-        override_dtypes: Optional[abc.Iterable[Optional[Dtype]]] = None,
+        columns: list[ColumnBase],
+        column_names: Iterable[str] | None = None,
+        index_names: list[str] | None = None,
     ) -> Self:
         """Construct a `Frame` from a list of columns with metadata from self.
 
         If `index_names` is set, the first `len(index_names)` columns are
         used to construct the index of the frame.
-
-        If override_dtypes is provided then any non-None entry will be
-        used for the dtype of the matching column in preference to the
-        dtype of the column in self.
         """
         if column_names is None:
             column_names = self._column_names
@@ -331,22 +354,27 @@ class IndexedFrame(Frame):
         if index_names is not None:
             n_index_columns = len(index_names)
             data_columns = columns[n_index_columns:]
-            index = _index_from_columns(columns[:n_index_columns])
+            index = _index_from_data(
+                dict(enumerate(columns[:n_index_columns]))
+            )
+            index = index._copy_type_metadata(self.index)
+            # TODO: Should this if statement be handled in Index._copy_type_metadata?
+            if (
+                isinstance(self.index, cudf.CategoricalIndex)
+                and not isinstance(index, cudf.CategoricalIndex)
+            ) or (
+                isinstance(self.index, cudf.MultiIndex)
+                and not isinstance(index, cudf.MultiIndex)
+            ):
+                index = type(self.index)._from_data(index._data)
             if isinstance(index, cudf.MultiIndex):
                 index.names = index_names
             else:
                 index.name = index_names[0]
 
-        data = dict(zip(column_names, data_columns))
-        frame = self.__class__._from_data(data)
-
-        if index is not None:
-            frame._index = index
-        return frame._copy_type_metadata(
-            self,
-            include_index=bool(index_names),
-            override_dtypes=override_dtypes,
-        )
+        data = dict(zip(column_names, data_columns, strict=True))
+        frame = type(self)._from_data(data, index)
+        return frame._copy_type_metadata(self)
 
     def __round__(self, digits=0):
         # Shouldn't be added to BinaryOperand
@@ -356,13 +384,12 @@ class IndexedFrame(Frame):
 
     def _mimic_inplace(
         self, result: Self, inplace: bool = False
-    ) -> Optional[Self]:
+    ) -> Self | None:
         if inplace:
-            self._index = result._index
+            self._index = result.index
         return super()._mimic_inplace(result, inplace)
 
-    # Scans
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _scan(self, op, axis=None, skipna=True):
         """
         Return {op_name} of the {cls}.
@@ -406,13 +433,10 @@ class IndexedFrame(Frame):
         cast_to_int = op in ("cumsum", "cumprod")
         skipna = True if skipna is None else skipna
 
-        results = {}
-        for name, col in self._data.items():
+        results = []
+        for col in self._columns:
             if skipna:
-                try:
-                    result_col = col.nans_to_nulls()
-                except AttributeError:
-                    result_col = col
+                result_col = col.nans_to_nulls()
             else:
                 if col.has_nulls(include_nan=True):
                     first_index = col.isnull().find_first_value(True)
@@ -421,93 +445,22 @@ class IndexedFrame(Frame):
                 else:
                     result_col = col
 
-            if (
-                cast_to_int
-                and not is_decimal_dtype(result_col.dtype)
-                and (
-                    np.issubdtype(result_col.dtype, np.integer)
-                    or np.issubdtype(result_col.dtype, np.bool_)
-                )
-            ):
+            if cast_to_int and result_col.dtype.kind in "uib":
                 # For reductions that accumulate a value (e.g. sum, not max)
                 # pandas returns an int64 dtype for all int or bool dtypes.
-                result_col = result_col.astype(np.int64)
-            results[name] = getattr(result_col, op)()
-        return self._from_data(results, self._index)
+                if cudf.get_option("mode.pandas_compatible"):
+                    dtype = get_dtype_of_same_kind(
+                        result_col.dtype, np.dtype(np.int64)
+                    )
+                else:
+                    dtype = np.dtype(np.int64)
+                result_col = result_col.astype(dtype)
+            results.append(getattr(result_col, op)())
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(results)
+        )
 
-    def _check_data_index_length_match(self) -> None:
-        # Validate that the number of rows in the data matches the index if the
-        # data is not empty. This is a helper for the constructor.
-        if self._data.nrows > 0 and self._data.nrows != len(self._index):
-            raise ValueError(
-                f"Length of values ({self._data.nrows}) does not "
-                f"match length of index ({len(self._index)})"
-            )
-
-    @property
-    @_cudf_nvtx_annotate
-    def empty(self):
-        """
-        Indicator whether DataFrame or Series is empty.
-
-        True if DataFrame/Series is entirely empty (no items),
-        meaning any of the axes are of length 0.
-
-        Returns
-        -------
-        out : bool
-            If DataFrame/Series is empty, return True, if not return False.
-
-        Examples
-        --------
-        >>> import cudf
-        >>> df = cudf.DataFrame({'A' : []})
-        >>> df
-        Empty DataFrame
-        Columns: [A]
-        Index: []
-        >>> df.empty
-        True
-
-        If we only have `null` values in our DataFrame, it is
-        not considered empty! We will need to drop
-        the `null`'s to make the DataFrame empty:
-
-        >>> df = cudf.DataFrame({'A' : [None, None]})
-        >>> df
-              A
-        0  <NA>
-        1  <NA>
-        >>> df.empty
-        False
-        >>> df.dropna().empty
-        True
-
-        Non-empty and empty Series example:
-
-        >>> s = cudf.Series([1, 2, None])
-        >>> s
-        0       1
-        1       2
-        2    <NA>
-        dtype: int64
-        >>> s.empty
-        False
-        >>> s = cudf.Series([])
-        >>> s
-        Series([], dtype: float64)
-        >>> s.empty
-        True
-
-        .. pandas-compat::
-            **DataFrame.empty, Series.empty**
-
-            If DataFrame/Series contains only `null` values, it is still not
-            considered empty. See the example above.
-        """
-        return self.size == 0
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @ioutils.doc_to_json()
     def to_json(self, path_or_buf=None, *args, **kwargs):
         """{docstring}"""
@@ -516,14 +469,14 @@ class IndexedFrame(Frame):
             self, path_or_buf=path_or_buf, *args, **kwargs
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @ioutils.doc_to_hdf()
     def to_hdf(self, path_or_buf, key, *args, **kwargs):
         """{docstring}"""
 
         cudf.io.hdf.to_hdf(path_or_buf, key, self, *args, **kwargs)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def to_string(self):
         r"""
         Convert to string
@@ -609,14 +562,12 @@ class IndexedFrame(Frame):
         return self._from_data(
             self._data.copy(deep=deep),
             # Indexes are immutable so copies can always be shallow.
-            self._index.copy(deep=False),
+            self.index.copy(deep=False),
         )
 
-    @_cudf_nvtx_annotate
-    def equals(self, other):  # noqa: D102
-        if not super().equals(other):
-            return False
-        return self._index.equals(other._index)
+    @_performance_tracking
+    def equals(self, other) -> bool:
+        return super().equals(other) and self.index.equals(other.index)
 
     @property
     def index(self):
@@ -629,14 +580,16 @@ class IndexedFrame(Frame):
         new_length = len(value)
 
         # A DataFrame with 0 columns can have an index of arbitrary length.
-        if len(self._data) > 0 and new_length != old_length:
+        if self._num_columns > 0 and new_length != old_length:
             raise ValueError(
                 f"Length mismatch: Expected axis has {old_length} elements, "
                 f"new values have {len(value)} elements"
             )
-        self._index = Index(value)
+        # avoid unnecessary cast to Index
+        value = ensure_index(value)
+        self._index = value
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def replace(
         self,
         to_replace=None,
@@ -834,7 +787,7 @@ class IndexedFrame(Frame):
         4    4    9  e
 
         .. pandas-compat::
-            **DataFrame.replace, Series.replace**
+            :meth:`pandas.DataFrame.replace`, :meth:`pandas.Series.replace`
 
             Parameters that are currently not supported are: `limit`, `regex`,
             `method`
@@ -869,7 +822,6 @@ class IndexedFrame(Frame):
                 FutureWarning,
             )
         if not (to_replace is None and value is no_default):
-            copy_data = {}
             (
                 all_na_per_column,
                 to_replace_per_column,
@@ -877,12 +829,12 @@ class IndexedFrame(Frame):
             ) = _get_replacement_values_for_columns(
                 to_replace=to_replace,
                 value=value,
-                columns_dtype_map=self._dtypes,
+                columns_dtype_map=dict(self._dtypes),
             )
-
-            for name, col in self._data.items():
+            copy_data = []
+            for name, col in self._column_labels_and_values:
                 try:
-                    copy_data[name] = col.find_and_replace(
+                    replaced = col.find_and_replace(
                         to_replace_per_column[name],
                         replacements_per_column[name],
                         all_na_per_column[name],
@@ -895,16 +847,18 @@ class IndexedFrame(Frame):
                     #    that exists in `copy_data`.
                     # ii. There is an OverflowError while trying to cast
                     #     `to_replace_per_column` to `replacements_per_column`.
-                    copy_data[name] = col.copy(deep=True)
+                    replaced = col.copy(deep=True)
+                copy_data.append(replaced)
+            result = self._from_data_like_self(
+                self._data._from_columns_like_self(copy_data)
+            )
         else:
-            copy_data = self._data.copy(deep=True)
-
-        result = self._from_data(copy_data, self._index)
+            result = self.copy()
 
         return self._mimic_inplace(result, inplace=inplace)
 
-    @_cudf_nvtx_annotate
-    def clip(self, lower=None, upper=None, inplace=False, axis=1):
+    @_performance_tracking
+    def clip(self, lower=None, upper=None, axis=1, inplace=False):
         """
         Trim values at input threshold(s).
 
@@ -1020,15 +974,16 @@ class IndexedFrame(Frame):
             ):
                 lower[0], upper[0] = upper[0], lower[0]
 
-        data = {
-            name: col.clip(lower[i], upper[i])
-            for i, (name, col) in enumerate(self._data.items())
-        }
-        output = self._from_data(data, self._index)
-        output._copy_type_metadata(self, include_index=False)
+        data = (
+            col.clip(low, high)
+            for col, low, high in zip(self._columns, lower, upper, strict=True)
+        )
+        output = self._from_data_like_self(
+            self._data._from_columns_like_self(data)
+        )
         return self._mimic_inplace(output, inplace=inplace)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def abs(self):
         """
         Return a Series/DataFrame with absolute numeric value of each element.
@@ -1054,7 +1009,7 @@ class IndexedFrame(Frame):
         """
         return self._unaryop("abs")
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def dot(self, other, reflect=False):
         """
         Get dot product of frame and other, (binary operator `dot`).
@@ -1102,22 +1057,18 @@ class IndexedFrame(Frame):
             other, (cudf.Series, cudf.DataFrame)
         ):
             common = self.index.union(other.index)
-            if len(common) > len(self.index) or len(common) > len(other.index):
+            if len(common) > max(len(self), len(other)):
                 raise ValueError("matrices are not aligned")
 
             lhs = self.reindex(index=common, copy=False).values
             rhs = other.reindex(index=common, copy=False).values
             if isinstance(other, cudf.DataFrame):
-                result_index = other._data.to_pandas_index()
+                result_index = other._data.to_pandas_index
         elif isinstance(self, cudf.DataFrame) and isinstance(
             other, (cudf.Series, cudf.DataFrame)
         ):
-            common = self._data.to_pandas_index().union(
-                other.index.to_pandas()
-            )
-            if len(common) > len(self._data.names) or len(common) > len(
-                other.index
-            ):
+            common = self._data.to_pandas_index.union(other.index.to_pandas())
+            if len(common) > max(self._num_columns, len(other)):
                 raise ValueError("matrices are not aligned")
 
             lhs = self.reindex(columns=common, copy=False)
@@ -1126,11 +1077,11 @@ class IndexedFrame(Frame):
             rhs = other.reindex(index=common, copy=False).values
             lhs = lhs.values
             if isinstance(other, cudf.DataFrame):
-                result_cols = other._data.to_pandas_index()
+                result_cols = other._data.to_pandas_index
 
         elif isinstance(
             other, (cp.ndarray, np.ndarray)
-        ) or cudf.utils.dtypes.can_convert_to_column(other):
+        ) or can_convert_to_column(other):
             rhs = cp.asarray(other)
         else:
             # TODO: This should raise an exception, not return NotImplemented,
@@ -1148,12 +1099,12 @@ class IndexedFrame(Frame):
             lhs, rhs = rhs, lhs
 
         result = lhs.dot(rhs)
-        if len(result.shape) == 1:
+        if result.ndim == 1:
             return cudf.Series(
                 result,
                 index=self.index if result_index is None else result_index,
             )
-        if len(result.shape) == 2:
+        if result.ndim == 2:
             return cudf.DataFrame(
                 result,
                 index=self.index if result_index is None else result_index,
@@ -1161,15 +1112,15 @@ class IndexedFrame(Frame):
             )
         return result.item()
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __matmul__(self, other):
         return self.dot(other)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def __rmatmul__(self, other):
         return self.dot(other, reflect=True)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def head(self, n=5):
         """
         Return the first `n` rows.
@@ -1248,7 +1199,7 @@ class IndexedFrame(Frame):
         """
         return self.iloc[:n]
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def tail(self, n=5):
         """
         Returns the last n rows as a new DataFrame or Series
@@ -1279,7 +1230,7 @@ class IndexedFrame(Frame):
 
         return self.iloc[-n:]
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def pipe(self, func, *args, **kwargs):
         """
         Apply ``func(self, *args, **kwargs)``.
@@ -1324,14 +1275,13 @@ class IndexedFrame(Frame):
         ...    .pipe((func, 'arg2'), arg1=a, arg3=c)
         ...  )
         """
-        return cudf.core.common.pipe(self, func, *args, **kwargs)
+        return pipe(self, func, *args, **kwargs)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def sum(
         self,
         axis=no_default,
         skipna=True,
-        dtype=None,
         numeric_only=False,
         min_count=0,
         **kwargs,
@@ -1345,8 +1295,6 @@ class IndexedFrame(Frame):
             Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-        dtype: data type
-            Data type to cast the result to.
         numeric_only : bool, default False
             If True, includes only float, int, boolean columns.
             If False, will raise error in-case there are
@@ -1371,28 +1319,21 @@ class IndexedFrame(Frame):
         a    10
         b    34
         dtype: int64
-
-        .. pandas-compat::
-            **DataFrame.sum, Series.sum**
-
-            Parameters currently not supported are `level`, `numeric_only`.
         """
         return self._reduce(
             "sum",
             axis=axis,
             skipna=skipna,
-            dtype=dtype,
             numeric_only=numeric_only,
             min_count=min_count,
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def product(
         self,
         axis=no_default,
         skipna=True,
-        dtype=None,
         numeric_only=False,
         min_count=0,
         **kwargs,
@@ -1406,8 +1347,6 @@ class IndexedFrame(Frame):
             Axis for the function to be applied on.
         skipna: bool, default True
             Exclude NA/null values when computing the result.
-        dtype: data type
-            Data type to cast the result to.
         numeric_only : bool, default False
             If True, includes only float, int, boolean columns.
             If False, will raise error in-case there are
@@ -1432,11 +1371,6 @@ class IndexedFrame(Frame):
         a      24
         b    5040
         dtype: int64
-
-        .. pandas-compat::
-            **DataFrame.product, Series.product**
-
-            Parameters currently not supported are level`, `numeric_only`.
         """
 
         return self._reduce(
@@ -1445,7 +1379,6 @@ class IndexedFrame(Frame):
             "prod" if axis in {1, "columns"} else "product",
             axis=axis,
             skipna=skipna,
-            dtype=dtype,
             numeric_only=numeric_only,
             min_count=min_count,
             **kwargs,
@@ -1454,7 +1387,7 @@ class IndexedFrame(Frame):
     # Alias for pandas compatibility.
     prod = product
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def mean(self, axis=0, skipna=True, numeric_only=False, **kwargs):
         """
         Return the mean of the values for the requested axis.
@@ -1494,7 +1427,7 @@ class IndexedFrame(Frame):
         )
 
     def median(
-        self, axis=None, skipna=True, level=None, numeric_only=None, **kwargs
+        self, axis=no_default, skipna=True, numeric_only=None, **kwargs
     ):
         """
         Return the median of the values for the requested axis.
@@ -1529,16 +1462,6 @@ class IndexedFrame(Frame):
         dtype: int64
         >>> ser.median()
         17.0
-
-        .. pandas-compat::
-            **DataFrame.median, Series.median**
-
-            Parameters currently not supported are `level` and `numeric_only`.
-
-        .. pandas-compat::
-            **DataFrame.median, Series.median**
-
-            Parameters currently not supported are `level` and `numeric_only`.
         """
         return self._reduce(
             "median",
@@ -1548,7 +1471,7 @@ class IndexedFrame(Frame):
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def std(
         self,
         axis=no_default,
@@ -1590,12 +1513,6 @@ class IndexedFrame(Frame):
         a    1.290994
         b    1.290994
         dtype: float64
-
-        .. pandas-compat::
-            **DataFrame.std, Series.std**
-
-            Parameters currently not supported are `level` and
-            `numeric_only`
         """
 
         return self._reduce(
@@ -1607,7 +1524,7 @@ class IndexedFrame(Frame):
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def var(
         self,
         axis=no_default,
@@ -1649,12 +1566,6 @@ class IndexedFrame(Frame):
         a    1.666667
         b    1.666667
         dtype: float64
-
-        .. pandas-compat::
-            **DataFrame.var, Series.var**
-
-            Parameters currently not supported are `level` and
-            `numeric_only`
         """
         return self._reduce(
             "var",
@@ -1665,7 +1576,7 @@ class IndexedFrame(Frame):
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def kurtosis(self, axis=0, skipna=True, numeric_only=False, **kwargs):
         """
         Return Fisher's unbiased kurtosis of a sample.
@@ -1705,11 +1616,6 @@ class IndexedFrame(Frame):
         a   -1.2
         b   -1.2
         dtype: float64
-
-        .. pandas-compat::
-            **DataFrame.kurtosis**
-
-            Parameters currently not supported are `level` and `numeric_only`
         """
         if axis not in (0, "index", None, no_default):
             raise NotImplementedError("Only axis=0 is currently supported.")
@@ -1725,7 +1631,7 @@ class IndexedFrame(Frame):
     # Alias for kurtosis.
     kurt = kurtosis
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def skew(self, axis=0, skipna=True, numeric_only=False, **kwargs):
         """
         Return unbiased Fisher-Pearson skew of a sample.
@@ -1769,7 +1675,7 @@ class IndexedFrame(Frame):
         dtype: float64
 
         .. pandas-compat::
-            **DataFrame.skew, Series.skew, Frame.skew**
+            :meth:`pandas.DataFrame.skew`, :meth:`pandas.Series.skew`
 
             The `axis` parameter is not currently supported.
         """
@@ -1784,8 +1690,15 @@ class IndexedFrame(Frame):
             **kwargs,
         )
 
-    @_cudf_nvtx_annotate
-    def mask(self, cond, other=None, inplace: bool = False) -> Optional[Self]:
+    @_performance_tracking
+    def mask(
+        self,
+        cond,
+        other=None,
+        inplace: bool = False,
+        axis=None,
+        level=None,
+    ) -> Self | None:
         """
         Replace values where the condition is True.
 
@@ -1837,6 +1750,10 @@ class IndexedFrame(Frame):
         4       0
         dtype: int64
         """
+        if axis is not None:
+            raise NotImplementedError("axis is not supported.")
+        elif level is not None:
+            raise NotImplementedError("level is not supported.")
 
         if not hasattr(cond, "__invert__"):
             # We Invert `cond` below and call `where`, so
@@ -1846,21 +1763,62 @@ class IndexedFrame(Frame):
 
         return self.where(cond=~cond, other=other, inplace=inplace)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @copy_docstring(Rolling)
     def rolling(
-        self, window, min_periods=None, center=False, axis=0, win_type=None
+        self,
+        window,
+        min_periods=None,
+        center: bool = False,
+        win_type: str | None = None,
+        on=None,
+        axis=0,
+        closed: str | None = None,
+        step: int | None = None,
+        method: str = "single",
     ):
         return Rolling(
-            self,
+            self,  # type: ignore[arg-type]
             window,
             min_periods=min_periods,
             center=center,
             axis=axis,
+            on=on,
             win_type=win_type,
+            closed=closed,
+            step=step,
+            method=method,
         )
 
-    @_cudf_nvtx_annotate
+    @copy_docstring(ExponentialMovingWindow)
+    def ewm(
+        self,
+        com: float | None = None,
+        span: float | None = None,
+        halflife: float | None = None,
+        alpha: float | None = None,
+        min_periods: int | None = 0,
+        adjust: bool = True,
+        ignore_na: bool = False,
+        axis: int = 0,
+        times: str | np.ndarray | None = None,
+        method: Literal["single", "table"] = "single",
+    ):
+        return ExponentialMovingWindow(
+            self,
+            com=com,
+            span=span,
+            halflife=halflife,
+            alpha=alpha,
+            min_periods=min_periods,
+            adjust=adjust,
+            ignore_na=ignore_na,
+            axis=axis,
+            times=times,
+            method=method,
+        )
+
+    @_performance_tracking
     def nans_to_nulls(self):
         """
         Convert nans (if any) to nulls
@@ -1906,56 +1864,17 @@ class IndexedFrame(Frame):
         1  <NA>  3.14
         2  <NA>  <NA>
         """
-        result_data = {}
-        for name, col in self._data.items():
-            try:
-                result_data[name] = col.nans_to_nulls()
-            except AttributeError:
-                result_data[name] = col.copy()
-        return self._from_data_like_self(result_data)
+        result = []
+        for col in self._columns:
+            converted = col.nans_to_nulls()
+            if converted is col:
+                converted = converted.copy()
+            result.append(converted)
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(result)
+        )
 
-    def _copy_type_metadata(
-        self,
-        other: Self,
-        include_index: bool = True,
-        *,
-        override_dtypes: Optional[abc.Iterable[Optional[Dtype]]] = None,
-    ) -> Self:
-        """
-        Copy type metadata from each column of `other` to the corresponding
-        column of `self`.
-        See `ColumnBase._with_type_metadata` for more information.
-        """
-        super()._copy_type_metadata(other, override_dtypes=override_dtypes)
-        if (
-            include_index
-            and self._index is not None
-            and other._index is not None
-        ):
-            self._index._copy_type_metadata(other._index)
-            # When other._index is a CategoricalIndex, the current index
-            # will be a NumericalIndex with an underlying CategoricalColumn
-            # (the above _copy_type_metadata call will have converted the
-            # column). Calling cudf.Index on that column generates the
-            # appropriate index.
-            if isinstance(
-                other._index, cudf.core.index.CategoricalIndex
-            ) and not isinstance(
-                self._index, cudf.core.index.CategoricalIndex
-            ):
-                self._index = cudf.Index(
-                    cast("cudf.Index", self._index)._column,
-                    name=self._index.name,
-                )
-            elif isinstance(other._index, cudf.MultiIndex) and not isinstance(
-                self._index, cudf.MultiIndex
-            ):
-                self._index = cudf.MultiIndex._from_data(
-                    self._index._data, name=self._index.name
-                )
-        return self
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def interpolate(
         self,
         method="linear",
@@ -2008,66 +1927,96 @@ class IndexedFrame(Frame):
                 "Use obj.ffill() or obj.bfill() instead.",
                 FutureWarning,
             )
+        elif method not in {"linear", "values", "index"}:
+            raise ValueError(f"Interpolation method `{method}` not found")
 
         data = self
 
-        if not isinstance(data._index, cudf.RangeIndex):
-            perm_sort = data._index.argsort()
+        if not isinstance(data.index, cudf.RangeIndex):
+            perm_sort = data.index.argsort()
             data = data._gather(
                 GatherMap.from_column_unchecked(
-                    cudf.core.column.as_column(perm_sort),
+                    as_column(perm_sort),
                     len(data),
                     nullify=False,
                 )
             )
 
-        interpolator = cudf.core.algorithms.get_column_interpolator(method)
-        columns = {}
-        for colname, col in data._data.items():
-            if isinstance(col, cudf.core.column.StringColumn):
+        if method == "linear":
+            interp_index = RangeIndex(self._num_rows)
+        else:
+            interp_index = data.index
+        columns = []
+        for col in data._columns:
+            if col.dtype == CUDF_STRING_DTYPE:
                 warnings.warn(
                     f"{type(self).__name__}.interpolate with object dtype is "
                     "deprecated and will raise in a future version.",
                     FutureWarning,
                 )
             if col.nullable:
-                col = col.astype("float64").fillna(np.nan)
+                col = col.astype(np.dtype(np.float64)).fillna(np.nan)
 
-            # Interpolation methods may or may not need the index
-            columns[colname] = interpolator(col, index=data._index)
+            columns.append(col.interpolate(index=interp_index))
 
-        result = self._from_data(columns, index=data._index)
+        result = self._from_data_like_self(
+            self._data._from_columns_like_self(columns)
+        )
+        result.index = data.index
 
         return (
             result
-            if isinstance(data._index, cudf.RangeIndex)
+            if isinstance(data.index, cudf.RangeIndex)
             # TODO: This should be a scatter, avoiding an argsort.
             else result._gather(
                 GatherMap.from_column_unchecked(
-                    cudf.core.column.as_column(perm_sort.argsort()),
+                    as_column(perm_sort.argsort()),
                     len(result),
                     nullify=False,
                 )
             )
         )
 
-    @_cudf_nvtx_annotate
-    def shift(self, periods=1, freq=None, axis=0, fill_value=None):
+    _SUPPORT_AXIS_LOOKUP = {0: 0, "index": 0}
+
+    @classmethod
+    @_performance_tracking
+    def _get_axis_from_axis_arg(cls, axis: int | str) -> int:
+        try:
+            return cls._SUPPORT_AXIS_LOOKUP[axis]
+        except KeyError:
+            raise ValueError(f"No axis named {axis} for object type {cls}")
+
+    @_performance_tracking
+    def shift(
+        self,
+        periods=1,
+        freq=None,
+        axis=0,
+        fill_value=None,
+        suffix: str | None = None,
+    ):
         """Shift values by `periods` positions."""
         axis = self._get_axis_from_axis_arg(axis)
         if axis != 0:
-            raise ValueError("Only axis=0 is supported.")
+            raise NotImplementedError("Only axis=0 is supported.")
         if freq is not None:
-            raise ValueError("The freq argument is not yet supported.")
+            raise NotImplementedError(
+                "The freq argument is not yet supported."
+            )
+        if suffix is not None:
+            raise NotImplementedError(
+                "The suffix argument is not yet supported."
+            )
 
         data_columns = (
             col.shift(periods, fill_value) for col in self._columns
         )
-        return self.__class__._from_data(
-            zip(self._column_names, data_columns), self._index
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(data_columns)
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def truncate(self, before=None, after=None, axis=0, copy=True):
         """
         Truncate a Series or DataFrame before and after some index value.
@@ -2239,7 +2188,7 @@ class IndexedFrame(Frame):
         2021-01-01 23:45:27  1  2
 
         .. pandas-compat::
-            **DataFrame.truncate, Series.truncate**
+            :meth:`pandas.DataFrame.truncate`, :meth:`pandas.Series.truncate`
 
             The ``copy`` parameter is only present for API compatibility, but
             ``copy=False`` is not supported. This method always generates a
@@ -2248,12 +2197,12 @@ class IndexedFrame(Frame):
         if not copy:
             raise ValueError("Truncating with copy=False is not supported.")
         axis = self._get_axis_from_axis_arg(axis)
-        ax = self._index if axis == 0 else self._data.to_pandas_index()
+        ax = self.index if axis == 0 else self._data.to_pandas_index
 
         if not ax.is_monotonic_increasing and not ax.is_monotonic_decreasing:
             raise ValueError("truncate requires a sorted index")
 
-        if type(ax) is cudf.core.index.DatetimeIndex:
+        if isinstance(ax, cudf.DatetimeIndex):
             before = pd.to_datetime(before)
             after = pd.to_datetime(after)
 
@@ -2267,7 +2216,7 @@ class IndexedFrame(Frame):
         slicer[axis] = slice(before, after)
         return self.loc[tuple(slicer)].copy()
 
-    @cached_property
+    @property
     def loc(self):
         """Select rows and columns by label or boolean mask.
 
@@ -2333,7 +2282,7 @@ class IndexedFrame(Frame):
         """
         return self._loc_indexer_type(self)
 
-    @cached_property
+    @property
     def iloc(self):
         """Select values by position.
 
@@ -2415,7 +2364,7 @@ class IndexedFrame(Frame):
         return self._iloc_indexer_type(self)
 
     @property  # type:ignore
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def axes(self):
         """
         Return a list representing the axes of the Series.
@@ -2537,7 +2486,7 @@ class IndexedFrame(Frame):
         1
         """
         axes = (
-            range(len(self.axes))
+            range(self.ndim)
             if axis is None
             else (self._get_axis_from_axis_arg(axis),)
         )
@@ -2547,7 +2496,7 @@ class IndexedFrame(Frame):
         )
         return self.iloc[indexer]
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def scale(self):
         """
         Scale values to [0, 1] in float64
@@ -2579,10 +2528,10 @@ class IndexedFrame(Frame):
         vmin = self.min()
         vmax = self.max()
         scaled = (self - vmin) / (vmax - vmin)
-        scaled._index = self._index.copy(deep=False)
+        scaled.index = self.index.copy(deep=False)
         return scaled
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def sort_index(
         self,
         axis=0,
@@ -2675,7 +2624,7 @@ class IndexedFrame(Frame):
         2  3  1
 
         .. pandas-compat::
-            **DataFrame.sort_index, Series.sort_index**
+            :meth:`pandas.DataFrame.sort_index`, :meth:`pandas.Series.sort_index`
 
             * Not supporting: kind, sort_remaining=False
         """
@@ -2700,11 +2649,11 @@ class IndexedFrame(Frame):
                         by.extend(
                             filter(
                                 lambda n: n not in handled,
-                                self.index._data.names,
+                                self.index._column_names,
                             )
                         )
                 else:
-                    by = list(idx._data.names)
+                    by = list(idx._column_names)
 
                 inds = idx._get_sorted_inds(
                     by=by, ascending=ascending, na_position=na_position
@@ -2716,10 +2665,7 @@ class IndexedFrame(Frame):
                 )
                 # TODO: frame factory function should handle multilevel column
                 # names
-                if (
-                    isinstance(self, cudf.core.dataframe.DataFrame)
-                    and self._data.multiindex
-                ):
+                if isinstance(self, cudf.DataFrame) and self._data.multiindex:
                     out._set_columns_like(self._data)
             elif (ascending and idx.is_monotonic_increasing) or (
                 not ascending and idx.is_monotonic_decreasing
@@ -2731,101 +2677,71 @@ class IndexedFrame(Frame):
                 )
                 out = self._gather(
                     GatherMap.from_column_unchecked(
-                        cudf.core.column.as_column(inds),
+                        as_column(inds),
                         len(self),
                         nullify=False,
                     )
                 )
-                if (
-                    isinstance(self, cudf.core.dataframe.DataFrame)
-                    and self._data.multiindex
-                ):
+                if isinstance(self, cudf.DataFrame) and self._data.multiindex:
                     out._set_columns_like(self._data)
             if ignore_index:
                 out = out.reset_index(drop=True)
         else:
-            labels = sorted(self._data.names, reverse=not ascending)
-            out = self[labels]
+            labels = sorted(self._column_names, reverse=not ascending)
+            result_columns = (self._data[label] for label in labels)
             if ignore_index:
-                out._data.rangeindex = True
-                out._data.names = list(range(len(self._data.names)))
+                ca = ColumnAccessor(
+                    dict(enumerate(result_columns)),
+                    rangeindex=True,
+                    verify=False,
+                )
+            else:
+                ca = ColumnAccessor(
+                    dict(zip(labels, result_columns, strict=True)),
+                    rangeindex=self._data.rangeindex,
+                    multiindex=self._data.multiindex,
+                    level_names=self._data.level_names,
+                    label_dtype=self._data.label_dtype,
+                    verify=False,
+                )
+            out = self._from_data_like_self(ca)
 
         return self._mimic_inplace(out, inplace=inplace)
 
-    def memory_usage(self, index=True, deep=False):
-        """Return the memory usage of an object.
-
-        Parameters
-        ----------
-        index : bool, default True
-            Specifies whether to include the memory usage of the index.
-        deep : bool, default False
-            The deep parameter is ignored and is only included for pandas
-            compatibility.
-
-        Returns
-        -------
-        Series or scalar
-            For DataFrame, a Series whose index is the original column names
-            and whose values is the memory usage of each column in bytes. For a
-            Series the total memory usage.
-
-        Examples
-        --------
-        **DataFrame**
-
-        >>> dtypes = ['int64', 'float64', 'object', 'bool']
-        >>> data = dict([(t, np.ones(shape=5000).astype(t))
-        ...              for t in dtypes])
-        >>> df = cudf.DataFrame(data)
-        >>> df.head()
-           int64  float64  object  bool
-        0      1      1.0     1.0  True
-        1      1      1.0     1.0  True
-        2      1      1.0     1.0  True
-        3      1      1.0     1.0  True
-        4      1      1.0     1.0  True
-        >>> df.memory_usage(index=False)
-        int64      40000
-        float64    40000
-        object     40000
-        bool        5000
-        dtype: int64
-
-        Use a Categorical for efficient storage of an object-dtype column with
-        many repeated values.
-
-        >>> df['object'].astype('category').memory_usage(deep=True)
-        5008
-
-        **Series**
-        >>> s = cudf.Series(range(3), index=['a','b','c'])
-        >>> s.memory_usage()
-        43
-
-        Not including the index gives the size of the rest of the data, which
-        is necessarily smaller:
-
-        >>> s.memory_usage(index=False)
-        24
-        """
-        raise NotImplementedError
-
-    def hash_values(self, method="murmur3", seed=None):
+    def hash_values(
+        self,
+        method: Literal[
+            "murmur3",
+            "xxhash64",
+            "md5",
+            "sha1",
+            "sha224",
+            "sha256",
+            "sha384",
+            "sha512",
+        ] = "murmur3",
+        seed: int | None = None,
+    ) -> Series:
         """Compute the hash of values in this column.
 
         Parameters
         ----------
-        method : {'murmur3', 'md5', 'xxhash64'}, default 'murmur3'
+        method : {'murmur3', 'xxhash32', 'xxhash64', 'md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512'}, default 'murmur3'
             Hash function to use:
 
             * murmur3: MurmurHash3 hash function
-            * md5: MD5 hash function
+            * xxhash32: xxHash32 hash function
             * xxhash64: xxHash64 hash function
+            * md5: MD5 hash function
+            * sha1: SHA-1 hash function
+            * sha224: SHA-224 hash function
+            * sha256: SHA-256 hash function
+            * sha384: SHA-384 hash function
+            * sha512: SHA-512 hash function
 
         seed : int, optional
             Seed value to use for the hash function. This parameter is only
-            supported for 'murmur3' and 'xxhash64'.
+            supported for 'murmur3', 'xxhash32', and 'xxhash64'.
 
 
         Returns
@@ -2880,7 +2796,7 @@ class IndexedFrame(Frame):
         2    fe061786ea286a515b772d91b0dfcd70
         dtype: object
         """
-        seed_hash_methods = {"murmur3", "xxhash64"}
+        seed_hash_methods = {"murmur3", "xxhash32", "xxhash64"}
         if seed is None:
             seed = 0
         elif method not in seed_hash_methods:
@@ -2888,11 +2804,33 @@ class IndexedFrame(Frame):
                 "Provided seed value has no effect for the hash method "
                 f"`{method}`. Only {seed_hash_methods} support seeds."
             )
-        # Note that both Series and DataFrame return Series objects from this
-        # calculation, necessitating the unfortunate circular reference to the
-        # child class here.
-        return cudf.Series._from_data(
-            {None: libcudf.hash.hash([*self._columns], method, seed)},
+        with acquire_spill_lock():
+            plc_table = plc.Table(
+                [c.to_pylibcudf(mode="read") for c in self._columns]
+            )
+            if method == "murmur3":
+                plc_column = plc.hashing.murmurhash3_x86_32(plc_table, seed)
+            elif method == "xxhash32":
+                plc_column = plc.hashing.xxhash_32(plc_table, seed)
+            elif method == "xxhash64":
+                plc_column = plc.hashing.xxhash_64(plc_table, seed)
+            elif method == "md5":
+                plc_column = plc.hashing.md5(plc_table)
+            elif method == "sha1":
+                plc_column = plc.hashing.sha1(plc_table)
+            elif method == "sha224":
+                plc_column = plc.hashing.sha224(plc_table)
+            elif method == "sha256":
+                plc_column = plc.hashing.sha256(plc_table)
+            elif method == "sha384":
+                plc_column = plc.hashing.sha384(plc_table)
+            elif method == "sha512":
+                plc_column = plc.hashing.sha512(plc_table)
+            else:
+                raise ValueError(f"Unsupported hashing algorithm {method}.")
+            result = ColumnBase.from_pylibcudf(plc_column)
+        return cudf.Series._from_column(
+            result,
             index=self.index,
         )
 
@@ -2912,15 +2850,18 @@ class IndexedFrame(Frame):
         if not gather_map.nullify and len(self) != gather_map.nrows:
             raise IndexError("Gather map is out of bounds")
         return self._from_columns_like_self(
-            libcudf.copying.gather(
-                list(self._index._columns + self._columns)
-                if keep_index
-                else list(self._columns),
-                gather_map.column,
-                nullify=gather_map.nullify,
-            ),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in copying.gather(
+                    itertools.chain(self.index._columns, self._columns)
+                    if keep_index
+                    else self._columns,
+                    gather_map.column,
+                    nullify=gather_map.nullify,
+                )
+            ],
             self._column_names,
-            self._index.names if keep_index else None,
+            self.index.names if keep_index else None,
         )
 
     def _slice(self, arg: slice, keep_index: bool = True) -> Self:
@@ -2982,9 +2923,12 @@ class IndexedFrame(Frame):
         if stride != 1:
             return self._gather(
                 GatherMap.from_column_unchecked(
-                    as_column(
-                        range(start, stop, stride),
-                        dtype=libcudf.types.size_type_dtype,
+                    cast(
+                        NumericalColumn,
+                        as_column(
+                            range(start, stop, stride),
+                            dtype=SIZE_TYPE_DTYPE,
+                        ),
                     ),
                     len(self),
                     nullify=False,
@@ -2992,42 +2936,48 @@ class IndexedFrame(Frame):
                 keep_index=keep_index,
             )
 
-        columns_to_slice = [
-            *(
-                self._index._data.columns
-                if keep_index and not has_range_index
-                else []
-            ),
-            *self._columns,
-        ]
-        result = self._from_columns_like_self(
-            libcudf.copying.columns_slice(columns_to_slice, [start, stop])[0],
-            self._column_names,
-            None if has_range_index or not keep_index else self._index.names,
+        columns_to_slice = (
+            itertools.chain(self.index._columns, self._columns)
+            if keep_index and not has_range_index
+            else self._columns
         )
-        result._data.label_dtype = self._data.label_dtype
-        result._data.rangeindex = self._data.rangeindex
+        with acquire_spill_lock():
+            plc_tables = plc.copying.slice(
+                plc.Table(
+                    [col.to_pylibcudf(mode="read") for col in columns_to_slice]
+                ),
+                [start, stop],
+            )
+            sliced = [
+                ColumnBase.from_pylibcudf(col)
+                for col in plc_tables[0].columns()
+            ]
+        result = self._from_columns_like_self(
+            sliced,
+            self._column_names,
+            None if has_range_index or not keep_index else self.index.names,
+        )
 
         if keep_index and has_range_index:
             result.index = self.index[start:stop]
         return result
 
     def _positions_from_column_names(
-        self, column_names, offset_by_index_columns=False
-    ):
+        self,
+        column_names: set[Hashable],
+        offset_by_index_columns: bool = True,
+    ) -> list[int]:
         """Map each column name into their positions in the frame.
 
         Return positions of the provided column names, offset by the number of
         index columns if `offset_by_index_columns` is True. The order of
         indices returned corresponds to the column order in this Frame.
         """
-        num_index_columns = (
-            len(self._index._data) if offset_by_index_columns else 0
-        )
+        start = self.index.nlevels if offset_by_index_columns else 0
         return [
-            i + num_index_columns
-            for i, name in enumerate(self._column_names)
-            if name in set(column_names)
+            i
+            for i, name in enumerate(self._column_names, start=start)
+            if name in column_names
         ]
 
     def drop_duplicates(
@@ -3064,20 +3014,25 @@ class IndexedFrame(Frame):
             subset, offset_by_index_columns=not ignore_index
         )
         return self._from_columns_like_self(
-            libcudf.stream_compaction.drop_duplicates(
-                list(self._columns)
-                if ignore_index
-                else list(self._index._columns + self._columns),
-                keys=keys,
-                keep=keep,
-                nulls_are_equal=nulls_are_equal,
-            ),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in stream_compaction.drop_duplicates(
+                    list(self._columns)
+                    if ignore_index
+                    else list(self.index._columns + self._columns),
+                    keys=keys,
+                    keep=keep,
+                    nulls_are_equal=nulls_are_equal,
+                )
+            ],
             self._column_names,
-            self._index.names if not ignore_index else None,
+            self.index.names if not ignore_index else None,
         )
 
-    @_cudf_nvtx_annotate
-    def duplicated(self, subset=None, keep="first"):
+    @_performance_tracking
+    def duplicated(
+        self, subset=None, keep: Literal["first", "last", False] = "first"
+    ) -> Series:
         """
         Return boolean Series denoting duplicate rows.
 
@@ -3171,83 +3126,94 @@ class IndexedFrame(Frame):
         """
         subset = self._preprocess_subset(subset)
 
+        name = None
         if isinstance(self, cudf.Series):
             columns = [self._column]
+            name = self.name
         else:
             columns = [self._data[n] for n in subset]
-        distinct = libcudf.stream_compaction.distinct_indices(
-            columns, keep=keep
-        )
-        (result,) = libcudf.copying.scatter(
-            [cudf.Scalar(False, dtype=bool)],
-            distinct,
-            [as_column(True, length=len(self), dtype=bool)],
+
+        _keep_options = {
+            "first": plc.stream_compaction.DuplicateKeepOption.KEEP_FIRST,
+            "last": plc.stream_compaction.DuplicateKeepOption.KEEP_LAST,
+            False: plc.stream_compaction.DuplicateKeepOption.KEEP_NONE,
+        }
+
+        if (keep_option := _keep_options.get(keep)) is None:
+            raise ValueError('keep must be either "first", "last" or False')
+
+        with acquire_spill_lock():
+            plc_column = plc.stream_compaction.distinct_indices(
+                plc.Table([col.to_pylibcudf(mode="read") for col in columns]),
+                keep_option,
+                plc.types.NullEquality.EQUAL,
+                plc.types.NanEquality.ALL_EQUAL,
+            )
+            distinct = ColumnBase.from_pylibcudf(plc_column)
+        result = as_column(
+            True, length=len(self), dtype=bool
+        )._scatter_by_column(
+            distinct,  # type: ignore[arg-type]
+            pa_scalar_to_plc_scalar(pa.scalar(False)),
             bounds_check=False,
         )
-        return cudf.Series(result, index=self.index)
+        return cudf.Series._from_column(result, index=self.index, name=name)
 
-    @_cudf_nvtx_annotate
-    def _empty_like(self, keep_index=True) -> Self:
+    @_performance_tracking
+    def _empty_like(self, keep_index: bool = True) -> Self:
+        with acquire_spill_lock():
+            plc_table = plc.copying.empty_like(
+                plc.Table(
+                    [
+                        col.to_pylibcudf(mode="read")
+                        for col in (
+                            itertools.chain(self.index._columns, self._columns)
+                            if keep_index
+                            else self._columns
+                        )
+                    ]
+                )
+            )
+            columns = [
+                ColumnBase.from_pylibcudf(col) for col in plc_table.columns()
+            ]
         result = self._from_columns_like_self(
-            libcudf.copying.columns_empty_like(
-                [
-                    *(self._index._data.columns if keep_index else ()),
-                    *self._columns,
-                ]
-            ),
+            columns,
             self._column_names,
-            self._index.names if keep_index else None,
+            self.index.names if keep_index else None,
         )
         result._data.label_dtype = self._data.label_dtype
         result._data.rangeindex = self._data.rangeindex
         return result
 
-    def _split(self, splits, keep_index=True):
+    def _split(self, splits: list[int], keep_index: bool = True) -> list[Self]:
         if self._num_rows == 0:
             return []
 
-        columns_split = libcudf.copying.columns_split(
-            [
-                *(self._index._data.columns if keep_index else []),
-                *self._columns,
-            ],
+        columns_split = copying.columns_split(
+            itertools.chain(self.index._columns, self._columns)
+            if keep_index
+            else self._columns,
             splits,
         )
 
+        @acquire_spill_lock()
+        def split_from_pylibcudf(split: list[plc.Column]) -> list[ColumnBase]:
+            return [ColumnBase.from_pylibcudf(col) for col in split]
+
         return [
             self._from_columns_like_self(
-                columns_split[i],
+                split_from_pylibcudf(split),
                 self._column_names,
-                self._index.names if keep_index else None,
+                self.index.names if keep_index else None,
             )
-            for i in range(len(splits) + 1)
+            for split in columns_split
         ]
 
-    @_cudf_nvtx_annotate
-    def fillna(
-        self, value=None, method=None, axis=None, inplace=False, limit=None
-    ):  # noqa: D102
-        if method is not None:
-            # Do not remove until pandas 3.0 support is added.
-            assert (
-                PANDAS_LT_300
-            ), "Need to drop after pandas-3.0 support is added."
-            warnings.warn(
-                f"{type(self).__name__}.fillna with 'method' is "
-                "deprecated and will raise in a future version. "
-                "Use obj.ffill() or obj.bfill() instead.",
-                FutureWarning,
-            )
-        old_index = self._index
-        ret = super().fillna(value, method, axis, inplace, limit)
-        if inplace:
-            self._index = old_index
-        else:
-            ret._index = old_index
-        return ret
-
-    @_cudf_nvtx_annotate
-    def bfill(self, value=None, axis=None, inplace=None, limit=None):
+    @_performance_tracking
+    def bfill(
+        self, value=None, axis=None, inplace=None, limit=None, limit_area=None
+    ):
         """
         Synonym for :meth:`Series.fillna` with ``method='bfill'``.
 
@@ -3255,6 +3221,9 @@ class IndexedFrame(Frame):
         -------
             Object with missing values filled or None if ``inplace=True``.
         """
+        if limit_area is not None:
+            raise NotImplementedError("limit_area is currently not supported.")
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             return self.fillna(
@@ -3265,7 +3234,7 @@ class IndexedFrame(Frame):
                 limit=limit,
             )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def backfill(self, value=None, axis=None, inplace=None, limit=None):
         """
         Synonym for :meth:`Series.fillna` with ``method='bfill'``.
@@ -3285,8 +3254,15 @@ class IndexedFrame(Frame):
         )
         return self.bfill(value=value, axis=axis, inplace=inplace, limit=limit)
 
-    @_cudf_nvtx_annotate
-    def ffill(self, value=None, axis=None, inplace=None, limit=None):
+    @_performance_tracking
+    def ffill(
+        self,
+        value=None,
+        axis=None,
+        inplace=None,
+        limit=None,
+        limit_area: Literal["inside", "outside", None] = None,
+    ):
         """
         Synonym for :meth:`Series.fillna` with ``method='ffill'``.
 
@@ -3294,6 +3270,9 @@ class IndexedFrame(Frame):
         -------
             Object with missing values filled or None if ``inplace=True``.
         """
+        if limit_area is not None:
+            raise NotImplementedError("limit_area is currently not supported.")
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             return self.fillna(
@@ -3304,7 +3283,7 @@ class IndexedFrame(Frame):
                 limit=limit,
             )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def pad(self, value=None, axis=None, inplace=None, limit=None):
         """
         Synonym for :meth:`Series.fillna` with ``method='ffill'``.
@@ -3324,7 +3303,7 @@ class IndexedFrame(Frame):
         )
         return self.ffill(value=value, axis=axis, inplace=inplace, limit=limit)
 
-    def add_prefix(self, prefix):
+    def add_prefix(self, prefix, axis=None):
         """
         Prefix labels with string `prefix`.
 
@@ -3385,7 +3364,7 @@ class IndexedFrame(Frame):
                 Use `Series.add_prefix` or `DataFrame.add_prefix`"
         )
 
-    def add_suffix(self, suffix):
+    def add_suffix(self, suffix, axis=None):
         """
         Suffix labels with string `suffix`.
 
@@ -3444,15 +3423,14 @@ class IndexedFrame(Frame):
         raise NotImplementedError
 
     @acquire_spill_lock()
-    @_cudf_nvtx_annotate
-    def _apply(self, func, kernel_getter, *args, **kwargs):
+    @_performance_tracking
+    def _apply(self, func, kernel_class, *args, **kwargs):
         """Apply `func` across the rows of the frame."""
         if kwargs:
             raise ValueError("UDFs using **kwargs are not yet supported.")
         try:
-            kernel, retty = _compile_or_get(
-                self, func, args, kernel_getter=kernel_getter
-            )
+            kr = kernel_class(self, func, args)
+            kernel, retty = kr.get_kernel()
         except Exception as e:
             raise ValueError(
                 "user defined function compilation failed."
@@ -3470,10 +3448,18 @@ class IndexedFrame(Frame):
         except Exception as e:
             raise RuntimeError("UDF kernel execution failed.") from e
 
-        col = _post_process_output_col(ans_col, retty)
+        if retty == CUDF_STRING_DTYPE:
+            col = ColumnBase.from_pylibcudf(
+                strings_udf.column_from_managed_udf_string_array(ans_col)
+            )
+            free_kernel = _make_free_string_kernel()
+            with _CUDFNumbaConfig():
+                free_kernel.forall(len(col))(ans_col, len(col))
+        else:
+            col = as_column(ans_col, retty)
 
-        col.set_base_mask(libcudf.transform.bools_to_mask(ans_mask))
-        result = cudf.Series._from_data({None: col}, self._index)
+        col.set_base_mask(ans_mask.as_mask())
+        result = cudf.Series._from_column(col, index=self.index)
 
         return result
 
@@ -3481,11 +3467,12 @@ class IndexedFrame(Frame):
         self,
         by,
         axis=0,
-        ascending=True,
-        inplace=False,
-        kind="quicksort",
-        na_position="last",
-        ignore_index=False,
+        ascending: bool | list[bool] = True,
+        inplace: bool = False,
+        kind: str = "quicksort",
+        na_position: Literal["first", "last"] = "last",
+        ignore_index: bool = False,
+        key=None,
     ):
         """Sort by the values along either axis.
 
@@ -3501,6 +3488,14 @@ class IndexedFrame(Frame):
             'first' puts nulls at the beginning, 'last' puts nulls at the end
         ignore_index : bool, default False
             If True, index will not be sorted.
+        key : callable, optional
+            Apply the key function to the values
+            before sorting. This is similar to the ``key`` argument in the
+            builtin ``sorted`` function, with the notable difference that
+            this ``key`` function should be *vectorized*. It should expect a
+            ``Series`` and return a Series with the same shape as the input.
+            It will be applied to each column in `by` independently.
+            Currently not supported.
 
         Returns
         -------
@@ -3519,7 +3514,7 @@ class IndexedFrame(Frame):
         1  1  2
 
         .. pandas-compat::
-            **DataFrame.sort_values, Series.sort_values**
+            :meth:`pandas.DataFrame.sort_values`, :meth:`pandas.Series.sort_values`
 
             * Support axis='index' only.
             * Not supporting: inplace, kind
@@ -3540,14 +3535,43 @@ class IndexedFrame(Frame):
             )
         if axis != 0:
             raise NotImplementedError("`axis` not currently implemented.")
+        if key is not None:
+            raise NotImplementedError("key is not currently supported.")
 
         if len(self) == 0:
             return self
 
+        try:
+            by_in_columns = self._get_columns_by_label(by)
+        except KeyError:
+            by_in_columns = None
+        if self.ndim == 1:
+            # For Series case, we're never selecting an index level.
+            by_in_index = None
+        else:
+            try:
+                by_in_index = self.index._get_columns_by_label(by)
+            except KeyError:
+                by_in_index = None
+
+        if by_in_columns is not None and by_in_index is not None:
+            raise ValueError(
+                f"{by=} appears in the {type(self).__name__} columns "
+                "and as an index level which is ambiguous."
+            )
+        elif by_in_columns is not None:
+            by_columns = by_in_columns
+        elif by_in_index is not None:
+            by_columns = by_in_index
+        else:
+            raise KeyError(by)
+
+        if cudf.get_option("mode.pandas_compatible"):
+            by_columns = by_columns.nans_to_nulls()
         # argsort the `by` column
         out = self._gather(
             GatherMap.from_column_unchecked(
-                self._get_columns_by_label(by)._get_sorted_inds(
+                by_columns._get_sorted_inds(
                     ascending=ascending, na_position=na_position
                 ),
                 len(self),
@@ -3555,11 +3579,6 @@ class IndexedFrame(Frame):
             ),
             keep_index=not ignore_index,
         )
-        if (
-            isinstance(self, cudf.core.dataframe.DataFrame)
-            and self._data.multiindex
-        ):
-            out.columns = self._data.to_pandas_index()
         return out
 
     def _n_largest_or_smallest(
@@ -3571,7 +3590,7 @@ class IndexedFrame(Frame):
 
         method = "nlargest" if largest else "nsmallest"
         for col in columns:
-            if isinstance(self._data[col], cudf.core.column.StringColumn):
+            if self._data[col].dtype == CUDF_STRING_DTYPE:
                 if isinstance(self, cudf.DataFrame):
                     error_msg = (
                         f"Column '{col}' has dtype {self._data[col].dtype}, "
@@ -3629,7 +3648,7 @@ class IndexedFrame(Frame):
         sort: bool = True,
         allow_non_unique: bool = False,
     ) -> Self:
-        index = cudf.core.index.as_index(index)
+        index = ensure_index(index)
 
         if self.index.equals(index):
             return self
@@ -3653,16 +3672,14 @@ class IndexedFrame(Frame):
             result = result.sort_values(sort_col_id)
             del result[sort_col_id]
 
-        result = self.__class__._from_data(
-            data=result._data, index=result.index
+        out = self._from_data(
+            self._data._from_columns_like_self(result._columns)
         )
-        result._data.multiindex = self._data.multiindex
-        result._data._level_names = self._data._level_names
-        result.index.names = self.index.names
+        out.index = result.index
+        out.index.names = self.index.names
+        return out
 
-        return result
-
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _reindex(
         self,
         column_names,
@@ -3671,6 +3688,10 @@ class IndexedFrame(Frame):
         index=None,
         inplace=False,
         fill_value=NA,
+        level=None,
+        method=None,
+        limit=None,
+        tolerance=None,
     ):
         """
         Helper for `.reindex`
@@ -3695,24 +3716,34 @@ class IndexedFrame(Frame):
         -------
         Series or DataFrame
         """
+        if method is not None:
+            raise NotImplementedError("method is not currently supported.")
+        if level is not None:
+            raise NotImplementedError("level is not currently supported.")
+        if limit is not None:
+            raise NotImplementedError("limit is not currently supported.")
+        if tolerance is not None:
+            raise NotImplementedError("tolerance is not currently supported.")
+
         if dtypes is None:
             dtypes = {}
 
         df = self
         if index is not None:
-            if not df._index.is_unique:
+            if not df.index.is_unique:
                 raise ValueError(
                     "cannot reindex on an axis with duplicate labels"
                 )
-            index = cudf.core.index.as_index(
-                index, name=getattr(index, "name", self._index.name)
+            index = cudf.Index(
+                index, name=getattr(index, "name", self.index.name)
             )
 
             idx_dtype_match = (df.index.nlevels == index.nlevels) and all(
                 _is_same_dtype(left_dtype, right_dtype)
                 for left_dtype, right_dtype in zip(
-                    (col.dtype for col in df.index._data.columns),
-                    (col.dtype for col in index._data.columns),
+                    (dtype for _, dtype in df.index._dtypes),
+                    (dtype for _, dtype in index._dtypes),
+                    strict=True,
                 )
             )
 
@@ -3731,9 +3762,9 @@ class IndexedFrame(Frame):
                         (name or 0)
                         if isinstance(self, cudf.Series)
                         else name: col
-                        for name, col in df._data.items()
+                        for name, col in df._column_labels_and_values
                     },
-                    index=df._index,
+                    index=df.index,
                 )
                 df = lhs.join(rhs, how="left", sort=True)
                 # double-argsort to map back from sorted to unsorted positions
@@ -3742,7 +3773,7 @@ class IndexedFrame(Frame):
         index = index if index is not None else df.index
 
         if column_names is None:
-            names = list(df._data.names)
+            names = list(df._column_names)
             level_names = self._data.level_names
             multiindex = self._data.multiindex
             rangeindex = self._data.rangeindex
@@ -3773,9 +3804,8 @@ class IndexedFrame(Frame):
             name: (
                 df._data[name].copy(deep=deep)
                 if name in df._data
-                else cudf.core.column.column.column_empty(
-                    dtype=dtypes.get(name, np.float64),
-                    masked=True,
+                else column_empty(
+                    dtype=dtypes.get(name, np.dtype(np.float64)),
                     row_count=len(index),
                 )
             )
@@ -3783,7 +3813,7 @@ class IndexedFrame(Frame):
         }
 
         result = self.__class__._from_data(
-            data=cudf.core.column_accessor.ColumnAccessor(
+            data=ColumnAccessor(
                 cols,
                 multiindex=multiindex,
                 level_names=level_names,
@@ -3887,45 +3917,40 @@ class IndexedFrame(Frame):
             decimals = decimals.to_dict()
         elif isinstance(decimals, int):
             decimals = {name: decimals for name in self._column_names}
-        elif not isinstance(decimals, abc.Mapping):
+        elif not isinstance(decimals, Mapping):
             raise TypeError(
                 "decimals must be an integer, a dict-like or a Series"
             )
 
-        cols = {
-            name: col.round(decimals[name], how=how)
-            if (
-                name in decimals
-                and _is_non_decimal_numeric_dtype(col.dtype)
-                and not is_bool_dtype(col.dtype)
+        cols = (
+            col.round(decimals[name], how=how)
+            if name in decimals
+            and (
+                col.dtype.kind in "fiu"
+                or isinstance(
+                    col.dtype, (cudf.Decimal32Dtype, cudf.Decimal64Dtype)
+                )
             )
             else col.copy(deep=True)
-            for name, col in self._data.items()
-        }
-
-        return self.__class__._from_data(
-            data=cudf.core.column_accessor.ColumnAccessor(
-                cols,
-                multiindex=self._data.multiindex,
-                level_names=self._data.level_names,
-            ),
-            index=self._index,
+            for name, col in self._column_labels_and_values
+        )
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(cols)
         )
 
     def resample(
         self,
         rule,
         axis=0,
-        closed=None,
-        label=None,
-        convention="start",
+        closed: Literal["right", "left"] | None = None,
+        label: Literal["right", "left"] | None = None,
+        convention: Literal["start", "end", "s", "e"] = "start",
         kind=None,
-        loffset=None,
-        base=None,
         on=None,
         level=None,
         origin="start_day",
         offset=None,
+        group_keys: bool = False,
     ):
         """
         Convert the frequency of ("resample") the given time series data.
@@ -4047,7 +4072,7 @@ class IndexedFrame(Frame):
 
 
         .. pandas-compat::
-            **DataFrame.resample, Series.resample**
+            :meth:`pandas.DataFrame.resample`, :meth:`pandas.Series.resample`
 
             Note that the dtype of the index (or the 'on' column if using
             'on=') in the result will be of a frequency closest to the
@@ -4055,7 +4080,7 @@ class IndexedFrame(Frame):
             nanoseconds to milliseconds, the index will be of dtype
             'datetime64[ms]'.
         """
-        import cudf.core.resample
+        from cudf.core.resample import DataFrameResampler, SeriesResampler
 
         if kind is not None:
             warnings.warn(
@@ -4063,37 +4088,44 @@ class IndexedFrame(Frame):
                 "deprecated and will be removed in a future version. ",
                 FutureWarning,
             )
-        if (axis, convention, kind, loffset, base, origin, offset) != (
-            0,
-            "start",
-            None,
-            None,
-            None,
-            "start_day",
-            None,
-        ):
-            raise NotImplementedError(
-                "The following arguments are not "
-                "currently supported by resample:\n\n"
-                "- axis\n"
-                "- convention\n"
-                "- kind\n"
-                "- loffset\n"
-                "- base\n"
-                "- origin\n"
-                "- offset"
+            raise NotImplementedError("kind is currently not supported.")
+        if axis != 0:
+            warnings.warn(
+                "The 'axis' keyword in is "
+                "deprecated and will be removed in a future version. ",
+                FutureWarning,
             )
+            raise NotImplementedError("axis is currently not supported.")
+        if convention != "start":
+            warnings.warn(
+                "The 'convention' keyword in is "
+                "deprecated and will be removed in a future version. ",
+                FutureWarning,
+            )
+            raise NotImplementedError("convention is currently not supported.")
+        if origin != "start_day":
+            raise NotImplementedError("origin is currently not supported.")
+        if offset is not None:
+            raise NotImplementedError("offset is currently not supported.")
+        if group_keys is not False:
+            raise NotImplementedError("group_keys is currently not supported.")
         by = cudf.Grouper(
             key=on, freq=rule, closed=closed, label=label, level=level
         )
         return (
-            cudf.core.resample.SeriesResampler(self, by=by)
+            SeriesResampler(self, by=by)
             if isinstance(self, cudf.Series)
-            else cudf.core.resample.DataFrameResampler(self, by=by)
+            else DataFrameResampler(self, by=by)
         )
 
     def dropna(
-        self, axis=0, how="any", thresh=None, subset=None, inplace=False
+        self,
+        axis=0,
+        how="any",
+        thresh=None,
+        subset=None,
+        inplace=False,
+        ignore_index: bool = False,
     ):
         """
         Drop rows (or columns) containing nulls from a Column.
@@ -4117,6 +4149,8 @@ class IndexedFrame(Frame):
             columns, subset is a list of rows to consider.
         inplace : bool, default False
             If True, do operation inplace and return None.
+        ignore_index : bool, default ``False``
+            If ``True``, the resulting axis will be labeled 0, 1, …, n - 1.
 
         Returns
         -------
@@ -4191,8 +4225,10 @@ class IndexedFrame(Frame):
              name        toy       born
         0  Alfred  Batmobile 1940-04-25
         """
-        if axis == 0:
+        if axis in [0, "index"]:
             result = self._drop_na_rows(how=how, subset=subset, thresh=thresh)
+            if ignore_index:
+                result.index = RangeIndex(len(result))
         else:
             result = self._drop_na_columns(
                 how=how, subset=subset, thresh=thresh
@@ -4200,7 +4236,7 @@ class IndexedFrame(Frame):
 
         return self._mimic_inplace(result, inplace=inplace)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _drop_na_columns(self, how="any", subset=None, thresh=None):
         """
         Drop columns containing nulls
@@ -4218,11 +4254,8 @@ class IndexedFrame(Frame):
             else:
                 thresh = len(df)
 
-        for name, col in df._data.items():
-            try:
-                check_col = col.nans_to_nulls()
-            except AttributeError:
-                check_col = col
+        for name, col in df._column_labels_and_values:
+            check_col = col.nans_to_nulls()
             no_threshold_valid_count = (
                 len(col) - check_col.null_count
             ) < thresh
@@ -4252,24 +4285,20 @@ class IndexedFrame(Frame):
         if len(subset) == 0:
             return self.copy(deep=True)
 
-        data_columns = [
-            col.nans_to_nulls()
-            if isinstance(col, cudf.core.column.NumericalColumn)
-            else col
-            for col in self._columns
-        ]
+        data_columns = [col.nans_to_nulls() for col in self._columns]
 
         return self._from_columns_like_self(
-            libcudf.stream_compaction.drop_nulls(
-                [*self._index._data.columns, *data_columns],
-                how=how,
-                keys=self._positions_from_column_names(
-                    subset, offset_by_index_columns=True
-                ),
-                thresh=thresh,
-            ),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in stream_compaction.drop_nulls(
+                    [*self.index._columns, *data_columns],
+                    how=how,
+                    keys=self._positions_from_column_names(subset),
+                    thresh=thresh,
+                )
+            ],
             self._column_names,
-            self._index.names,
+            self.index.names,
         )
 
     def _apply_boolean_mask(self, boolean_mask: BooleanMask, keep_index=True):
@@ -4285,15 +4314,24 @@ class IndexedFrame(Frame):
                 f"{len(boolean_mask.column)} not {len(self)}"
             )
         return self._from_columns_like_self(
-            libcudf.stream_compaction.apply_boolean_mask(
-                list(self._index._columns + self._columns)
-                if keep_index
-                else list(self._columns),
-                boolean_mask.column,
-            ),
+            [
+                ColumnBase.from_pylibcudf(col)
+                for col in stream_compaction.apply_boolean_mask(
+                    list(self.index._columns + self._columns)
+                    if keep_index
+                    else list(self._columns),
+                    boolean_mask.column,
+                )
+            ],
             column_names=self._column_names,
-            index_names=self._index.names if keep_index else None,
+            index_names=self.index.names if keep_index else None,
         )
+
+    def _pandas_repr_compatible(self) -> Self:
+        """Return Self but with columns prepared for a pandas-like repr."""
+        result = super()._pandas_repr_compatible()
+        result.index = self.index._pandas_repr_compatible()
+        return result
 
     def take(self, indices, axis=0):
         """Return a new frame containing the rows specified by *indices*.
@@ -4339,36 +4377,43 @@ class IndexedFrame(Frame):
 
         return self._gather(GatherMap(indices, len(self), nullify=False))
 
-    def _reset_index(self, level, drop, col_level=0, col_fill=""):
+    def _reset_index(
+        self,
+        level,
+        drop,
+        col_level=0,
+        col_fill="",
+        allow_duplicates: bool = False,
+        names: Hashable | Sequence[Hashable] | None = None,
+    ):
         """Shared path for DataFrame.reset_index and Series.reset_index."""
-        if level is not None and not isinstance(level, (tuple, list)):
-            level = (level,)
-        _check_duplicate_level_names(level, self._index.names)
-
-        # Split the columns in the index into data and index columns
-        (
-            data_columns,
-            index_columns,
-            data_names,
-            index_names,
-        ) = self._index._split_columns_by_levels(level)
-        if index_columns:
-            index = _index_from_columns(
-                index_columns,
-                name=self._index.name,
+        if allow_duplicates is not False:
+            raise NotImplementedError(
+                "allow_duplicates is not currently supported."
             )
-            if isinstance(index, MultiIndex):
-                index.names = index_names
-            else:
-                index.name = index_names[0]
-        else:
-            index = RangeIndex(len(self))
+        elif names is not None:
+            raise NotImplementedError("names is not currently supported.")
+        if level is not None:
+            if (
+                isinstance(level, int)
+                and level > 0
+                and not isinstance(self.index, MultiIndex)
+            ):
+                raise IndexError(
+                    f"Too many levels: Index has only 1 level, not {level + 1}"
+                )
+            if not isinstance(level, (tuple, list)):
+                level = (level,)
+        _check_duplicate_level_names(level, self.index.names)
 
+        index = self.index._new_index_for_reset_index(level, self.index.name)
+        if index is None:
+            index = RangeIndex(len(self))
         if drop:
             return self._data, index
 
         new_column_data = {}
-        for name, col in zip(data_names, data_columns):
+        for name, col in self.index._columns_for_reset_index(level):
             if name == "index" and "index" in self._data:
                 name = "level_0"
             name = (
@@ -4395,7 +4440,7 @@ class IndexedFrame(Frame):
         self, offset, idx: int, op: Callable, side: str, slice_func: Callable
     ) -> "IndexedFrame":
         """Shared code path for ``first`` and ``last``."""
-        if not isinstance(self._index, cudf.core.index.DatetimeIndex):
+        if not isinstance(self.index, cudf.DatetimeIndex):
             raise TypeError("'first' only supports a DatetimeIndex index.")
         if not isinstance(offset, str):
             raise NotImplementedError(
@@ -4407,20 +4452,20 @@ class IndexedFrame(Frame):
 
         pd_offset = pd.tseries.frequencies.to_offset(offset)
         to_search = op(
-            pd.Timestamp(self._index._column.element_indexing(idx)), pd_offset
+            pd.Timestamp(self.index._column.element_indexing(idx)), pd_offset
         )
         if (
             idx == 0
             and not isinstance(pd_offset, pd.tseries.offsets.Tick)
-            and pd_offset.is_on_offset(pd.Timestamp(self._index[0]))
+            and pd_offset.is_on_offset(pd.Timestamp(self.index[0]))
         ):
             # Special handle is required when the start time of the index
             # is on the end of the offset. See pandas gh29623 for detail.
             to_search = to_search - pd_offset.base
             return self.loc[:to_search]
-        needle = as_column(to_search, dtype=self._index.dtype)
+        needle = as_column(to_search, dtype=self.index.dtype)
         end_point = int(
-            self._index._column.searchsorted(
+            self.index._column.searchsorted(
                 needle, side=side
             ).element_indexing(0)
         )
@@ -4532,7 +4577,7 @@ class IndexedFrame(Frame):
             slice_func=lambda i: self.iloc[i:],
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def sample(
         self,
         n=None,
@@ -4618,7 +4663,7 @@ class IndexedFrame(Frame):
         1  2  4
 
         .. pandas-compat::
-            **DataFrame.sample, Series.sample**
+            :meth:`pandas.DataFrame.sample`, :meth:`pandas.Series.sample`
 
             When sampling from ``axis=0/'index'``, ``random_state`` can be
             either a numpy random state (``numpy.random.RandomState``)
@@ -4698,17 +4743,20 @@ class IndexedFrame(Frame):
     def _sample_axis_0(
         self,
         n: int,
-        weights: Optional[ColumnLike],
+        weights: ColumnLike | None,
         replace: bool,
-        random_state: Union[np.random.RandomState, cp.random.RandomState],
+        random_state: np.random.RandomState | cp.random.RandomState,
         ignore_index: bool,
     ):
         try:
             gather_map = GatherMap.from_column_unchecked(
-                cudf.core.column.as_column(
-                    random_state.choice(
-                        len(self), size=n, replace=replace, p=weights
-                    )
+                cast(
+                    NumericalColumn,
+                    as_column(
+                        random_state.choice(
+                            len(self), size=n, replace=replace, p=weights
+                        )
+                    ),
                 ),
                 len(self),
                 nullify=False,
@@ -4723,7 +4771,7 @@ class IndexedFrame(Frame):
     def _sample_axis_1(
         self,
         n: int,
-        weights: Optional[ColumnLike],
+        weights: ColumnLike | None,
         replace: bool,
         random_state: np.random.RandomState,
         ignore_index: bool,
@@ -4745,20 +4793,16 @@ class IndexedFrame(Frame):
         (
             operands,
             out_index,
-            can_use_self_column_name,
+            ca_attributes,
         ) = self._make_operands_and_index_for_binop(
             other, op, fill_value, reflect, can_reindex
         )
         if operands is NotImplemented:
             return NotImplemented
-
-        level_names = (
-            self._data._level_names if can_use_self_column_name else None
-        )
         return self._from_data(
             ColumnAccessor(
                 type(self)._colwise_binop(operands, op),
-                level_names=level_names,
+                **ca_attributes,
             ),
             index=out_index,
         )
@@ -4770,13 +4814,11 @@ class IndexedFrame(Frame):
         fill_value: Any = None,
         reflect: bool = False,
         can_reindex: bool = False,
-    ) -> Tuple[
-        Union[
-            Dict[Optional[str], Tuple[ColumnBase, Any, bool, Any]],
-            NotImplementedType,
-        ],
-        Optional[cudf.BaseIndex],
-        bool,
+    ) -> tuple[
+        dict[str | None, tuple[ColumnBase, Any, bool, Any]]
+        | NotImplementedType,
+        cudf.Index | None,
+        dict[str, Any],
     ]:
         raise NotImplementedError(
             f"Binary operations are not supported for {self.__class__}"
@@ -4801,9 +4843,9 @@ class IndexedFrame(Frame):
                 # This works for Index too
                 inputs = {
                     name: (col, None, False, None)
-                    for name, col in self._data.items()
+                    for name, col in self._column_labels_and_values
                 }
-                index = self._index
+                index = self.index
 
             data = self._apply_cupy_ufunc_to_operands(
                 ufunc, cupy_func, inputs, **kwargs
@@ -4814,7 +4856,7 @@ class IndexedFrame(Frame):
 
         return NotImplemented
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def repeat(self, repeats, axis=None):
         """Repeats elements consecutively.
 
@@ -4879,20 +4921,23 @@ class IndexedFrame(Frame):
         1    2
         dtype: int64
         """
-        return self._from_columns_like_self(
-            Frame._repeat(
-                [*self._index._data.columns, *self._columns], repeats, axis
+        res = self._from_columns_like_self(
+            self._repeat(
+                [*self.index._columns, *self._columns], repeats, axis
             ),
             self._column_names,
             self._index_names,
         )
+        if isinstance(res.index, cudf.DatetimeIndex):
+            res.index._freq = None
+        return res
 
     def astype(
         self,
-        dtype,
-        copy: bool = False,
+        dtype: Dtype | dict[Hashable, Dtype],
+        copy: bool | None = None,
         errors: Literal["raise", "ignore"] = "raise",
-    ):
+    ) -> Self:
         """Cast the object to the given dtype.
 
         Parameters
@@ -5003,15 +5048,24 @@ class IndexedFrame(Frame):
             raise ValueError("invalid error value specified")
 
         try:
-            data = super().astype(dtype, copy)
+            return super().astype(dtype, copy)
         except Exception as e:
             if errors == "raise":
                 raise e
             return self
 
-        return self._from_data(data, index=self._index)
+    @_performance_tracking
+    def _drop_column(
+        self, name: Hashable, errors: Literal["ignore", "raise"] = "raise"
+    ) -> None:
+        """Drop a column by *name* inplace."""
+        try:
+            del self._data[name]
+        except KeyError as err:
+            if errors != "ignore":
+                raise KeyError(f"column '{name}' does not exist") from err
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def drop(
         self,
         labels=None,
@@ -5208,63 +5262,107 @@ class IndexedFrame(Frame):
             out = self.copy()
 
         if axis in (1, "columns"):
-            target = _get_host_unique(target)
-
-            _drop_columns(out, target, errors)
+            for label in _get_unique_drop_labels(target):
+                out._drop_column(label, errors=errors)
         elif axis in (0, "index"):
             dropped = _drop_rows_by_labels(out, target, level, errors)
 
             if columns is not None:
-                columns = _get_host_unique(columns)
-                _drop_columns(dropped, columns, errors)
+                for label in _get_unique_drop_labels(columns):
+                    dropped._drop_column(label, errors=errors)
 
-            out._data = dropped._data
-            out._index = dropped._index
+            out._mimic_inplace(dropped, inplace=True)
 
         if not inplace:
             return out
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def _explode(self, explode_column: Any, ignore_index: bool):
         # Helper function for `explode` in `Series` and `Dataframe`, explodes a
         # specified nested column. Other columns' corresponding rows are
         # duplicated. If ignore_index is set, the original index is not
         # exploded and will be replaced with a `RangeIndex`.
         if not isinstance(self._data[explode_column].dtype, ListDtype):
-            data = self._data.copy(deep=True)
-            idx = None if ignore_index else self._index.copy(deep=True)
-            return self.__class__._from_data(data, index=idx)
+            result = self.copy()
+            if ignore_index:
+                result.index = RangeIndex(len(result))
+            return result
 
         column_index = self._column_names.index(explode_column)
-        if not ignore_index and self._index is not None:
-            index_offset = self._index.nlevels
+        if not ignore_index:
+            idx_cols = self.index._columns
         else:
-            index_offset = 0
+            idx_cols = ()
 
-        exploded = libcudf.lists.explode_outer(
-            [
-                *(self._index._data.columns if not ignore_index else ()),
-                *self._columns,
-            ],
-            column_index + index_offset,
-        )
+        with acquire_spill_lock():
+            plc_table = plc.lists.explode_outer(
+                plc.Table(
+                    [
+                        col.to_pylibcudf(mode="read")
+                        for col in itertools.chain(idx_cols, self._columns)
+                    ]
+                ),
+                column_index + len(idx_cols),
+            )
+            exploded = [
+                ColumnBase.from_pylibcudf(col) for col in plc_table.columns()
+            ]
         # We must copy inner datatype of the exploded list column to
         # maintain struct dtype key names
-        exploded_dtype = cast(
+        element_type = cast(
             ListDtype, self._columns[column_index].dtype
         ).element_type
-        return self._from_columns_like_self(
-            exploded,
-            self._column_names,
-            self._index_names if not ignore_index else None,
-            override_dtypes=(
-                exploded_dtype if i == column_index else None
-                for i in range(len(self._columns))
-            ),
-        )
 
-    @_cudf_nvtx_annotate
-    def tile(self, count):
+        column_index += len(idx_cols)
+        exploded = [
+            new_column._with_type_metadata(
+                element_type,
+            )
+            if i == column_index
+            else new_column._with_type_metadata(old_column.dtype)
+            for i, (new_column, old_column) in enumerate(
+                zip(
+                    exploded,
+                    itertools.chain(idx_cols, self._columns),
+                    strict=True,
+                )
+            )
+        ]
+
+        data = type(self._data)(
+            dict(
+                zip(self._column_names, exploded[len(idx_cols) :], strict=True)
+            ),
+            multiindex=self._data.multiindex,
+            level_names=self._data.level_names,
+            rangeindex=self._data.rangeindex,
+            label_dtype=self._data.label_dtype,
+            verify=False,
+        )
+        if len(idx_cols):
+            index = _index_from_data(
+                dict(enumerate(exploded[: len(idx_cols)]))
+            )._copy_type_metadata(self.index)
+            if (
+                isinstance(self.index, cudf.CategoricalIndex)
+                and not isinstance(index, cudf.CategoricalIndex)
+            ) or (
+                isinstance(self.index, cudf.MultiIndex)
+                and not isinstance(index, cudf.MultiIndex)
+            ):
+                index = type(self.index)._from_data(index._data)
+            if isinstance(self.index, cudf.MultiIndex):
+                index.names = self.index.names
+            else:
+                index.name = self.index.name
+        else:
+            index = None
+
+        result = type(self)._from_data(data, index)
+        return result
+
+    @_performance_tracking
+    def tile(self, count: int):
         """Repeats the rows `count` times to form a new Frame.
 
         Parameters
@@ -5288,15 +5386,28 @@ class IndexedFrame(Frame):
         -------
         The indexed frame containing the tiled "rows".
         """
+        with acquire_spill_lock():
+            plc_table = plc.reshape.tile(
+                plc.Table(
+                    [
+                        col.to_pylibcudf(mode="read")
+                        for col in itertools.chain(
+                            self.index._columns, self._columns
+                        )
+                    ]
+                ),
+                count,
+            )
+            tiled = [
+                ColumnBase.from_pylibcudf(plc) for plc in plc_table.columns()
+            ]
         return self._from_columns_like_self(
-            libcudf.reshape.tile(
-                [*self._index._columns, *self._columns], count
-            ),
+            tiled,
             column_names=self._column_names,
             index_names=self._index_names,
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def groupby(
         self,
         by=None,
@@ -5305,7 +5416,6 @@ class IndexedFrame(Frame):
         as_index=True,
         sort=no_default,
         group_keys=False,
-        squeeze=False,
         observed=True,
         dropna=True,
     ):
@@ -5314,11 +5424,6 @@ class IndexedFrame(Frame):
 
         if axis not in (0, "index"):
             raise NotImplementedError("axis parameter is not yet implemented")
-
-        if squeeze is not False:
-            raise NotImplementedError(
-                "squeeze parameter is not yet implemented"
-            )
 
         if not observed:
             raise NotImplementedError(
@@ -5346,7 +5451,7 @@ class IndexedFrame(Frame):
             )
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Addition",
@@ -5381,13 +5486,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def add(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def add(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__add__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Addition",
@@ -5422,13 +5527,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def radd(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def radd(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__radd__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Subtraction",
@@ -5463,7 +5568,7 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def subtract(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def subtract(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
@@ -5471,7 +5576,7 @@ class IndexedFrame(Frame):
 
     sub = subtract
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Subtraction",
@@ -5506,13 +5611,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def rsub(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def rsub(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__rsub__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Multiplication",
@@ -5547,7 +5652,7 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def multiply(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def multiply(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
@@ -5555,7 +5660,7 @@ class IndexedFrame(Frame):
 
     mul = multiply
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Multiplication",
@@ -5590,13 +5695,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def rmul(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def rmul(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__rmul__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Modulo",
@@ -5631,13 +5736,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def mod(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def mod(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__mod__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Modulo",
@@ -5672,13 +5777,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def rmod(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def rmod(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__rmod__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Exponential",
@@ -5713,13 +5818,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def pow(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def pow(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__pow__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Exponential",
@@ -5754,13 +5859,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def rpow(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def rpow(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__rpow__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Integer division",
@@ -5795,13 +5900,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def floordiv(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def floordiv(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__floordiv__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Integer division",
@@ -5836,13 +5941,13 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def rfloordiv(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def rfloordiv(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
         return self._binaryop(other, "__rfloordiv__", fill_value)
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Floating division",
@@ -5877,7 +5982,7 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def truediv(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def truediv(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
@@ -5887,7 +5992,7 @@ class IndexedFrame(Frame):
     div = truediv
     divide = truediv
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Floating division",
@@ -5922,7 +6027,7 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def rtruediv(self, other, axis, level=None, fill_value=None):  # noqa: D102
+    def rtruediv(self, other, axis, level=None, fill_value=None):
         if level is not None:
             raise NotImplementedError("level parameter is not supported yet.")
 
@@ -5931,7 +6036,7 @@ class IndexedFrame(Frame):
     # Alias for rtruediv
     rdiv = rtruediv
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Equal to",
@@ -5966,12 +6071,12 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def eq(self, other, axis="columns", level=None, fill_value=None):  # noqa: D102
+    def eq(self, other, axis="columns", level=None, fill_value=None):
         return self._binaryop(
             other=other, op="__eq__", fill_value=fill_value, can_reindex=True
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Not equal to",
@@ -6006,12 +6111,12 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def ne(self, other, axis="columns", level=None, fill_value=None):  # noqa: D102
+    def ne(self, other, axis="columns", level=None, fill_value=None):
         return self._binaryop(
             other=other, op="__ne__", fill_value=fill_value, can_reindex=True
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Less than",
@@ -6046,12 +6151,12 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def lt(self, other, axis="columns", level=None, fill_value=None):  # noqa: D102
+    def lt(self, other, axis="columns", level=None, fill_value=None):
         return self._binaryop(
             other=other, op="__lt__", fill_value=fill_value, can_reindex=True
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Less than or equal to",
@@ -6086,12 +6191,12 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def le(self, other, axis="columns", level=None, fill_value=None):  # noqa: D102
+    def le(self, other, axis="columns", level=None, fill_value=None):
         return self._binaryop(
             other=other, op="__le__", fill_value=fill_value, can_reindex=True
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Greater than",
@@ -6126,12 +6231,12 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def gt(self, other, axis="columns", level=None, fill_value=None):  # noqa: D102
+    def gt(self, other, axis="columns", level=None, fill_value=None):
         return self._binaryop(
             other=other, op="__gt__", fill_value=fill_value, can_reindex=True
         )
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     @docutils.doc_apply(
         doc_binop_template.format(
             operation="Greater than or equal to",
@@ -6166,36 +6271,35 @@ class IndexedFrame(Frame):
             ),
         )
     )
-    def ge(self, other, axis="columns", level=None, fill_value=None):  # noqa: D102
+    def ge(self, other, axis="columns", level=None, fill_value=None):
         return self._binaryop(
             other=other, op="__ge__", fill_value=fill_value, can_reindex=True
         )
 
-    def _preprocess_subset(self, subset):
+    def _preprocess_subset(self, subset) -> set[Hashable]:
         if subset is None:
             subset = self._column_names
         elif (
-            not np.iterable(subset)
-            or isinstance(subset, str)
+            is_scalar(subset)
             or isinstance(subset, tuple)
-            and subset in self._data.names
+            and subset in self._column_names
         ):
             subset = (subset,)
-        diff = set(subset) - set(self._data)
+        diff = set(subset) - set(self._column_names)
         if len(diff) != 0:
             raise KeyError(f"columns {diff} do not exist")
         return subset
 
-    @_cudf_nvtx_annotate
+    @_performance_tracking
     def rank(
         self,
-        axis=0,
-        method="average",
-        numeric_only=False,
-        na_option="keep",
-        ascending=True,
-        pct=False,
-    ):
+        axis: Literal[0, "index"] = 0,
+        method: Literal["average", "min", "max", "first", "dense"] = "average",
+        numeric_only: bool = False,
+        na_option: Literal["keep", "top", "bottom"] = "keep",
+        ascending: bool = True,
+        pct: bool = False,
+    ) -> Self:
         """
         Compute numerical data ranks (1 through n) along axis.
 
@@ -6235,7 +6339,7 @@ class IndexedFrame(Frame):
         if method not in {"average", "min", "max", "first", "dense"}:
             raise KeyError(method)
 
-        method_enum = libcudf.pylibcudf.aggregation.RankMethod[method.upper()]
+        method_enum = plc.aggregation.RankMethod[method.upper()]
         if na_option not in {"keep", "top", "bottom"}:
             raise ValueError(
                 "na_option must be one of 'keep', 'top', or 'bottom'"
@@ -6247,42 +6351,98 @@ class IndexedFrame(Frame):
                 f"axis={axis} is not yet supported in rank"
             )
 
+        num_cols = self._num_columns
+        dropped_cols = False
         source = self
         if numeric_only:
-            if isinstance(
-                source, cudf.Series
-            ) and not _is_non_decimal_numeric_dtype(self.dtype):
+            if isinstance(source, cudf.Series) and not is_dtype_obj_numeric(
+                source.dtype, include_decimal=False
+            ):  # type: ignore[attr-defined]
                 raise TypeError(
                     "Series.rank does not allow numeric_only=True with "
                     "non-numeric dtype."
                 )
             numeric_cols = (
                 name
-                for name in self._data.names
-                if _is_non_decimal_numeric_dtype(self._data[name])
+                for name, dtype in self._dtypes
+                if is_dtype_obj_numeric(dtype, include_decimal=False)
             )
             source = self._get_columns_by_label(numeric_cols)
             if source.empty:
-                return source.astype("float64")
+                return source.astype(np.dtype(np.float64))
+            elif source._num_columns != num_cols:
+                dropped_cols = True
 
-        result_columns = libcudf.sort.rank_columns(
-            [*source._columns], method_enum, na_option, ascending, pct
+        column_order = (
+            plc.types.Order.ASCENDING
+            if ascending
+            else plc.types.Order.DESCENDING
+        )
+        # ascending
+        #    #top    = na_is_smallest
+        #    #bottom = na_is_largest
+        #    #keep   = na_is_largest
+        # descending
+        #    #top    = na_is_largest
+        #    #bottom = na_is_smallest
+        #    #keep   = na_is_smallest
+        if ascending:
+            if na_option == "top":
+                null_precedence = plc.types.NullOrder.BEFORE
+            else:
+                null_precedence = plc.types.NullOrder.AFTER
+        else:
+            if na_option == "top":
+                null_precedence = plc.types.NullOrder.AFTER
+            else:
+                null_precedence = plc.types.NullOrder.BEFORE
+        c_null_handling = (
+            plc.types.NullPolicy.EXCLUDE
+            if na_option == "keep"
+            else plc.types.NullPolicy.INCLUDE
         )
 
-        return self.__class__._from_data(
-            dict(zip(source._column_names, result_columns)),
-            index=source._index,
-        ).astype(np.float64)
+        if cudf.get_option("mode.pandas_compatible"):
+            source = source.nans_to_nulls()
+        result_columns = [
+            col.rank(
+                method=method_enum,
+                column_order=column_order,
+                null_handling=c_null_handling,
+                null_precedence=null_precedence,
+                pct=pct,
+            )
+            for col in source._columns
+        ]
+
+        if dropped_cols:
+            result = type(source)._from_data(
+                ColumnAccessor(
+                    dict(
+                        zip(source._column_names, result_columns, strict=True)
+                    ),
+                    multiindex=source._data.multiindex,
+                    level_names=source._data.level_names,
+                    label_dtype=source._data.label_dtype,
+                    verify=False,
+                ),
+            )
+        else:
+            result = source._from_data_like_self(
+                self._data._from_columns_like_self(result_columns)
+            )
+        result.index = source.index
+        return result.astype(np.float64)
 
     def convert_dtypes(
         self,
-        infer_objects=True,
-        convert_string=True,
-        convert_integer=True,
-        convert_boolean=True,
-        convert_floating=True,
+        infer_objects: bool = True,
+        convert_string: bool = True,
+        convert_integer: bool = True,
+        convert_boolean: bool = True,
+        convert_floating: bool = True,
         dtype_backend=None,
-    ):
+    ) -> Self:
         """
         Convert columns to the best possible nullable dtypes.
 
@@ -6293,17 +6453,46 @@ class IndexedFrame(Frame):
         All other dtypes are always returned as-is as all dtypes in
         cudf are nullable.
         """
-        result = self.copy()
-
-        if convert_floating:
-            # cast any floating columns to int64 if
-            # they are all integer data:
-            for name, col in result._data.items():
+        if not (convert_floating and convert_integer):
+            return self.copy()
+        else:
+            cols = []
+            for col in self._columns:
                 if col.dtype.kind == "f":
                     col = col.fillna(0)
-                    if cp.allclose(col, col.astype("int64")):
-                        result._data[name] = col.astype("int64")
-        return result
+                    as_int = col.astype(np.dtype(np.int64))
+                    if cp.allclose(col, as_int):
+                        cols.append(as_int)
+                        continue
+                cols.append(col)
+            return self._from_data_like_self(
+                self._data._from_columns_like_self(cols, verify=False)
+            )
+
+    @_performance_tracking
+    def serialize(self):
+        header, frames = super().serialize()
+
+        header["index"], index_frames = self.index.device_serialize()
+        header["index_frame_count"] = len(index_frames)
+        # For backwards compatibility with older versions of cuDF, index
+        # columns are placed before data columns.
+        frames = index_frames + frames
+
+        return header, frames
+
+    @classmethod
+    @_performance_tracking
+    def deserialize(cls, header, frames):
+        index_nframes = header["index_frame_count"]
+        obj = super().deserialize(
+            header, frames[header["index_frame_count"] :]
+        )
+
+        index = cls.device_deserialize(header["index"], frames[:index_nframes])
+        obj.index = index
+
+        return obj
 
     @_warn_no_dask_cudf
     def __dask_tokenize__(self):
@@ -6311,7 +6500,12 @@ class IndexedFrame(Frame):
 
         return [
             type(self),
-            normalize_token(self._dtypes),
+            str(dict(self._dtypes)),
+            *[
+                normalize_token(col.dtype.categories)
+                for col in self._columns
+                if col.dtype == "category"
+            ],
             normalize_token(self.index),
             normalize_token(self.hash_values().values_host),
         ]
@@ -6334,10 +6528,10 @@ def _check_duplicate_level_names(specified, level_names):
         )
 
 
-@_cudf_nvtx_annotate
+@_performance_tracking
 def _get_replacement_values_for_columns(
-    to_replace: Any, value: Any, columns_dtype_map: Dict[Any, Any]
-) -> Tuple[Dict[Any, bool], Dict[Any, Any], Dict[Any, Any]]:
+    to_replace: Any, value: Any, columns_dtype_map: dict[Any, DtypeObj]
+) -> tuple[dict[Any, bool], dict[Any, Any], dict[Any, Any]]:
     """
     Returns a per column mapping for the values to be replaced, new
     values to be replaced with and if all the values are empty.
@@ -6362,29 +6556,29 @@ def _get_replacement_values_for_columns(
         A dict mapping of all columns and the corresponding values
         to be replaced with.
     """
-    to_replace_columns: Dict[Any, Any] = {}
-    values_columns: Dict[Any, Any] = {}
-    all_na_columns: Dict[Any, Any] = {}
+    to_replace_columns: dict[Any, Any] = {}
+    values_columns: dict[Any, Any] = {}
+    all_na_columns: dict[Any, Any] = {}
 
     if is_scalar(to_replace) and is_scalar(value):
         to_replace_columns = {col: [to_replace] for col in columns_dtype_map}
         values_columns = {col: [value] for col in columns_dtype_map}
-    elif cudf.api.types.is_list_like(to_replace) or isinstance(
-        to_replace, ColumnBase
+    elif is_list_like(to_replace) or isinstance(
+        to_replace, (ColumnBase, Index)
     ):
         if is_scalar(value):
             to_replace_columns = {col: to_replace for col in columns_dtype_map}
             values_columns = {
                 col: [value]
-                if _is_non_decimal_numeric_dtype(columns_dtype_map[col])
+                if is_dtype_obj_numeric(dtype, include_decimal=False)
                 else as_column(
                     value,
                     length=len(to_replace),
                     dtype=cudf.dtype(type(value)),
                 )
-                for col in columns_dtype_map
+                for col, dtype in columns_dtype_map.items()
             }
-        elif cudf.api.types.is_list_like(value):
+        elif is_list_like(value) or is_column_like(value):
             if len(to_replace) != len(value):
                 raise ValueError(
                     f"Replacement lists must be "
@@ -6396,9 +6590,6 @@ def _get_replacement_values_for_columns(
                     col: to_replace for col in columns_dtype_map
                 }
                 values_columns = {col: value for col in columns_dtype_map}
-        elif cudf.utils.dtypes.is_column_like(value):
-            to_replace_columns = {col: to_replace for col in columns_dtype_map}
-            values_columns = {col: value for col in columns_dtype_map}
         else:
             raise TypeError(
                 "value argument must be scalar, list-like or Series"
@@ -6493,32 +6684,33 @@ def _get_replacement_values_for_columns(
     return all_na_columns, to_replace_columns, values_columns
 
 
-def _is_series(obj):
+def _is_series(obj: Any) -> bool:
     """
     Checks if the `obj` is of type `cudf.Series`
     instead of checking for isinstance(obj, cudf.Series)
+    to avoid circular imports.
     """
-    return isinstance(obj, Frame) and obj.ndim == 1 and obj._index is not None
+    return isinstance(obj, IndexedFrame) and obj.ndim == 1
 
 
-@_cudf_nvtx_annotate
+@_performance_tracking
 def _drop_rows_by_labels(
     obj: DataFrameOrSeries,
-    labels: Union[ColumnLike, abc.Iterable, str],
-    level: Union[int, str],
+    labels: ColumnLike | Iterable | str,
+    level: int | str,
     errors: str,
 ) -> DataFrameOrSeries:
     """Remove rows specified by `labels`.
 
     If `errors="raise"`, an error is raised if some items in `labels` do not
-    exist in `obj._index`.
+    exist in `obj.index`.
 
     Will raise if level(int) is greater or equal to index nlevels.
     """
     if isinstance(level, int) and level >= obj.index.nlevels:
         raise ValueError("Param level out of bounds.")
 
-    if not isinstance(labels, cudf.core.single_column_frame.SingleColumnFrame):
+    if not isinstance(labels, (cudf.Series, cudf.Index)):
         labels = as_column(labels)
 
     if isinstance(obj.index, cudf.MultiIndex):
@@ -6526,38 +6718,42 @@ def _drop_rows_by_labels(
             level = 0
 
         levels_index = obj.index.get_level_values(level)
-        if errors == "raise" and not labels.isin(levels_index).all():
+        if errors == "raise" and not labels.isin(levels_index).all():  # type: ignore[union-attr]
             raise KeyError("One or more values not found in axis")
 
         if isinstance(level, int):
             ilevel = level
         else:
-            ilevel = obj._index.names.index(level)
+            ilevel = obj.index.names.index(level)
 
         # 1. Merge Index df and data df along column axis:
-        # | id | ._index df | data column(s) |
-        idx_nlv = obj._index.nlevels
-        working_df = obj._index.to_frame(index=False)
+        # | id | .index df | data column(s) |
+        idx_nlv = obj.index.nlevels
+        working_df = obj.index.to_frame(index=False)
         working_df.columns = list(range(idx_nlv))
         for i, col in enumerate(obj._data):
             working_df[idx_nlv + i] = obj._data[col]
         # 2. Set `level` as common index:
-        # | level | ._index df w/o level | data column(s) |
+        # | level | .index df w/o level | data column(s) |
         working_df = working_df.set_index(level)
 
         # 3. Use "leftanti" join to drop
         # TODO: use internal API with "leftanti" and specify left and right
         # join keys to bypass logic check
-        to_join = cudf.DataFrame(index=cudf.Index(labels, name=level))
+        if isinstance(labels, ColumnBase):
+            join_index = cudf.Index._from_column(labels, name=level)
+        else:
+            join_index = cudf.Index(labels, name=level)
+        to_join = cudf.DataFrame(index=join_index)
         join_res = working_df.join(to_join, how="leftanti")
 
         # 4. Reconstruct original layout, and rename
         join_res._insert(
-            ilevel, name=join_res._index.name, value=join_res._index
+            ilevel, name=join_res.index.name, value=join_res.index
         )
 
         midx = cudf.MultiIndex.from_frame(
-            join_res.iloc[:, 0:idx_nlv], names=obj._index.names
+            join_res.iloc[:, 0:idx_nlv], names=obj.index.names
         )
 
         if isinstance(obj, cudf.Series):
@@ -6568,19 +6764,19 @@ def _drop_rows_by_labels(
             return obj.__class__._from_data(
                 join_res.iloc[:, idx_nlv:]._data,
                 index=midx,
-                columns=obj._data.to_pandas_index(),
+                columns=obj._data.to_pandas_index,
             )
 
     else:
-        if errors == "raise" and not labels.isin(obj.index).all():
+        orig_index_type = obj.index.dtype
+        if errors == "raise" and not labels.isin(obj.index).all():  # type: ignore[union-attr]
             raise KeyError("One or more values not found in axis")
 
-        key_df = cudf.DataFrame._from_data(
-            data={},
-            index=cudf.Index(
-                labels, name=getattr(labels, "name", obj.index.name)
-            ),
-        )
+        if isinstance(labels, ColumnBase):
+            idx = cudf.Index._from_column(labels, name=obj.index.name)
+        else:
+            idx = cudf.Index(labels, name=labels.name)
+        key_df = cudf.DataFrame._from_data(data={}, index=idx)
         if isinstance(obj, cudf.DataFrame):
             res = obj.join(key_df, how="leftanti")
         else:
@@ -6589,7 +6785,7 @@ def _drop_rows_by_labels(
         # Join changes the index to common type,
         # but we need to preserve the type of
         # index being returned, Hence this type-cast.
-        res._index = res.index.astype(obj.index.dtype)
+        res.index = res.index.astype(orig_index_type)
         return res
 
 
@@ -6619,3 +6815,59 @@ def _is_same_dtype(lhs_dtype, rhs_dtype):
         return True
     else:
         return False
+
+
+def _append_new_row_inplace(col: ColumnBase, value: ScalarLike) -> None:
+    """Append a scalar `value` to the end of `col` inplace.
+    Cast to common type if possible
+    """
+    val_col = as_column(
+        value,
+        dtype=col.dtype
+        if (
+            cudf.utils.utils._is_null_host_scalar(value)
+            or value in {None, np.nan}
+        )
+        else None,
+    )
+    if val_col.dtype.kind != "f" and val_col.can_cast_safely(col.dtype):
+        # If the value can be cast to the column dtype, do so
+        val_col = val_col.astype(col.dtype)
+        to_type = col.dtype
+    else:
+        if (
+            cudf.get_option("mode.pandas_compatible")
+            and is_pandas_nullable_extension_dtype(col.dtype)
+            and val_col.dtype.kind == "f"
+        ):
+            # If the column is a pandas nullable extension type, we need to
+            # convert the nans to a nullable type as well.
+            val_col = val_col.nans_to_nulls()
+            if len(val_col) == val_col.null_count:
+                # If the column is all nulls, we can use the column dtype
+                # to avoid unnecessary casting.
+                val_col = val_col.astype(col.dtype)
+        to_type = find_common_type([val_col.dtype, col.dtype])
+        if (
+            cudf.get_option("mode.pandas_compatible")
+            and is_string_dtype(to_type)
+            and is_mixed_with_object_dtype(val_col, col)
+        ):
+            raise MixedTypeError("Cannot append mixed types")
+        if cudf.get_option(
+            "mode.pandas_compatible"
+        ) and val_col.can_cast_safely(col.dtype):
+            to_type = col.dtype
+    val_col = val_col.astype(to_type)
+    old_col = col.astype(to_type)
+    res_col = concat_columns([old_col, val_col])._with_type_metadata(to_type)
+    if (
+        cudf.get_option("mode.pandas_compatible")
+        and res_col.dtype != col.dtype
+        and isinstance(col, CategoricalColumn)
+    ):
+        raise MixedTypeError(
+            "Cannot append mixed types: "
+            f"Column dtype {col.dtype} is not compatible with {res_col.dtype}"
+        )
+    col._mimic_inplace(res_col, inplace=True)

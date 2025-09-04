@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 #include <cudf/strings/string_view.cuh>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -42,13 +43,14 @@ struct replace_regex_fn {
   column_device_view const d_strings;
   string_view const d_repl;
   size_type const maxrepl;
-  size_type* d_offsets{};
+  size_type* d_sizes{};
   char* d_chars{};
+  cudf::detail::input_offsetalator d_offsets;
 
   __device__ void operator()(size_type const idx, reprog_device const prog, int32_t const prog_idx)
   {
     if (d_strings.is_null(idx)) {
-      if (!d_chars) d_offsets[idx] = 0;
+      if (!d_chars) { d_sizes[idx] = 0; }
       return;
     }
 
@@ -76,9 +78,9 @@ struct replace_regex_fn {
                                      in_ptr + last_pos.byte_offset(),      // o:bbbb
                                      start_pos - last_pos.byte_offset());  //       ^
         out_ptr = copy_string(out_ptr, d_repl);                            // o:bbbbrrrrrr
-      }                                                                    //  out_ptr ---^
-      last_pos += (match->second - last_pos.position());                   // i:bbbbsssseeee
-                                                                           //  in_ptr --^
+      }  //  out_ptr ---^
+      last_pos += (match->second - last_pos.position());  // i:bbbbsssseeee
+                                                          //  in_ptr --^
 
       itr = last_pos + (match->first == match->second);
     }
@@ -89,7 +91,7 @@ struct replace_regex_fn {
                      d_str.size_bytes() - last_pos.byte_offset(),  //             ^   ^
                      out_ptr);
     } else {
-      d_offsets[idx] = nbytes;
+      d_sizes[idx] = nbytes;
     }
   }
 };
@@ -102,7 +104,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& input,
                                    string_scalar const& replacement,
                                    std::optional<size_type> max_replace_count,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   if (input.is_empty()) return make_empty_column(type_id::STRING);
 
@@ -135,7 +137,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& strings,
                                    string_scalar const& replacement,
                                    std::optional<size_type> max_replace_count,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::replace_re(strings, prog, replacement, max_replace_count, stream, mr);

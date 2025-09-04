@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <cudf/ast/ast_operator.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_device_view.cuh>
 #include <cudf/table/table_view.hpp>
@@ -22,8 +23,10 @@
 #include <cudf/utilities/error.hpp>
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace ast {
 /**
  * @addtogroup expressions
@@ -86,73 +89,6 @@ struct expression {
                                                rmm::cuda_stream_view stream) const = 0;
 
   virtual ~expression() {}
-};
-
-/**
- * @brief Enum of supported operators.
- */
-enum class ast_operator : int32_t {
-  // Binary operators
-  ADD,         ///< operator +
-  SUB,         ///< operator -
-  MUL,         ///< operator *
-  DIV,         ///< operator / using common type of lhs and rhs
-  TRUE_DIV,    ///< operator / after promoting type to floating point
-  FLOOR_DIV,   ///< operator / after promoting to 64 bit floating point and then
-               ///< flooring the result
-  MOD,         ///< operator %
-  PYMOD,       ///< operator % using Python's sign rules for negatives
-  POW,         ///< lhs ^ rhs
-  EQUAL,       ///< operator ==
-  NULL_EQUAL,  ///< operator == with Spark rules: NULL_EQUAL(null, null) is true, NULL_EQUAL(null,
-               ///< valid) is false, and
-               ///< NULL_EQUAL(valid, valid) == EQUAL(valid, valid)
-  NOT_EQUAL,   ///< operator !=
-  LESS,        ///< operator <
-  GREATER,     ///< operator >
-  LESS_EQUAL,  ///< operator <=
-  GREATER_EQUAL,     ///< operator >=
-  BITWISE_AND,       ///< operator &
-  BITWISE_OR,        ///< operator |
-  BITWISE_XOR,       ///< operator ^
-  LOGICAL_AND,       ///< operator &&
-  NULL_LOGICAL_AND,  ///< operator && with Spark rules: NULL_LOGICAL_AND(null, null) is null,
-                     ///< NULL_LOGICAL_AND(null, true) is
-                     ///< null, NULL_LOGICAL_AND(null, false) is false, and NULL_LOGICAL_AND(valid,
-                     ///< valid) == LOGICAL_AND(valid, valid)
-  LOGICAL_OR,        ///< operator ||
-  NULL_LOGICAL_OR,   ///< operator || with Spark rules: NULL_LOGICAL_OR(null, null) is null,
-                     ///< NULL_LOGICAL_OR(null, true) is true,
-                     ///< NULL_LOGICAL_OR(null, false) is null, and NULL_LOGICAL_OR(valid, valid) ==
-                     ///< LOGICAL_OR(valid, valid)
-  // Unary operators
-  IDENTITY,        ///< Identity function
-  IS_NULL,         ///< Check if operand is null
-  SIN,             ///< Trigonometric sine
-  COS,             ///< Trigonometric cosine
-  TAN,             ///< Trigonometric tangent
-  ARCSIN,          ///< Trigonometric sine inverse
-  ARCCOS,          ///< Trigonometric cosine inverse
-  ARCTAN,          ///< Trigonometric tangent inverse
-  SINH,            ///< Hyperbolic sine
-  COSH,            ///< Hyperbolic cosine
-  TANH,            ///< Hyperbolic tangent
-  ARCSINH,         ///< Hyperbolic sine inverse
-  ARCCOSH,         ///< Hyperbolic cosine inverse
-  ARCTANH,         ///< Hyperbolic tangent inverse
-  EXP,             ///< Exponential (base e, Euler number)
-  LOG,             ///< Natural Logarithm (base e)
-  SQRT,            ///< Square-root (x^0.5)
-  CBRT,            ///< Cube-root (x^(1.0/3))
-  CEIL,            ///< Smallest integer value not less than arg
-  FLOOR,           ///< largest integer value not greater than arg
-  ABS,             ///< Absolute value
-  RINT,            ///< Rounds the floating-point argument arg to an integer value
-  BIT_INVERT,      ///< Bitwise Not (~)
-  NOT,             ///< Logical Not (!)
-  CAST_TO_INT64,   ///< Cast value to int64_t
-  CAST_TO_UINT64,  ///< Cast value to uint64_t
-  CAST_TO_FLOAT64  ///< Cast value to double
 };
 
 /**
@@ -314,6 +250,13 @@ class literal : public expression {
    * @return The device scalar object
    */
   [[nodiscard]] generic_scalar_device_view get_value() const { return value; }
+
+  /**
+   * @brief Get the scalar.
+   *
+   * @return The scalar object
+   */
+  [[nodiscard]] cudf::scalar const& get_scalar() const { return scalar; }
 
   /**
    * @copydoc expression::accept
@@ -478,7 +421,10 @@ class operation : public expression {
    *
    * @return Vector of operands
    */
-  std::vector<std::reference_wrapper<expression const>> get_operands() const { return operands; }
+  [[nodiscard]] std::vector<std::reference_wrapper<expression const>> const& get_operands() const
+  {
+    return operands;
+  }
 
   /**
    * @copydoc expression::accept
@@ -493,18 +439,11 @@ class operation : public expression {
 
   [[nodiscard]] bool may_evaluate_null(table_view const& left,
                                        table_view const& right,
-                                       rmm::cuda_stream_view stream) const override
-  {
-    return std::any_of(operands.cbegin(),
-                       operands.cend(),
-                       [&left, &right, &stream](std::reference_wrapper<expression const> subexpr) {
-                         return subexpr.get().may_evaluate_null(left, right, stream);
-                       });
-  };
+                                       rmm::cuda_stream_view stream) const override;
 
  private:
-  ast_operator const op;
-  std::vector<std::reference_wrapper<expression const>> const operands;
+  ast_operator op;
+  std::vector<std::reference_wrapper<expression const>> operands;
 };
 
 /**
@@ -549,7 +488,98 @@ class column_name_reference : public expression {
   std::string column_name;
 };
 
+/**
+ * @brief An AST expression tree. It owns and contains multiple dependent expressions. All the
+ * expressions are destroyed when the tree is destroyed.
+ */
+class tree {
+ public:
+  /**
+   * @brief construct an empty ast tree
+   */
+  tree() = default;
+
+  /**
+   * @brief Moves the ast tree
+   */
+  tree(tree&&) = default;
+
+  /**
+   * @brief move-assigns the AST tree
+   * @returns a reference to the move-assigned tree
+   */
+  tree& operator=(tree&&) = default;
+
+  ~tree() = default;
+
+  // the tree is not copyable
+  tree(tree const&)            = delete;
+  tree& operator=(tree const&) = delete;
+
+  /**
+   * @brief Add an expression to the AST tree
+   * @param args Arguments to use to construct the ast expression
+   * @returns a reference to the added expression
+   */
+  template <typename Expr, typename... Args>
+  std::enable_if_t<std::is_base_of_v<expression, Expr>, Expr const&> emplace(Args&&... args)
+  {
+    auto expr            = std::make_unique<Expr>(std::forward<Args>(args)...);
+    Expr const& expr_ref = *expr;
+    expressions.emplace_back(std::move(expr));
+    return expr_ref;
+  }
+
+  /**
+   * @brief Add an expression to the AST tree
+   * @param expr AST expression to be added
+   * @returns a reference to the added expression
+   */
+  template <typename Expr>
+  decltype(auto) push(Expr expr)
+  {
+    return emplace<Expr>(std::move(expr));
+  }
+
+  /**
+   * @brief get the first expression in the tree
+   * @returns the first inserted expression into the tree
+   */
+  [[nodiscard]] expression const& front() const { return *expressions.front(); }
+
+  /**
+   * @brief get the last expression in the tree
+   * @returns the last inserted expression into the tree
+   */
+  [[nodiscard]] expression const& back() const { return *expressions.back(); }
+
+  /**
+   * @brief get the number of expressions added to the tree
+   * @returns the number of expressions added to the tree
+   */
+  [[nodiscard]] size_t size() const { return expressions.size(); }
+
+  /**
+   * @brief get the expression at an index in the tree. Index is checked.
+   * @param index index of expression in the ast tree
+   * @returns the expression at the specified index
+   */
+  expression const& at(size_t index) { return *expressions.at(index); }
+
+  /**
+   * @brief get the expression at an index in the tree. Index is unchecked.
+   * @param index index of expression in the ast tree
+   * @returns the expression at the specified index
+   */
+  expression const& operator[](size_t index) const { return *expressions[index]; }
+
+ private:
+  // TODO: use better ownership semantics, the unique_ptr here is redundant. Consider using a bump
+  // allocator with type-erased deleters.
+  std::vector<std::unique_ptr<expression>> expressions;
+};
+
 /** @} */  // end of group
 }  // namespace ast
 
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

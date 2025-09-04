@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,11 +24,13 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/export.hpp>
 
 #include <thrust/host_vector.h>
 #include <thrust/iterator/transform_iterator.h>
 
-namespace cudf::test {
+namespace CUDF_EXPORT cudf {
+namespace test {
 
 /**
  * @brief Verbosity level of output from column and table comparison functions.
@@ -175,7 +177,7 @@ template <typename T, std::enable_if_t<not cudf::is_fixed_point<T>()>* = nullptr
 std::pair<thrust::host_vector<T>, std::vector<bitmask_type>> to_host(column_view c)
 {
   auto col_span  = cudf::device_span<T const>(c.data<T>(), c.size());
-  auto host_data = cudf::detail::make_host_vector_sync(col_span, cudf::get_default_stream());
+  auto host_data = cudf::detail::make_host_vector(col_span, cudf::get_default_stream());
   return {std::move(host_data), bitmask_to_host(c)};
 }
 
@@ -194,7 +196,7 @@ std::pair<thrust::host_vector<T>, std::vector<bitmask_type>> to_host(column_view
  *  `column_view`'s data, and second is the column's bitmask.
  */
 template <typename T, std::enable_if_t<cudf::is_fixed_point<T>()>* = nullptr>
-std::pair<thrust::host_vector<T>, std::vector<bitmask_type>> to_host(column_view c);
+CUDF_EXPORT std::pair<thrust::host_vector<T>, std::vector<bitmask_type>> to_host(column_view c);
 
 /**
  * @brief Copies the data and bitmask of a `column_view` of strings
@@ -207,10 +209,35 @@ std::pair<thrust::host_vector<T>, std::vector<bitmask_type>> to_host(column_view
  * and second is the column's bitmask.
  */
 template <>
-std::pair<thrust::host_vector<std::string>, std::vector<bitmask_type>> to_host(column_view c);
+CUDF_EXPORT std::pair<thrust::host_vector<std::string>, std::vector<bitmask_type>> to_host(
+  column_view c);
 //! @endcond
 
-}  // namespace cudf::test
+/**
+ * @brief For enabling large strings testing in specific tests
+ */
+struct large_strings_enabler {
+  /**
+   * @brief Create large strings enable object
+   *
+   * @param default_enable Default enables large strings support
+   */
+  large_strings_enabler(bool default_enable = true);
+  ~large_strings_enabler();
+
+  /**
+   * @brief Enable large strings support
+   */
+  void enable();
+
+  /**
+   * @brief Disable large strings support
+   */
+  void disable();
+};
+
+}  // namespace test
+}  // namespace CUDF_EXPORT cudf
 
 // Macros for showing line of failure.
 #define CUDF_TEST_EXPECT_COLUMN_PROPERTIES_EQUAL(lhs, rhs)        \
@@ -242,3 +269,5 @@ std::pair<thrust::host_vector<std::string>, std::vector<bitmask_type>> to_host(c
     SCOPED_TRACE(" <--  line of failure\n");                        \
     cudf::test::detail::expect_equal_buffers(lhs, rhs, size_bytes); \
   } while (0)
+
+#define CUDF_TEST_ENABLE_LARGE_STRINGS() cudf::test::large_strings_enabler ls___

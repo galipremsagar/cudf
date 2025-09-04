@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,12 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/strings/strings_column_view.hpp>
-
-#include <rmm/mr/device/per_device_resource.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <string>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace strings {
 /**
  * @addtogroup strings_convert
@@ -35,7 +34,7 @@ namespace strings {
  * @brief Returns a new timestamp column converting a strings column into
  * timestamps using the provided format pattern.
  *
- * The format pattern can include the following specifiers: "%Y,%y,%m,%d,%H,%I,%p,%M,%S,%f,%z"
+ * The format pattern can include the following specifiers:
  *
  * | Specifier | Description |
  * | :-------: | ----------- |
@@ -88,14 +87,14 @@ std::unique_ptr<column> to_timestamps(
   strings_column_view const& input,
   data_type timestamp_type,
   std::string_view format,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Verifies the given strings column can be parsed to timestamps using the provided format
  * pattern.
  *
- * The format pattern can include the following specifiers: "%Y,%y,%m,%d,%H,%I,%p,%M,%S,%f,%z"
+ * The format pattern can include the following specifiers:
  *
  * | Specifier | Description |
  * | :-------: | ----------- |
@@ -126,6 +125,9 @@ std::unique_ptr<column> to_timestamps(
  * This will return a column of type BOOL8 where a `true` row indicates the corresponding
  * input string can be parsed correctly with the given format.
  *
+ * @throw std::invalid_argument if the `format` string is empty
+ * @throw std::invalid_argument if a specifier is not supported
+ *
  * @param input Strings instance for this operation
  * @param format String specifying the timestamp format in strings
  * @param stream CUDA stream used for device memory operations and kernel launches
@@ -135,14 +137,14 @@ std::unique_ptr<column> to_timestamps(
 std::unique_ptr<column> is_timestamp(
   strings_column_view const& input,
   std::string_view format,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a new strings column converting a timestamp column into
  * strings using the provided format pattern.
  *
- * The format pattern can include the following specifiers: "%Y,%y,%m,%d,%H,%I,%p,%M,%S,%f,%z,%Z"
+ * The format pattern can include the following specifiers:
  *
  * | Specifier | Description |
  * | :-------: | ----------- |
@@ -231,9 +233,10 @@ std::unique_ptr<column> is_timestamp(
  * }
  * @endcode
  *
- * @throw cudf::logic_error if `timestamps` column parameter is not a timestamp type.
- * @throw cudf::logic_error if the `format` string is empty
- * @throw cudf::logic_error if `names.size()` is an invalid size. Must be 0 or 40 strings.
+ * @throw std::invalid_argument if `timestamps` column parameter is not a timestamp type.
+ * @throw std::invalid_argument if the `format` string is empty
+ * @throw std::invalid_argument if `names.size()` is an invalid size. Must be 0 or 40 strings.
+ * @throw std::invalid_argument if a specifier is not supported
  *
  * @param timestamps Timestamp values to convert
  * @param format The string specifying output format.
@@ -246,12 +249,12 @@ std::unique_ptr<column> is_timestamp(
  */
 std::unique_ptr<column> from_timestamps(
   column_view const& timestamps,
-  std::string_view format             = "%Y-%m-%dT%H:%M:%SZ",
-  strings_column_view const& names    = strings_column_view(column_view{
+  std::string_view format           = "%Y-%m-%dT%H:%M:%SZ",
+  strings_column_view const& names  = strings_column_view(column_view{
     data_type{type_id::STRING}, 0, nullptr, nullptr, 0}),
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of doxygen group
 }  // namespace strings
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

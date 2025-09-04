@@ -19,6 +19,22 @@ As contributors and maintainers to this project, you are expected to abide by cu
 conduct. More information can be found at:
 [Contributor Code of Conduct](https://docs.rapids.ai/resources/conduct/).
 
+## Documentation contributions
+
+To make a contribution only to cuDF documentation:
+
+1. Create the `cudf_dev` conda environment following the steps in [Building with a conda environment](#building-with-a-conda-environment).
+2. Activate the environment and install a recent version of `cudf`
+
+```bash
+conda activate cudf_dev
+conda install cudf -c rapidsai-nightly -c conda-forge
+```
+
+3. Build and view the docs locally following the instructions in the [Building
+documentation docs](https://docs.rapids.ai/api/cudf/stable/developer_guide/documentation/#building-and-viewing-docs)
+4. Follow steps 7-10 in the section [Your first issue](#your-first-issue)
+
 ## Code contributions
 
 ### Your first issue
@@ -38,6 +54,7 @@ conduct. More information can be found at:
 8. Verify that CI passes all [status checks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/about-status-checks).
    Fix if needed.
 9. Wait for other developers to review your code and update code as needed.
+   Changes to any C++ files require at least 2 approvals from the cudf-cpp-codeowners before merging.
 10. Once reviewed and approved, a RAPIDS developer will merge your pull request.
 
 If you are unsure about anything, don't hesitate to comment on issues and ask for clarification!
@@ -71,15 +88,14 @@ for a minimal build of libcudf without using conda are also listed below.
 
 Compilers:
 
-* `gcc` version 9.3+
-* `nvcc` version 11.5+
-* `cmake` version 3.26.4+
+* `gcc` version 13.3+
+* `nvcc` version 12.0+
+* `cmake` version 3.29.6+
 
-CUDA/GPU:
+CUDA/GPU Runtime:
 
-* CUDA 11.5+
-* NVIDIA driver 450.80.02+
-* Volta architecture or better (Compute Capability >=7.0)
+* CUDA 12.0+
+* Volta architecture or better ([Compute Capability](https://docs.nvidia.com/deploy/cuda-compatibility/) >=7.0)
 
 You can obtain CUDA from
 [https://developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads).
@@ -105,7 +121,7 @@ Instructions for a minimal build environment without conda are included below.
 # create the conda environment (assuming in base `cudf` directory)
 # note: RAPIDS currently doesn't support `channel_priority: strict`;
 # use `channel_priority: flexible` instead
-conda env create --name cudf_dev --file conda/environments/all_cuda-118_arch-x86_64.yaml
+conda env create --name cudf_dev --file conda/environments/all_cuda-130_arch-x86_64.yaml
 # activate the environment
 conda activate cudf_dev
 ```
@@ -154,12 +170,14 @@ cd $CUDF_HOME
 #### Building for development
 
 To build Python packages for development purposes, add the `--pydevelop` flag.
-To build C++ tests, you can also request that build.sh build the `test` target.
+To build C++ tests, you can also request that build.sh build the `tests` target.
 To build all libraries and tests, with Python packages in development mode, simply run
 
 ```bash
-./build.sh --pydevelop libcudf libcudf_kafka cudf dask_cudf cudf_kafka custreamz
+./build.sh --pydevelop libcudf libcudf_kafka pylibcudf cudf dask_cudf cudf_kafka custreamz
 ```
+
+- **Note**: if Cython files (`*.pyx` or `*.pxd`) have changed, the Python build must be rerun.
 
 To run the C++ tests, run
 
@@ -292,8 +310,8 @@ In order to run doxygen as a linter on C++/CUDA code, run
 ./ci/checks/doxygen.sh
 ```
 
-Python code runs several linters including [Black](https://black.readthedocs.io/en/stable/),
-[isort](https://pycqa.github.io/isort/), and [flake8](https://flake8.pycqa.org/en/latest/).
+Python code runs several linters including [Ruff](https://docs.astral.sh/ruff/)
+with its various rules  for Black-like formatting or Isort.
 
 cuDF also uses [codespell](https://github.com/codespell-project/codespell) to find spelling
 mistakes, and this check is run as a pre-commit hook. To apply the suggested spelling fixes,

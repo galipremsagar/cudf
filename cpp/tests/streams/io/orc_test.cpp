@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,19 +17,12 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/default_stream.hpp>
-#include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/testing_main.hpp>
 
-#include <cudf/io/detail/orc.hpp>
 #include <cudf/io/orc.hpp>
 #include <cudf/io/orc_metadata.hpp>
-#include <cudf/io/orc_types.hpp>
 #include <cudf/table/table.hpp>
-#include <cudf/table/table_view.hpp>
-#include <cudf/types.hpp>
 
-#include <iostream>
-#include <random>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -59,22 +52,10 @@ cudf::table construct_table()
   cudf::test::fixed_width_column_wrapper<int32_t> col3(zeros_iterator, zeros_iterator + num_rows);
   cudf::test::fixed_width_column_wrapper<float> col4(zeros_iterator, zeros_iterator + num_rows);
   cudf::test::fixed_width_column_wrapper<double> col5(zeros_iterator, zeros_iterator + num_rows);
-
-  cudf::test::fixed_width_column_wrapper<numeric::decimal128> col6 = [&ones_iterator, num_rows] {
-    auto col6_data = cudf::detail::make_counting_transform_iterator(0, [&](auto i) {
-      return numeric::decimal128{ones_iterator[i], numeric::scale_type{12}};
-    });
-    return cudf::test::fixed_width_column_wrapper<numeric::decimal128>(col6_data,
-                                                                       col6_data + num_rows);
-  }();
-
-  cudf::test::fixed_width_column_wrapper<numeric::decimal128> col7 = [&ones_iterator, num_rows] {
-    auto col7_data = cudf::detail::make_counting_transform_iterator(0, [&](auto i) {
-      return numeric::decimal128{ones_iterator[i], numeric::scale_type{-12}};
-    });
-    return cudf::test::fixed_width_column_wrapper<numeric::decimal128>(col7_data,
-                                                                       col7_data + num_rows);
-  }();
+  cudf::test::fixed_point_column_wrapper<numeric::decimal128::rep> col6(
+    ones_iterator, ones_iterator + num_rows, numeric::scale_type{12});
+  cudf::test::fixed_point_column_wrapper<numeric::decimal128::rep> col7(
+    ones_iterator, ones_iterator + num_rows, numeric::scale_type{-12});
 
   cudf::test::lists_column_wrapper<int64_t> col8 = [] {
     auto col8_mask =
@@ -135,3 +116,5 @@ TEST_F(ORCTest, ORCReader)
   auto meta        = read_orc_metadata(cudf::io::source_info{filepath});
   auto const stats = cudf::io::read_parsed_orc_statistics(cudf::io::source_info{filepath});
 }
+
+CUDF_TEST_PROGRAM_MAIN()

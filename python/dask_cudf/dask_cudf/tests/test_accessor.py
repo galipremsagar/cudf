@@ -1,4 +1,6 @@
-# Copyright (c) 2019-2024, NVIDIA CORPORATION.
+# Copyright (c) 2019-2025, NVIDIA CORPORATION.
+
+from contextlib import nullcontext as does_not_raise
 
 import numpy as np
 import pandas as pd
@@ -9,10 +11,9 @@ import dask
 from dask import dataframe as dd
 
 from cudf import DataFrame, Series, date_range
-from cudf.testing._utils import assert_eq, does_not_raise
+from cudf.testing import assert_eq
 
 import dask_cudf
-from dask_cudf.tests.utils import xfail_dask_expr
 
 #############################################################################
 #                        Datetime Accessor                                  #
@@ -24,7 +25,7 @@ def data_dt_1():
 
 
 def data_dt_2():
-    return np.random.randn(100)
+    return np.random.default_rng(seed=0).standard_normal(size=100)
 
 
 dt_fields = ["year", "month", "day", "hour", "minute", "second"]
@@ -111,7 +112,6 @@ def test_categorical_accessor_initialization2(data):
         dsr.cat
 
 
-@xfail_dask_expr("TODO: Unexplained dask-expr failure")
 @pytest.mark.parametrize("data", [data_cat_1()])
 def test_categorical_basic(data):
     cat = data.copy()
@@ -131,15 +131,7 @@ def test_categorical_basic(data):
         pdsr.cat.codes.values, result.cat.codes.values_host
     )
 
-    string = str(result)
-    expect_str = """
-0 a
-1 a
-2 b
-3 c
-4 a
-"""
-    assert all(x == y for x, y in zip(string.split(), expect_str.split()))
+    assert str(result) == str(pdsr)
     with dask.config.set({"dataframe.convert-string": False}):
         df = DataFrame()
         df["a"] = ["xyz", "abc", "def"] * 10
@@ -203,7 +195,6 @@ def test_categorical_compare_unordered(data):
         dsr < dsr
 
 
-@xfail_dask_expr("TODO: Unexplained dask-expr failure")
 @pytest.mark.parametrize("data", [data_cat_3()])
 def test_categorical_compare_ordered(data):
     cat1 = data[0].copy()
@@ -274,7 +265,6 @@ def test_categorical_categories():
     )
 
 
-@xfail_dask_expr("TODO: Unexplained dask-expr failure")
 def test_categorical_as_known():
     df = dask_cudf.from_cudf(DataFrame({"col_1": [0, 1, 2, 3]}), npartitions=2)
     df["col_1"] = df["col_1"].astype("category")
@@ -283,7 +273,19 @@ def test_categorical_as_known():
     pdf = dd.from_pandas(pd.DataFrame({"col_1": [0, 1, 2, 3]}), npartitions=2)
     pdf["col_1"] = pdf["col_1"].astype("category")
     expected = pdf["col_1"].cat.as_known()
-    dd.assert_eq(expected, actual)
+
+    # Note: Categories may be ordered differently in
+    # cudf and pandas. Therefore, we need to compare
+    # the global set of categories (before and after
+    # calling `compute`), then we need to check that
+    # the initial order of rows was preserved.
+    assert set(expected.cat.categories) == set(
+        actual.cat.categories.values_host
+    )
+    assert set(expected.compute().cat.categories) == set(
+        actual.compute().cat.categories.values_host
+    )
+    dd.assert_eq(expected, actual.astype(expected.dtype))
 
 
 def test_str_slice():
@@ -510,7 +512,6 @@ def test_dask_struct_field_Key_Error(data):
     struct_accessor_data_params,
 )
 def test_dask_struct_field_Int_Error(data):
-    # breakpoint()
     got = dask_cudf.from_cudf(Series(data), 2)
 
     with pytest.raises(IndexError):
@@ -533,7 +534,7 @@ def test_struct_explode(data):
 
 
 def test_tz_localize():
-    data = Series(date_range("2000-04-01", "2000-04-03", freq="H"))
+    data = Series(date_range("2000-04-01", "2000-04-03", freq="h"))
     expect = data.dt.tz_localize(
         "US/Eastern", ambiguous="NaT", nonexistent="NaT"
     )
@@ -550,8 +551,8 @@ def test_tz_localize():
 @pytest.mark.parametrize(
     "data",
     [
-        date_range("2000-04-01", "2000-04-03", freq="H").tz_localize("UTC"),
-        date_range("2000-04-01", "2000-04-03", freq="H").tz_localize(
+        date_range("2000-04-01", "2000-04-03", freq="h").tz_localize("UTC"),
+        date_range("2000-04-01", "2000-04-03", freq="h").tz_localize(
             "US/Eastern"
         ),
     ],

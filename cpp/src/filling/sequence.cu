@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,15 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/detail/sequence.hpp>
 #include <cudf/filling.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_device_view.cuh>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/type_checks.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
@@ -60,13 +63,13 @@ struct const_tabulator {
  * by init and step.
  */
 struct sequence_functor {
-  template <typename T,
-            std::enable_if_t<cudf::is_numeric<T>() and not cudf::is_boolean<T>()>* = nullptr>
+  template <typename T>
   std::unique_ptr<column> operator()(size_type size,
                                      scalar const& init,
                                      scalar const& step,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
+    requires(cudf::is_numeric<T>() and not cudf::is_boolean<T>())
   {
     auto result = make_fixed_width_column(init.type(), size, mask_state::UNALLOCATED, stream, mr);
     auto result_device_view = mutable_column_device_view::create(*result, stream);
@@ -87,12 +90,12 @@ struct sequence_functor {
     return result;
   }
 
-  template <typename T,
-            std::enable_if_t<cudf::is_numeric<T>() and not cudf::is_boolean<T>()>* = nullptr>
+  template <typename T>
   std::unique_ptr<column> operator()(size_type size,
                                      scalar const& init,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
+    requires(cudf::is_numeric<T>() and not cudf::is_boolean<T>())
   {
     auto result = make_fixed_width_column(init.type(), size, mask_state::UNALLOCATED, stream, mr);
     auto result_device_view = mutable_column_device_view::create(*result, stream);
@@ -112,10 +115,10 @@ struct sequence_functor {
   }
 
   template <typename T, typename... Args>
-  std::enable_if_t<not cudf::is_numeric<T>() or cudf::is_boolean<T>(), std::unique_ptr<column>>
-  operator()(Args&&...)
+  std::unique_ptr<column> operator()(Args&&...)
+    requires(not cudf::is_numeric<T>() or cudf::is_boolean<T>())
   {
-    CUDF_FAIL("Unsupported sequence scalar type");
+    CUDF_FAIL("Unsupported sequence scalar type", cudf::data_type_error);
   }
 };
 
@@ -125,11 +128,16 @@ std::unique_ptr<column> sequence(size_type size,
                                  scalar const& init,
                                  scalar const& step,
                                  rmm::cuda_stream_view stream,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(init.type() == step.type(), "init and step must be of the same type.");
-  CUDF_EXPECTS(size >= 0, "size must be >= 0");
-  CUDF_EXPECTS(is_numeric(init.type()), "Input scalar types must be numeric");
+  CUDF_EXPECTS(cudf::have_same_types(init, step),
+               "init and step must be of the same type.",
+               cudf::data_type_error);
+  CUDF_EXPECTS(size >= 0, "size must be >= 0", std::invalid_argument);
+  CUDF_EXPECTS(
+    is_numeric(init.type()), "Input scalar types must be numeric", std::invalid_argument);
+  CUDF_EXPECTS(init.is_valid(stream), "init must be a valid scalar", std::invalid_argument);
+  CUDF_EXPECTS(step.is_valid(stream), "step must be a valid scalar", std::invalid_argument);
 
   return type_dispatcher(init.type(), sequence_functor{}, size, init, step, stream, mr);
 }
@@ -137,10 +145,11 @@ std::unique_ptr<column> sequence(size_type size,
 std::unique_ptr<column> sequence(size_type size,
                                  scalar const& init,
                                  rmm::cuda_stream_view stream,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::device_async_resource_ref mr)
 {
-  CUDF_EXPECTS(size >= 0, "size must be >= 0");
-  CUDF_EXPECTS(is_numeric(init.type()), "init scalar type must be numeric");
+  CUDF_EXPECTS(size >= 0, "size must be >= 0", std::invalid_argument);
+  CUDF_EXPECTS(is_numeric(init.type()), "init scalar type must be numeric", cudf::data_type_error);
+  CUDF_EXPECTS(init.is_valid(stream), "init must be a valid scalar", std::invalid_argument);
 
   return type_dispatcher(init.type(), sequence_functor{}, size, init, stream, mr);
 }
@@ -151,7 +160,7 @@ std::unique_ptr<column> sequence(size_type size,
                                  scalar const& init,
                                  scalar const& step,
                                  rmm::cuda_stream_view stream,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::sequence(size, init, step, stream, mr);
@@ -160,7 +169,7 @@ std::unique_ptr<column> sequence(size_type size,
 std::unique_ptr<column> sequence(size_type size,
                                  scalar const& init,
                                  rmm::cuda_stream_view stream,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::sequence(size, init, stream, mr);

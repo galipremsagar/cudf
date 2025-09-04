@@ -29,5 +29,7 @@ other operations.
 
    user_guide/index
    cudf_pandas/index
+   cudf_polars/index
+   pylibcudf/index
    libcudf_docs/index
    developer_guide/index

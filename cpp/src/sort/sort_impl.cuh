@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,17 +16,22 @@
 
 #pragma once
 
-#include "common_sort_impl.cuh"
+#include "sort.hpp"
 #include "sort_column_impl.cuh"
 
 #include <cudf/column/column_factories.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
 
 namespace cudf {
 namespace detail {
 
 /**
  * @copydoc
- * sorted_order(table_view&,std::vector<order>,std::vector<null_order>,rmm::mr::device_memory_resource*)
+ * sorted_order(table_view&,std::vector<order>,std::vector<null_order>,rmm::device_async_resource_ref
+ * )
  *
  * @tparam stable Whether to use stable sort
  * @param stream CUDA stream used for device memory operations and kernel launches
@@ -36,7 +41,7 @@ std::unique_ptr<column> sorted_order(table_view input,
                                      std::vector<order> const& column_order,
                                      std::vector<null_order> const& null_precedence,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
 {
   if (input.num_rows() == 0 or input.num_columns() == 0) {
     return cudf::make_numeric_column(

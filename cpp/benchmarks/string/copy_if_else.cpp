@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.
+ * Copyright (c) 2024-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,15 +25,11 @@
 static void bench_copy(nvbench::state& state)
 {
   auto const num_rows  = static_cast<cudf::size_type>(state.get_int64("num_rows"));
-  auto const row_width = static_cast<cudf::size_type>(state.get_int64("row_width"));
-
-  if (static_cast<std::size_t>(num_rows) * static_cast<std::size_t>(row_width) >=
-      static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
-    state.skip("Skip benchmarks greater than size_type limit");
-  }
+  auto const min_width = static_cast<cudf::size_type>(state.get_int64("min_width"));
+  auto const max_width = static_cast<cudf::size_type>(state.get_int64("max_width"));
 
   data_profile const str_profile = data_profile_builder().distribution(
-    cudf::type_id::STRING, distribution_id::NORMAL, 0, row_width);
+    cudf::type_id::STRING, distribution_id::NORMAL, min_width, max_width);
   auto const source_table =
     create_random_table({cudf::type_id::STRING}, row_count{num_rows}, str_profile);
   auto const target_table =
@@ -47,9 +43,9 @@ static void bench_copy(nvbench::state& state)
   auto const left_right = booleans->view().column(0);
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
-  auto chars_size = cudf::strings_column_view(target).chars_size(cudf::get_default_stream());
-  state.add_global_memory_reads<nvbench::int8_t>(chars_size);   // all bytes are read;
-  state.add_global_memory_writes<nvbench::int8_t>(chars_size);  // both columns are similar size
+  auto data_size = target_table->alloc_size();
+  state.add_global_memory_reads<nvbench::int8_t>(data_size);   // all bytes are read;
+  state.add_global_memory_writes<nvbench::int8_t>(data_size);  // both columns are similar size
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
     [[maybe_unused]] auto result = cudf::copy_if_else(source, target, left_right);
@@ -58,5 +54,6 @@ static void bench_copy(nvbench::state& state)
 
 NVBENCH_BENCH(bench_copy)
   .set_name("copy_if_else")
-  .add_int64_axis("row_width", {32, 64, 128, 256, 512, 1024, 2048, 4096})
-  .add_int64_axis("num_rows", {4096, 32768, 262144, 2097152, 16777216});
+  .add_int64_axis("min_width", {0})
+  .add_int64_axis("max_width", {32, 64, 128, 256})
+  .add_int64_axis("num_rows", {32768, 262144, 2097152});

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,13 +17,14 @@
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/export.hpp>
 
 /**
  * @file
  * @brief Class definition for cudf::strings_column_view
  */
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @addtogroup strings_classes
@@ -42,9 +43,11 @@ class strings_column_view : private column_view {
    * @param strings_column The column view to wrap.
    */
   strings_column_view(column_view strings_column);
+  // So we can use this from cython.
+  strings_column_view()                           = default;
   strings_column_view(strings_column_view&&)      = default;  ///< Move constructor
   strings_column_view(strings_column_view const&) = default;  ///< Copy constructor
-  ~strings_column_view()                          = default;
+  ~strings_column_view() override                 = default;
   /**
    * @brief Copy assignment operator
    *
@@ -86,28 +89,6 @@ class strings_column_view : private column_view {
   [[nodiscard]] column_view offsets() const;
 
   /**
-   * @brief Return an iterator for the offsets child column.
-   *
-   * @deprecated Since 24.04
-   *
-   * This automatically applies the offset of the parent.
-   *
-   * @return Iterator pointing to the first offset value.
-   */
-  [[deprecated]] offset_iterator offsets_begin() const;
-
-  /**
-   * @brief Return an end iterator for the offsets child column.
-   *
-   * @deprecated Since 24.04
-   *
-   * This automatically applies the offset of the parent.
-   *
-   * @return Iterator pointing 1 past the last offset value.
-   */
-  [[deprecated]] offset_iterator offsets_end() const;
-
-  /**
    * @brief Returns the number of bytes in the chars child column.
    *
    * This accounts for empty columns but does not reflect a sliced parent column
@@ -116,7 +97,7 @@ class strings_column_view : private column_view {
    * @param stream CUDA stream used for device memory operations and kernel launches
    * @return Number of bytes in the chars child column
    */
-  [[nodiscard]] int64_t chars_size(rmm::cuda_stream_view stream) const noexcept;
+  [[nodiscard]] int64_t chars_size(rmm::cuda_stream_view stream) const;
 
   /**
    * @brief Return an iterator for the chars child column.
@@ -129,7 +110,7 @@ class strings_column_view : private column_view {
    *
    * @return Iterator pointing to the first char byte.
    */
-  [[nodiscard]] chars_iterator chars_begin(rmm::cuda_stream_view) const;
+  [[nodiscard]] chars_iterator chars_begin(rmm::cuda_stream_view) const noexcept;
 
   /**
    * @brief Return an end iterator for the offsets child column.
@@ -148,4 +129,4 @@ namespace strings {
 }  // namespace strings
 
 /** @} */  // end of group
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

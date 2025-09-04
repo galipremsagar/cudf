@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,12 +23,13 @@
 
 #include <cudf/io/orc_types.hpp>
 #include <cudf/io/types.hpp>
+#include <cudf/utilities/export.hpp>
 
 #include <optional>
 #include <variant>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace io {
 /**
  * @addtogroup io_types
@@ -154,13 +155,28 @@ struct timestamp_statistics : minmax_statistics<int64_t> {
   std::optional<uint32_t> maximum_nanos;  ///< nanoseconds part of the maximum
 };
 
+/**
+ * @brief Variant type for ORC type-specific column statistics.
+ *
+ * The variant can hold any of the supported column statistics types.
+ */
+using statistics_type = std::variant<no_statistics,
+                                     integer_statistics,
+                                     double_statistics,
+                                     string_statistics,
+                                     bucket_statistics,
+                                     decimal_statistics,
+                                     date_statistics,
+                                     binary_statistics,
+                                     timestamp_statistics>;
+
 //! Orc I/O interfaces
-namespace orc {
-// forward declare the type that ProtobufReader uses. The `cudf::io::column_statistics` objects,
+namespace orc::detail {
+// forward declare the type that protobuf_reader uses. The `cudf::io::column_statistics` objects,
 // returned from `read_parsed_orc_statistics`, are constructed from
-// `cudf::io::orc::column_statistics` objects that `ProtobufReader` initializes.
+// `cudf::io::orc::detail::column_statistics` objects that `protobuf_reader` initializes.
 struct column_statistics;
-}  // namespace orc
+}  // namespace orc::detail
 
 /**
  * @brief Contains per-column ORC statistics.
@@ -171,23 +187,14 @@ struct column_statistics;
 struct column_statistics {
   std::optional<uint64_t> number_of_values;  ///< number of statistics
   std::optional<bool> has_null;              ///< column has any nulls
-  std::variant<no_statistics,
-               integer_statistics,
-               double_statistics,
-               string_statistics,
-               bucket_statistics,
-               decimal_statistics,
-               date_statistics,
-               binary_statistics,
-               timestamp_statistics>
-    type_specific_stats;  ///< type-specific statistics
+  statistics_type type_specific_stats;       ///< type-specific statistics
 
   /**
    * @brief Construct a new column statistics object
    *
    * @param detail_statistics The statistics to initialize the object with
    */
-  column_statistics(orc::column_statistics&& detail_statistics);
+  column_statistics(orc::detail::column_statistics&& detail_statistics);
 };
 
 /**
@@ -381,4 +388,4 @@ orc_metadata read_orc_metadata(source_info const& src_info,
 
 /** @} */  // end of group
 }  // namespace io
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

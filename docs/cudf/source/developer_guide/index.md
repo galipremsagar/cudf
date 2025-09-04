@@ -26,5 +26,6 @@ documentation
 testing
 benchmarking
 options
-pylibcudf
+cudf_pandas
+udf_memory_management
 ```

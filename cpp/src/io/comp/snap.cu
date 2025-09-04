@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,8 +19,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
-namespace cudf {
-namespace io {
+namespace cudf::io::detail {
 constexpr int hash_bits = 12;
 
 // TBD: Tentatively limits to 2-byte codes to prevent long copy search followed by long literal
@@ -249,9 +248,11 @@ static __device__ uint32_t Match60(uint8_t const* src1,
 CUDF_KERNEL void __launch_bounds__(128)
   snap_kernel(device_span<device_span<uint8_t const> const> inputs,
               device_span<device_span<uint8_t> const> outputs,
-              device_span<compression_result> results)
+              device_span<codec_exec_result> results)
 {
   __shared__ __align__(16) snap_state_s state_g;
+
+  if (results[blockIdx.x].status == codec_status::SKIPPED) { return; }
 
   snap_state_s* const s = &state_g;
   uint32_t t            = threadIdx.x;
@@ -327,15 +328,13 @@ CUDF_KERNEL void __launch_bounds__(128)
   __syncthreads();
   if (!t) {
     results[blockIdx.x].bytes_written = s->dst - s->dst_base;
-    results[blockIdx.x].status =
-      (s->dst > s->end) ? compression_status::FAILURE : compression_status::SUCCESS;
-    results[blockIdx.x].reserved = 0;
+    results[blockIdx.x].status = (s->dst > s->end) ? codec_status::FAILURE : codec_status::SUCCESS;
   }
 }
 
 void gpu_snap(device_span<device_span<uint8_t const> const> inputs,
               device_span<device_span<uint8_t> const> outputs,
-              device_span<compression_result> results,
+              device_span<codec_exec_result> results,
               rmm::cuda_stream_view stream)
 {
   dim3 dim_block(128, 1);  // 4 warps per stream, 1 stream per block
@@ -345,5 +344,4 @@ void gpu_snap(device_span<device_span<uint8_t const> const> inputs,
   }
 }
 
-}  // namespace io
-}  // namespace cudf
+}  // namespace cudf::io::detail

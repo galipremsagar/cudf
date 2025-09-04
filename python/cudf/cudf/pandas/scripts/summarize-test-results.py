@@ -1,17 +1,21 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
 Summarizes the test results per module.
 
-Examples:
+Examples
+--------
     python summarize-test-results.py log.json
     python summarize-test-results.py log.json --output json
     python summarize-test-results.py log.json --output table
 """
+
 import argparse
+import glob
 import json
+import os
 
 from rich.console import Console
 from rich.table import Table
@@ -25,9 +29,11 @@ def get_per_module_results(log_file_name):
         for line in f:
             try:
                 line = json.loads(line)
+
             except Exception:
                 line = {}
             if "outcome" in line:
+                was_skipped_by_cudf_pandas = False
                 outcome = line["outcome"]
                 # outcome can be "passed", "failed", or "skipped".
                 # Depending on other fields, it can indicate
@@ -38,6 +44,16 @@ def get_per_module_results(log_file_name):
                         # if the test failed during setup or teardown,
                         # it counts as an "errored" test:
                         outcome = "errored"
+                    elif outcome == "skipped":
+                        longrepr = line.get("longrepr", [])
+                        if (
+                            longrepr is not None
+                            and "Skipped: XPASSes with cudf.pandas enabled."
+                            in longrepr
+                        ):
+                            was_skipped_by_cudf_pandas = True
+                        else:
+                            continue
                     else:
                         # we don't care about other outcomes during
                         # setup or teardown
@@ -46,6 +62,11 @@ def get_per_module_results(log_file_name):
                     if line.get("wasxfail", False) and outcome == "passed":
                         # it's an xpassed test
                         outcome = "failed"
+
+                was_xfailed_by_cudf_pandas = (
+                    line.get("wasxfail", "")
+                    == "Fails with cudf.pandas enabled."
+                )
                 module_name = (
                     line["nodeid"]
                     .split("::")[0]
@@ -54,8 +75,60 @@ def get_per_module_results(log_file_name):
                 per_module_results.setdefault(module_name, {})
                 per_module_results[module_name].setdefault("total", 0)
                 per_module_results[module_name].setdefault(outcome, 0)
+                per_module_results[module_name].setdefault(
+                    "xfailed_by_cudf_pandas", 0
+                )
+                per_module_results[module_name].setdefault(
+                    "skipped_by_cudf_pandas", 0
+                )
                 per_module_results[module_name]["total"] += 1
                 per_module_results[module_name][outcome] += 1
+                if was_xfailed_by_cudf_pandas:
+                    per_module_results[module_name][
+                        "xfailed_by_cudf_pandas"
+                    ] += 1
+                if was_skipped_by_cudf_pandas:
+                    per_module_results[module_name][
+                        "skipped_by_cudf_pandas"
+                    ] += 1
+
+    directory = os.path.dirname(log_file_name)
+    pattern = os.path.join(directory, "function_call_counts_worker_*.json")
+    matching_files = glob.glob(pattern)
+    function_call_counts = {}
+
+    for file in matching_files:
+        with open(file) as f:
+            function_call_count = json.load(f)
+        if not function_call_counts:
+            function_call_counts.update(function_call_count)
+        else:
+            for key, value in function_call_count.items():
+                if key not in function_call_counts:
+                    function_call_counts[key] = value
+                else:
+                    if "_slow_function_call" not in function_call_counts[key]:
+                        function_call_counts[key]["_slow_function_call"] = 0
+                    if "_fast_function_call" not in function_call_counts[key]:
+                        function_call_counts[key]["_fast_function_call"] = 0
+                    function_call_counts[key]["_slow_function_call"] += (
+                        value.get("_slow_function_call", 0)
+                    )
+                    function_call_counts[key]["_fast_function_call"] += (
+                        value.get("_fast_function_call", 0)
+                    )
+
+    for key, value in per_module_results.items():
+        if key in function_call_counts:
+            per_module_results[key]["_slow_function_call"] = (
+                function_call_counts[key].get("_slow_function_call", 0)
+            )
+            per_module_results[key]["_fast_function_call"] = (
+                function_call_counts[key].get("_fast_function_call", 0)
+            )
+        else:
+            per_module_results[key]["_slow_function_call"] = 0
+            per_module_results[key]["_fast_function_call"] = 0
     return per_module_results
 
 
@@ -67,7 +140,7 @@ def sort_results(results):
 
 
 def print_results_as_json(results):
-    print(json.dumps(results, indent=4))
+    print(json.dumps(results, indent=4))  # noqa: T201
 
 
 def print_results_as_table(results):

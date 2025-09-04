@@ -17,7 +17,7 @@
  * limitations under the License.
  */
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,10 +37,12 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/concatenate.hpp>
 #include <cudf/detail/copy.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/replace.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/dictionary/detail/update_keys.hpp>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/dictionary_factories.hpp>
@@ -48,12 +50,13 @@
 #include <cudf/strings/detail/replace.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+#include <cudf/utilities/type_checks.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/device_scalar.hpp>
 
-#include <thrust/distance.h>
+#include <cuda/std/iterator>
 #include <thrust/execution_policy.h>
 #include <thrust/find.h>
 #include <thrust/pair.h>
@@ -77,7 +80,7 @@ __device__ auto get_new_value(cudf::size_type idx,
   bool output_is_valid{true};
 
   if (found_ptr != values_to_replace_end) {
-    auto d    = thrust::distance(values_to_replace_begin, found_ptr);
+    auto d    = cuda::std::distance(values_to_replace_begin, found_ptr);
     new_value = d_replacement_values[d];
     if (replacement_has_nulls) { output_is_valid = cudf::bit_is_set(replacement_valid, d); }
   } else {
@@ -178,9 +181,9 @@ struct replace_kernel_forwarder {
                                            cudf::column_view const& values_to_replace,
                                            cudf::column_view const& replacement_values,
                                            rmm::cuda_stream_view stream,
-                                           rmm::mr::device_memory_resource* mr)
+                                           rmm::device_async_resource_ref mr)
   {
-    rmm::device_scalar<cudf::size_type> valid_counter(0, stream);
+    cudf::detail::device_scalar<cudf::size_type> valid_counter(0, stream);
     cudf::size_type* valid_count = valid_counter.data();
 
     auto replace = [&] {
@@ -226,7 +229,7 @@ struct replace_kernel_forwarder {
                                            cudf::column_view const&,
                                            cudf::column_view const&,
                                            rmm::cuda_stream_view,
-                                           rmm::mr::device_memory_resource*)
+                                           rmm::device_async_resource_ref)
   {
     CUDF_FAIL("No specialization exists for this type");
   }
@@ -238,7 +241,7 @@ std::unique_ptr<cudf::column> replace_kernel_forwarder::operator()<cudf::string_
   cudf::column_view const& values_to_replace,
   cudf::column_view const& replacement_values,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   return cudf::strings::detail::find_and_replace_all(
     input_col, values_to_replace, replacement_values, stream, mr);
@@ -250,7 +253,7 @@ std::unique_ptr<cudf::column> replace_kernel_forwarder::operator()<cudf::diction
   cudf::column_view const& values_to_replace,
   cudf::column_view const& replacement_values,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   auto input        = cudf::dictionary_column_view(input_col);
   auto values       = cudf::dictionary_column_view(values_to_replace);
@@ -260,14 +263,14 @@ std::unique_ptr<cudf::column> replace_kernel_forwarder::operator()<cudf::diction
     auto new_keys = cudf::detail::concatenate(
       std::vector<cudf::column_view>({values.keys(), replacements.keys()}),
       stream,
-      rmm::mr::get_current_device_resource());
+      cudf::get_current_device_resource_ref());
     return cudf::dictionary::detail::add_keys(input, new_keys->view(), stream, mr);
   }();
   auto matched_view   = cudf::dictionary_column_view(matched_input->view());
   auto matched_values = cudf::dictionary::detail::set_keys(
-    values, matched_view.keys(), stream, rmm::mr::get_current_device_resource());
+    values, matched_view.keys(), stream, cudf::get_current_device_resource_ref());
   auto matched_replacements = cudf::dictionary::detail::set_keys(
-    replacements, matched_view.keys(), stream, rmm::mr::get_current_device_resource());
+    replacements, matched_view.keys(), stream, cudf::get_current_device_resource_ref());
 
   auto indices_type = matched_view.indices().type();
   auto new_indices  = cudf::type_dispatcher<cudf::dispatch_storage_type>(
@@ -297,14 +300,15 @@ std::unique_ptr<cudf::column> find_and_replace_all(cudf::column_view const& inpu
                                                    cudf::column_view const& values_to_replace,
                                                    cudf::column_view const& replacement_values,
                                                    rmm::cuda_stream_view stream,
-                                                   rmm::mr::device_memory_resource* mr)
+                                                   rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(values_to_replace.size() == replacement_values.size(),
                "values_to_replace and replacement_values size mismatch.");
 
-  CUDF_EXPECTS(
-    input_col.type() == values_to_replace.type() && input_col.type() == replacement_values.type(),
-    "Columns type mismatch");
+  CUDF_EXPECTS(cudf::have_same_types(input_col, values_to_replace) &&
+                 cudf::have_same_types(input_col, replacement_values),
+               "Columns type mismatch",
+               cudf::data_type_error);
   CUDF_EXPECTS(not values_to_replace.has_nulls(), "values_to_replace must not have nulls");
 
   if (input_col.is_empty() or values_to_replace.is_empty() or replacement_values.is_empty()) {
@@ -337,7 +341,7 @@ std::unique_ptr<cudf::column> find_and_replace_all(cudf::column_view const& inpu
                                                    cudf::column_view const& values_to_replace,
                                                    cudf::column_view const& replacement_values,
                                                    rmm::cuda_stream_view stream,
-                                                   rmm::mr::device_memory_resource* mr)
+                                                   rmm::device_async_resource_ref mr)
 {
   return detail::find_and_replace_all(input_col, values_to_replace, replacement_values, stream, mr);
 }

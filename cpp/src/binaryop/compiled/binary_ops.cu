@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,14 @@
 #include "operation.cuh"
 #include "struct_binary_ops.cuh"
 
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/structs/utilities.hpp>
+#include <cudf/detail/utilities/functional.hpp>
 #include <cudf/scalar/scalar_device_view.cuh>
 #include <cudf/strings/detail/strings_children.cuh>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
@@ -50,7 +53,7 @@ struct scalar_as_column_view {
   template <typename T, CUDF_ENABLE_IF(is_fixed_width<T>())>
   return_type operator()(scalar const& s,
                          rmm::cuda_stream_view stream,
-                         rmm::mr::device_memory_resource*)
+                         rmm::device_async_resource_ref)
   {
     auto& h_scalar_type_view = static_cast<cudf::scalar_type_t<T>&>(const_cast<scalar&>(s));
     auto col_v               = column_view(s.type(),
@@ -61,7 +64,7 @@ struct scalar_as_column_view {
     return std::pair{col_v, std::unique_ptr<column>(nullptr)};
   }
   template <typename T, CUDF_ENABLE_IF(!is_fixed_width<T>())>
-  return_type operator()(scalar const&, rmm::cuda_stream_view, rmm::mr::device_memory_resource*)
+  return_type operator()(scalar const&, rmm::cuda_stream_view, rmm::device_async_resource_ref)
   {
     CUDF_FAIL("Unsupported type");
   }
@@ -69,7 +72,7 @@ struct scalar_as_column_view {
 // specialization for cudf::string_view
 template <>
 scalar_as_column_view::return_type scalar_as_column_view::operator()<cudf::string_view>(
-  scalar const& s, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr)
+  scalar const& s, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
   using T                  = cudf::string_view;
   auto& h_scalar_type_view = static_cast<cudf::scalar_type_t<T>&>(const_cast<scalar&>(s));
@@ -96,7 +99,7 @@ scalar_as_column_view::return_type scalar_as_column_view::operator()<cudf::strin
 // specializing for struct column
 template <>
 scalar_as_column_view::return_type scalar_as_column_view::operator()<cudf::struct_view>(
-  scalar const& s, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr)
+  scalar const& s, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
 {
   auto col = make_column_from_scalar(s, 1, stream, mr);
   return std::pair{col->view(), std::move(col)};
@@ -114,7 +117,7 @@ scalar_as_column_view::return_type scalar_as_column_view::operator()<cudf::struc
 auto scalar_to_column_view(
   scalar const& scal,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource())
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref())
 {
   return type_dispatcher(scal.type(), scalar_as_column_view{}, scal, stream, mr);
 }
@@ -136,10 +139,9 @@ struct compare_functor {
 
   // This is used to compare a scalar and a column value
   template <typename LhsViewT = LhsDeviceViewT, typename RhsViewT = RhsDeviceViewT>
-  __device__ inline std::enable_if_t<std::is_same_v<LhsViewT, column_device_view> &&
-                                       !std::is_same_v<RhsViewT, column_device_view>,
-                                     OutT>
-  operator()(cudf::size_type i) const
+  __device__ inline OutT operator()(cudf::size_type i) const
+    requires(std::is_same_v<LhsViewT, column_device_view> &&
+             !std::is_same_v<RhsViewT, column_device_view>)
   {
     return cfunc_(lhs_dev_view_.is_valid(i),
                   rhs_dev_view_.is_valid(),
@@ -150,10 +152,9 @@ struct compare_functor {
 
   // This is used to compare a scalar and a column value
   template <typename LhsViewT = LhsDeviceViewT, typename RhsViewT = RhsDeviceViewT>
-  __device__ inline std::enable_if_t<!std::is_same_v<LhsViewT, column_device_view> &&
-                                       std::is_same_v<RhsViewT, column_device_view>,
-                                     OutT>
-  operator()(cudf::size_type i) const
+  __device__ inline OutT operator()(cudf::size_type i) const
+    requires(!std::is_same_v<LhsViewT, column_device_view> &&
+             std::is_same_v<RhsViewT, column_device_view>)
   {
     return cfunc_(lhs_dev_view_.is_valid(),
                   rhs_dev_view_.is_valid(i),
@@ -164,10 +165,9 @@ struct compare_functor {
 
   // This is used to compare 2 column values
   template <typename LhsViewT = LhsDeviceViewT, typename RhsViewT = RhsDeviceViewT>
-  __device__ inline std::enable_if_t<std::is_same_v<LhsViewT, column_device_view> &&
-                                       std::is_same_v<RhsViewT, column_device_view>,
-                                     OutT>
-  operator()(cudf::size_type i) const
+  __device__ inline OutT operator()(cudf::size_type i) const
+    requires(std::is_same_v<LhsViewT, column_device_view> &&
+             std::is_same_v<RhsViewT, column_device_view>)
   {
     return cfunc_(lhs_dev_view_.is_valid(i),
                   rhs_dev_view_.is_valid(i),
@@ -216,7 +216,7 @@ struct null_considering_binop {
                                      data_type output_type,
                                      cudf::size_type col_size,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr) const
+                                     rmm::device_async_resource_ref mr) const
   {
     // Create device views for inputs
     auto const lhs_dev_view = get_device_view(lhs);
@@ -239,8 +239,8 @@ struct null_considering_binop {
           return invalid_str;
         else if (lhs_valid && rhs_valid) {
           return (op == binary_operator::NULL_MAX)
-                   ? thrust::maximum<cudf::string_view>()(lhs_value, rhs_value)
-                   : thrust::minimum<cudf::string_view>()(lhs_value, rhs_value);
+                   ? cudf::detail::maximum<cudf::string_view>()(lhs_value, rhs_value)
+                   : cudf::detail::minimum<cudf::string_view>()(lhs_value, rhs_value);
         } else if (lhs_valid)
           return lhs_value;
         else
@@ -263,7 +263,7 @@ std::unique_ptr<column> string_null_min_max(scalar const& lhs,
                                             binary_operator op,
                                             data_type output_type,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   // hard-coded to only work with cudf::string_view so we don't explode compile times
   CUDF_EXPECTS(lhs.type().id() == cudf::type_id::STRING, "Invalid/Unsupported lhs datatype");
@@ -280,7 +280,7 @@ std::unique_ptr<column> string_null_min_max(column_view const& lhs,
                                             binary_operator op,
                                             data_type output_type,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   // hard-coded to only work with cudf::string_view so we don't explode compile times
   CUDF_EXPECTS(lhs.type().id() == cudf::type_id::STRING, "Invalid/Unsupported lhs datatype");
@@ -297,7 +297,7 @@ std::unique_ptr<column> string_null_min_max(column_view const& lhs,
                                             binary_operator op,
                                             data_type output_type,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   // hard-coded to only work with cudf::string_view so we don't explode compile times
   CUDF_EXPECTS(lhs.type().id() == cudf::type_id::STRING, "Invalid/Unsupported lhs datatype");
@@ -355,6 +355,7 @@ case binary_operator::LOG_BASE:             apply_binary_op<ops::LogBase>(out, l
 case binary_operator::ATAN2:                apply_binary_op<ops::ATan2>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
 case binary_operator::PMOD:                 apply_binary_op<ops::PMod>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
 case binary_operator::NULL_EQUALS:          apply_binary_op<ops::NullEquals>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
+case binary_operator::NULL_NOT_EQUALS:      apply_binary_op<ops::NullNotEquals>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
 case binary_operator::NULL_MAX:             apply_binary_op<ops::NullMax>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
 case binary_operator::NULL_MIN:             apply_binary_op<ops::NullMin>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
 case binary_operator::NULL_LOGICAL_AND:     apply_binary_op<ops::NullLogicalAnd>(out, lhs, rhs, is_lhs_scalar, is_rhs_scalar, stream); break;
@@ -411,8 +412,9 @@ void apply_sorting_struct_binary_op(mutable_column_view& out,
   // Struct child column type and structure mismatches are caught within the two_table_comparator
   switch (op) {
     case binary_operator::EQUAL: [[fallthrough]];
+    case binary_operator::NOT_EQUAL: [[fallthrough]];
     case binary_operator::NULL_EQUALS: [[fallthrough]];
-    case binary_operator::NOT_EQUAL:
+    case binary_operator::NULL_NOT_EQUALS:
       detail::apply_struct_equality_op(
         out,
         lhs,

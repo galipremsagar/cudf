@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,7 @@
 
 #pragma once
 
-#include "parquet.hpp"
-#include "parquet_common.hpp"
+#include <cudf/io/parquet_schema.hpp>
 
 #include <algorithm>
 #include <cstddef>
@@ -53,6 +52,8 @@ class CompactProtocolWriter {
   size_t write(OffsetIndex const&);
   size_t write(SizeStatistics const&);
   size_t write(ColumnOrder const&);
+  size_t write(PageEncodingStats const&);
+  size_t write(SortingColumn const&);
 
  protected:
   std::vector<uint8_t>& m_buf;
@@ -62,11 +63,11 @@ class CompactProtocolWriter {
 class CompactProtocolFieldWriter {
   CompactProtocolWriter& writer;
   size_t struct_start_pos;
-  int current_field_value;
+  int current_field_value{0};
 
  public:
   CompactProtocolFieldWriter(CompactProtocolWriter& caller)
-    : writer(caller), struct_start_pos(writer.m_buf.size()), current_field_value(0)
+    : writer(caller), struct_start_pos(writer.m_buf.size())
   {
   }
 
@@ -90,6 +91,8 @@ class CompactProtocolFieldWriter {
   inline void field_bool(int field, bool b);
 
   inline void field_int8(int field, int8_t val);
+
+  inline void field_int16(int field, int16_t val);
 
   inline void field_int(int field, int32_t val);
 

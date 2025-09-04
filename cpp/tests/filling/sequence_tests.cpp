@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/cudf_gtest.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/filling.hpp>
@@ -41,8 +40,7 @@ TYPED_TEST(SequenceTypedTestFixture, Incrementing)
 
   cudf::size_type num_els = 10;
 
-  T expected[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-  cudf::test::fixed_width_column_wrapper<T> expected_w(expected, expected + num_els);
+  cudf::test::fixed_width_column_wrapper<T> expected_w({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
 
   auto result = cudf::sequence(num_els, init, step);
 
@@ -58,8 +56,8 @@ TYPED_TEST(SequenceTypedTestFixture, Decrementing)
 
   cudf::size_type num_els = 10;
 
-  T expected[] = {0, -5, -10, -15, -20, -25, -30, -35, -40, -45};
-  cudf::test::fixed_width_column_wrapper<T> expected_w(expected, expected + num_els);
+  cudf::test::fixed_width_column_wrapper<T> expected_w(
+    {0, -5, -10, -15, -20, -25, -30, -35, -40, -45});
 
   auto result = cudf::sequence(num_els, init, step);
 
@@ -75,8 +73,7 @@ TYPED_TEST(SequenceTypedTestFixture, EmptyOutput)
 
   cudf::size_type num_els = 0;
 
-  T expected[] = {};
-  cudf::test::fixed_width_column_wrapper<T> expected_w(expected, expected + num_els);
+  cudf::test::fixed_width_column_wrapper<T> expected_w({});
 
   auto result = cudf::sequence(num_els, init, step);
 
@@ -87,30 +84,43 @@ TEST_F(SequenceTestFixture, BadTypes)
 {
   cudf::string_scalar string_init("zero");
   cudf::string_scalar string_step("???");
-  EXPECT_THROW(cudf::sequence(10, string_init, string_step), cudf::logic_error);
+  EXPECT_THROW(cudf::sequence(10, string_init, string_step), std::invalid_argument);
 
   cudf::numeric_scalar<bool> bool_init(true);
   cudf::numeric_scalar<bool> bool_step(false);
-  EXPECT_THROW(cudf::sequence(10, bool_init, bool_step), cudf::logic_error);
+  EXPECT_THROW(cudf::sequence(10, bool_init, bool_step), cudf::data_type_error);
 
   cudf::timestamp_scalar<cudf::timestamp_s> ts_init(cudf::duration_s{10}, true);
   cudf::timestamp_scalar<cudf::timestamp_s> ts_step(cudf::duration_s{10}, true);
-  EXPECT_THROW(cudf::sequence(10, ts_init, ts_step), cudf::logic_error);
+  EXPECT_THROW(cudf::sequence(10, ts_init, ts_step), std::invalid_argument);
 }
 
 TEST_F(SequenceTestFixture, MismatchedInputs)
 {
   cudf::numeric_scalar<int> init(0);
   cudf::numeric_scalar<float> step(-5);
-  EXPECT_THROW(cudf::sequence(10, init, step), cudf::logic_error);
+  EXPECT_THROW(cudf::sequence(10, init, step), cudf::data_type_error);
 
   cudf::numeric_scalar<int> init2(0);
   cudf::numeric_scalar<int8_t> step2(-5);
-  EXPECT_THROW(cudf::sequence(10, init2, step2), cudf::logic_error);
+  EXPECT_THROW(cudf::sequence(10, init2, step2), cudf::data_type_error);
 
   cudf::numeric_scalar<float> init3(0);
   cudf::numeric_scalar<double> step3(-5);
-  EXPECT_THROW(cudf::sequence(10, init3, step3), cudf::logic_error);
+  EXPECT_THROW(cudf::sequence(10, init3, step3), cudf::data_type_error);
+}
+
+TEST_F(SequenceTestFixture, InvalidInput)
+{
+  cudf::numeric_scalar<int> init(0, false);
+  EXPECT_THROW(cudf::sequence(10, init), std::invalid_argument);
+  cudf::numeric_scalar<int8_t> step1(1);
+  EXPECT_THROW(cudf::sequence(10, init, step1), std::invalid_argument);
+
+  cudf::numeric_scalar<int> zero(0);
+  cudf::numeric_scalar<float> step(1, false);
+  EXPECT_THROW(cudf::sequence(10, zero, step), std::invalid_argument);
+  EXPECT_THROW(cudf::sequence(10, init, step), std::invalid_argument);
 }
 
 TYPED_TEST(SequenceTypedTestFixture, DefaultStep)
@@ -121,8 +131,7 @@ TYPED_TEST(SequenceTypedTestFixture, DefaultStep)
 
   cudf::size_type num_els = 10;
 
-  T expected[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
-  cudf::test::fixed_width_column_wrapper<T> expected_w(expected, expected + num_els);
+  cudf::test::fixed_width_column_wrapper<T> expected_w({0, 1, 2, 3, 4, 5, 6, 7, 8, 9});
 
   auto result = cudf::sequence(num_els, init);
 

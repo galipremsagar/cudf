@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@
 
 /**
  * @defgroup default_stream Default Stream
+ * @defgroup memory_resource Memory Resource Management
  * @defgroup cudf_classes Classes
  * @{
  *   @defgroup column_classes Column
@@ -174,6 +175,7 @@
  *   @defgroup nvtext_replace Replacing
  *   @defgroup nvtext_minhash MinHashing
  *   @defgroup nvtext_jaccard Jaccard Index
+ *   @defgroup nvtext_dedup Deduplication
  * @}
  * @defgroup utility_apis Utilities
  * @{

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 
 #pragma once
 
-#include "aggregate_orc_metadata.hpp"
+#include "io/orc/aggregate_orc_metadata.hpp"
+#include "io/orc/orc.hpp"
 #include "io/utilities/column_buffer.hpp"
-#include "orc.hpp"
-
-#include <cudf/io/orc.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -63,36 +61,36 @@ struct reader_column_meta {
 /**
  * @brief Function that translates ORC data kind to cuDF type enum
  */
-inline constexpr type_id to_cudf_type(orc::TypeKind kind,
+inline constexpr type_id to_cudf_type(TypeKind kind,
                                       bool use_np_dtypes,
                                       type_id timestamp_type_id,
                                       type_id decimal_type_id)
 {
   switch (kind) {
-    case orc::BOOLEAN: return type_id::BOOL8;
-    case orc::BYTE: return type_id::INT8;
-    case orc::SHORT: return type_id::INT16;
-    case orc::INT: return type_id::INT32;
-    case orc::LONG: return type_id::INT64;
-    case orc::FLOAT: return type_id::FLOAT32;
-    case orc::DOUBLE: return type_id::FLOAT64;
-    case orc::STRING:
-    case orc::BINARY:
-    case orc::VARCHAR:
-    case orc::CHAR:
+    case BOOLEAN: return type_id::BOOL8;
+    case BYTE: return type_id::INT8;
+    case SHORT: return type_id::INT16;
+    case INT: return type_id::INT32;
+    case LONG: return type_id::INT64;
+    case FLOAT: return type_id::FLOAT32;
+    case DOUBLE: return type_id::FLOAT64;
+    case STRING:
+    case BINARY:
+    case VARCHAR:
+    case CHAR:
       // Variable-length types can all be mapped to STRING
       return type_id::STRING;
-    case orc::TIMESTAMP:
+    case TIMESTAMP:
       return (timestamp_type_id != type_id::EMPTY) ? timestamp_type_id
                                                    : type_id::TIMESTAMP_NANOSECONDS;
-    case orc::DATE:
+    case DATE:
       // There isn't a (DAYS -> np.dtype) mapping
       return (use_np_dtypes) ? type_id::TIMESTAMP_MILLISECONDS : type_id::TIMESTAMP_DAYS;
-    case orc::DECIMAL: return decimal_type_id;
+    case DECIMAL: return decimal_type_id;
     // Need to update once cuDF plans to support map type
-    case orc::MAP:
-    case orc::LIST: return type_id::LIST;
-    case orc::STRUCT: return type_id::STRUCT;
+    case MAP:
+    case LIST: return type_id::LIST;
+    case STRUCT: return type_id::STRUCT;
     default: break;
   }
 
@@ -147,6 +145,6 @@ column_buffer assemble_buffer(size_type orc_col_id,
                               column_hierarchy const& selected_columns,
                               std::vector<std::vector<column_buffer>>& col_buffers,
                               rmm::cuda_stream_view stream,
-                              rmm::mr::device_memory_resource* mr);
+                              rmm::device_async_resource_ref mr);
 
 }  // namespace cudf::io::orc::detail

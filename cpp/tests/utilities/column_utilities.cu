@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,13 +31,16 @@
 #include <cudf/table/experimental/row_operators.cuh>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/type_checks.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/functional>
+#include <cuda/std/cmath>
+#include <cuda/std/iterator>
+#include <cuda/std/limits>
 #include <thrust/copy.h>
-#include <thrust/distance.h>
 #include <thrust/equal.h>
 #include <thrust/execution_policy.h>
 #include <thrust/generate.h>
@@ -238,11 +241,6 @@ std::unique_ptr<column> generate_child_row_indices(lists_column_view const& c,
 
 template <bool check_exact_equality>
 struct column_property_comparator {
-  bool types_equivalent(cudf::data_type const& lhs, cudf::data_type const& rhs)
-  {
-    return is_fixed_point(lhs) ? lhs.id() == rhs.id() : lhs == rhs;
-  }
-
   bool compare_common(cudf::column_view const& lhs,
                       cudf::column_view const& rhs,
                       cudf::column_view const& lhs_row_indices,
@@ -252,9 +250,9 @@ struct column_property_comparator {
     bool result = true;
 
     if (check_exact_equality) {
-      PROP_EXPECT_EQ(lhs.type(), rhs.type());
+      PROP_EXPECT_EQ(cudf::have_same_types(lhs, rhs), true);
     } else {
-      PROP_EXPECT_EQ(types_equivalent(lhs.type(), rhs.type()), true);
+      PROP_EXPECT_EQ(cudf::column_types_equivalent(lhs, rhs), true);
     }
 
     auto const lhs_size = check_exact_equality ? lhs.size() : lhs_row_indices.size();
@@ -274,24 +272,24 @@ struct column_property_comparator {
     return result;
   }
 
-  template <typename T,
-            std::enable_if_t<!std::is_same_v<T, cudf::list_view> &&
-                             !std::is_same_v<T, cudf::struct_view>>* = nullptr>
+  template <typename T>
   bool operator()(cudf::column_view const& lhs,
                   cudf::column_view const& rhs,
                   cudf::column_view const& lhs_row_indices,
                   cudf::column_view const& rhs_row_indices,
                   debug_output_level verbosity)
+    requires(!std::is_same_v<T, cudf::list_view> && !std::is_same_v<T, cudf::struct_view>)
   {
     return compare_common(lhs, rhs, lhs_row_indices, rhs_row_indices, verbosity);
   }
 
-  template <typename T, std::enable_if_t<std::is_same_v<T, cudf::list_view>>* = nullptr>
+  template <typename T>
   bool operator()(cudf::column_view const& lhs,
                   cudf::column_view const& rhs,
                   cudf::column_view const& lhs_row_indices,
                   cudf::column_view const& rhs_row_indices,
                   debug_output_level verbosity)
+    requires(std::is_same_v<T, cudf::list_view>)
   {
     if (!compare_common(lhs, rhs, lhs_row_indices, rhs_row_indices, verbosity)) { return false; }
 
@@ -320,12 +318,13 @@ struct column_property_comparator {
     return true;
   }
 
-  template <typename T, std::enable_if_t<std::is_same_v<T, cudf::struct_view>>* = nullptr>
+  template <typename T>
   bool operator()(cudf::column_view const& lhs,
                   cudf::column_view const& rhs,
                   cudf::column_view const& lhs_row_indices,
                   cudf::column_view const& rhs_row_indices,
                   debug_output_level verbosity)
+    requires(std::is_same_v<T, cudf::struct_view>)
   {
     if (!compare_common(lhs, rhs, lhs_row_indices, rhs_row_indices, verbosity)) { return false; }
 
@@ -404,26 +403,28 @@ class corresponding_rows_not_equivalent {
 
   struct typed_element_not_equivalent {
     template <typename T>
-    __device__ std::enable_if_t<std::is_floating_point_v<T>, bool> operator()(
-      column_device_view const& lhs,
-      column_device_view const& rhs,
-      size_type lhs_index,
-      size_type rhs_index,
-      size_type fp_ulps)
+    __device__ bool operator()(column_device_view const& lhs,
+                               column_device_view const& rhs,
+                               size_type lhs_index,
+                               size_type rhs_index,
+                               size_type fp_ulps)
+      requires(std::is_floating_point_v<T>)
     {
       if (lhs.is_valid(lhs_index) and rhs.is_valid(rhs_index)) {
         T const x = lhs.element<T>(lhs_index);
         T const y = rhs.element<T>(rhs_index);
 
         // Must handle inf and nan separately
-        if (std::isinf(x) || std::isinf(y)) {
+        if (cuda::std::isinf(x) || cuda::std::isinf(y)) {
           return x != y;  // comparison of (inf==inf) returns true
-        } else if (std::isnan(x) || std::isnan(y)) {
-          return std::isnan(x) != std::isnan(y);  // comparison of (nan==nan) returns false
+        } else if (cuda::std::isnan(x) || cuda::std::isnan(y)) {
+          return cuda::std::isnan(x) !=
+                 cuda::std::isnan(y);  // comparison of (nan==nan) returns false
         } else {
-          T const abs_x_minus_y = std::abs(x - y);
-          return abs_x_minus_y >= std::numeric_limits<T>::min() &&
-                 abs_x_minus_y > std::numeric_limits<T>::epsilon() * std::abs(x + y) * fp_ulps;
+          T const abs_x_minus_y = cuda::std::abs(x - y);
+          return abs_x_minus_y >= cuda::std::numeric_limits<T>::min() &&
+                 abs_x_minus_y >
+                   cuda::std::numeric_limits<T>::epsilon() * cuda::std::abs(x + y) * fp_ulps;
         }
       } else {
         // if either is null, then the inequality was checked already
@@ -432,7 +433,8 @@ class corresponding_rows_not_equivalent {
     }
 
     template <typename T, typename... Args>
-    __device__ std::enable_if_t<not std::is_floating_point_v<T>, bool> operator()(Args...)
+    __device__ bool operator()(Args...)
+      requires(not std::is_floating_point_v<T>)
     {
       // Non-floating point inequality is checked already
       return true;
@@ -468,7 +470,7 @@ std::string stringify_column_differences(cudf::device_span<int const> difference
   std::string const depth_str = depth > 0 ? "depth " + std::to_string(depth) + '\n' : "";
   // move the differences to the host.
   auto h_differences =
-    cudf::detail::make_host_vector_sync(differences, cudf::test::get_default_stream());
+    cudf::detail::make_host_vector(differences, cudf::test::get_default_stream());
   if (verbosity == debug_output_level::ALL_ERRORS) {
     std::ostringstream buffer;
     buffer << depth_str << "differences:" << std::endl;
@@ -554,9 +556,9 @@ struct column_comparator_impl {
                                      input_iter + lhs_row_indices.size(),
                                      diff_map.begin(),
                                      differences.begin(),
-                                     thrust::identity<bool>{});
+                                     cuda::std::identity{});
 
-    differences.resize(thrust::distance(differences.begin(), diff_iter),
+    differences.resize(cuda::std::distance(differences.begin(), diff_iter),
                        cudf::test::get_default_stream());  // shrink back down
 
     if (not differences.is_empty()) {
@@ -680,7 +682,7 @@ struct column_comparator_impl<list_view, check_exact_equality> {
         return false;
       });
 
-    differences.resize(thrust::distance(differences.begin(), diff_iter),
+    differences.resize(cuda::std::distance(differences.begin(), diff_iter),
                        cudf::test::get_default_stream());  // shrink back down
 
     if (not differences.is_empty()) {
@@ -781,7 +783,7 @@ struct column_comparator {
 
 void check_non_empty_nulls(column_view const& lhs, column_view const& rhs)
 {
-  auto check_column_nulls = [](column_view const& col, const char* col_name) {
+  auto check_column_nulls = [](column_view const& col, char const* col_name) {
     if (cudf::detail::has_nonempty_nulls(col, cudf::get_default_stream())) {
       throw std::invalid_argument(col_name + std::string(" column has non-empty nulls"));
     }
@@ -917,7 +919,7 @@ std::vector<bitmask_type> bitmask_to_host(cudf::column_view const& c)
                          static_cast<bitmask_type*>(mask.data()), num_bitmasks),
                        std::move(mask)};
     }();
-    return cudf::detail::make_std_vector_sync(bitmask_span, cudf::get_default_stream());
+    return cudf::detail::make_std_vector(bitmask_span, cudf::get_default_stream());
   } else {
     return std::vector<bitmask_type>{};
   }
@@ -945,7 +947,7 @@ std::pair<thrust::host_vector<T>, std::vector<bitmask_type>> to_host(column_view
   using Rep = typename T::rep;
 
   auto col_span       = cudf::device_span<Rep const>(c.begin<Rep>(), c.size());
-  auto host_rep_types = cudf::detail::make_host_vector_sync(col_span, cudf::get_default_stream());
+  auto host_rep_types = cudf::detail::make_host_vector(col_span, cudf::get_default_stream());
 
   auto to_fp = [&](Rep val) { return T{scaled_integer<Rep>{val, scale_type{c.type().scale()}}}; };
   auto begin = thrust::make_transform_iterator(std::cbegin(host_rep_types), to_fp);
@@ -963,15 +965,14 @@ template std::pair<thrust::host_vector<numeric::decimal128>, std::vector<bitmask
 
 namespace {
 struct strings_to_host_fn {
-  template <typename OffsetType,
-            std::enable_if_t<std::is_same_v<OffsetType, int32_t> ||
-                             std::is_same_v<OffsetType, int64_t>>* = nullptr>
+  template <typename OffsetType>
   void operator()(thrust::host_vector<std::string>& host_data,
                   char const* chars,
                   cudf::column_view const& offsets,
                   rmm::cuda_stream_view stream)
+    requires(std::is_same_v<OffsetType, int32_t> || std::is_same_v<OffsetType, int64_t>)
   {
-    auto const h_offsets = cudf::detail::make_std_vector_sync(
+    auto const h_offsets = cudf::detail::make_std_vector(
       cudf::device_span<OffsetType const>(offsets.data<OffsetType>(), offsets.size()), stream);
     // build std::string vector from chars and offsets
     std::transform(std::begin(h_offsets),
@@ -981,13 +982,12 @@ struct strings_to_host_fn {
                    [&](auto start, auto end) { return std::string(chars + start, end - start); });
   }
 
-  template <typename OffsetType,
-            std::enable_if_t<!std::is_same_v<OffsetType, int32_t> &&
-                             !std::is_same_v<OffsetType, int64_t>>* = nullptr>
+  template <typename OffsetType>
   void operator()(thrust::host_vector<std::string>&,
                   char const*,
                   cudf::column_view const&,
                   rmm::cuda_stream_view)
+    requires(!std::is_same_v<OffsetType, int32_t> && !std::is_same_v<OffsetType, int64_t>)
   {
     CUDF_FAIL("invalid offsets type");
   }
@@ -1001,7 +1001,7 @@ std::pair<thrust::host_vector<std::string>, std::vector<bitmask_type>> to_host(c
   auto stream = cudf::get_default_stream();
   if (c.size() > c.null_count()) {
     auto const scv     = strings_column_view(c);
-    auto const h_chars = cudf::detail::make_std_vector_sync<char>(
+    auto const h_chars = cudf::detail::make_std_vector<char>(
       cudf::device_span<char const>(scv.chars_begin(stream), scv.chars_size(stream)), stream);
     auto offsets =
       cudf::slice(scv.offsets(), {scv.offset(), scv.offset() + scv.size() + 1}).front();
@@ -1010,6 +1010,17 @@ std::pair<thrust::host_vector<std::string>, std::vector<bitmask_type>> to_host(c
   }
   return {std::move(host_data), bitmask_to_host(c)};
 }
+
+large_strings_enabler::large_strings_enabler(bool default_enable)
+{
+  default_enable ? enable() : disable();
+}
+
+large_strings_enabler::~large_strings_enabler() { disable(); }
+
+void large_strings_enabler::enable() { setenv("LIBCUDF_LARGE_STRINGS_ENABLED", "1", 1); }
+
+void large_strings_enabler::disable() { setenv("LIBCUDF_LARGE_STRINGS_ENABLED", "0", 1); }
 
 }  // namespace test
 }  // namespace cudf

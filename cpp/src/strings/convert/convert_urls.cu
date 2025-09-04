@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/offsets_iterator_factory.cuh>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/strings/convert/convert_urls.hpp>
 #include <cudf/strings/detail/strings_children.cuh>
@@ -28,10 +29,14 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+#include <cooperative_groups/scan.h>
 #include <cub/cub.cuh>
 
 namespace cudf {
@@ -49,8 +54,9 @@ namespace {
 //
 struct url_encoder_fn {
   column_device_view const d_strings;
-  size_type* d_offsets{};
+  size_type* d_sizes{};
   char* d_chars{};
+  cudf::detail::input_offsetalator d_offsets;
 
   // utility to create 2-byte hex characters from single binary byte
   __device__ void byte_to_hex(uint8_t byte, char* hex)
@@ -79,7 +85,7 @@ struct url_encoder_fn {
   __device__ void operator()(size_type idx)
   {
     if (d_strings.is_null(idx)) {
-      if (!d_chars) d_offsets[idx] = 0;
+      if (!d_chars) { d_sizes[idx] = 0; }
       return;
     }
 
@@ -116,7 +122,7 @@ struct url_encoder_fn {
         }
       }
     }
-    if (!d_chars) d_offsets[idx] = nbytes;
+    if (!d_chars) { d_sizes[idx] = nbytes; }
   }
 };
 
@@ -125,14 +131,14 @@ struct url_encoder_fn {
 //
 std::unique_ptr<column> url_encode(strings_column_view const& input,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   if (input.is_empty()) return make_empty_column(type_id::STRING);
 
   auto d_column = column_device_view::create(input.parent(), stream);
 
-  auto [offsets_column, chars] = cudf::strings::detail::make_strings_children(
-    url_encoder_fn{*d_column}, input.size(), stream, mr);
+  auto [offsets_column, chars] =
+    make_strings_children(url_encoder_fn{*d_column}, input.size(), stream, mr);
 
   return make_strings_column(input.size(),
                              std::move(offsets_column),
@@ -146,7 +152,7 @@ std::unique_ptr<column> url_encode(strings_column_view const& input,
 // external API
 std::unique_ptr<column> url_encode(strings_column_view const& input,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::url_encode(input, stream, mr);
@@ -200,11 +206,16 @@ CUDF_KERNEL void url_decode_char_counter(column_device_view const in_strings,
   __shared__ char temporary_buffer[num_warps_per_threadblock][char_block_size + halo_size];
   __shared__ typename cub::WarpReduce<int8_t>::TempStorage cub_storage[num_warps_per_threadblock];
 
+  namespace cg     = cooperative_groups;
+  auto const block = cg::this_thread_block();
+  auto const warp  = cg::tiled_partition<cudf::detail::warp_size>(block);
+
   auto const global_thread_id = cudf::detail::grid_1d::global_thread_id();
   auto const global_warp_id   = static_cast<size_type>(global_thread_id / cudf::detail::warp_size);
-  auto const local_warp_id    = static_cast<size_type>(threadIdx.x / cudf::detail::warp_size);
-  auto const warp_lane        = static_cast<size_type>(threadIdx.x % cudf::detail::warp_size);
-  auto const nwarps     = static_cast<size_type>(gridDim.x * blockDim.x / cudf::detail::warp_size);
+  auto const local_warp_id    = static_cast<size_type>(warp.meta_group_rank());
+  auto const warp_lane        = static_cast<size_type>(warp.thread_rank());
+  auto const nwarps =
+    static_cast<size_type>(cudf::detail::grid_1d::grid_stride() / cudf::detail::warp_size);
   char* in_chars_shared = temporary_buffer[local_warp_id];
 
   // Loop through strings, and assign each string to a warp.
@@ -237,7 +248,7 @@ CUDF_KERNEL void url_decode_char_counter(column_device_view const in_strings,
         in_chars_shared[char_idx] = in_idx < string_length ? in_chars[in_idx] : 0;
       }
 
-      __syncwarp();
+      warp.sync();
 
       // `char_idx_start` represents the start character index of the current warp.
       for (size_type char_idx_start = 0; char_idx_start < string_length_block;
@@ -254,7 +265,7 @@ CUDF_KERNEL void url_decode_char_counter(column_device_view const in_strings,
 
         if (warp_lane == 0) { escape_char_count += total_escape_char; }
 
-        __syncwarp();
+        warp.sync();
       }
     }
     // URL decoding replaces 3 bytes with 1 for each escape character.
@@ -285,11 +296,16 @@ CUDF_KERNEL void url_decode_char_replacer(column_device_view const in_strings,
   __shared__ typename cub::WarpScan<int8_t>::TempStorage cub_storage[num_warps_per_threadblock];
   __shared__ size_type out_idx[num_warps_per_threadblock];
 
+  namespace cg     = cooperative_groups;
+  auto const block = cg::this_thread_block();
+  auto const warp  = cg::tiled_partition<cudf::detail::warp_size>(block);
+
   auto const global_thread_id = cudf::detail::grid_1d::global_thread_id();
   auto const global_warp_id   = static_cast<size_type>(global_thread_id / cudf::detail::warp_size);
-  auto const local_warp_id    = static_cast<size_type>(threadIdx.x / cudf::detail::warp_size);
-  auto const warp_lane        = static_cast<size_type>(threadIdx.x % cudf::detail::warp_size);
-  auto const nwarps     = static_cast<size_type>(gridDim.x * blockDim.x / cudf::detail::warp_size);
+  auto const local_warp_id    = static_cast<size_type>(warp.meta_group_rank());
+  auto const warp_lane        = static_cast<size_type>(warp.thread_rank());
+  auto const nwarps =
+    static_cast<size_type>(cudf::detail::grid_1d::grid_stride() / cudf::detail::warp_size);
   char* in_chars_shared = temporary_buffer[local_warp_id];
 
   // Loop through strings, and assign each string to a warp
@@ -320,7 +336,7 @@ CUDF_KERNEL void url_decode_char_replacer(column_device_view const in_strings,
         in_chars_shared[char_idx] = in_idx >= 0 && in_idx < string_length ? in_chars[in_idx] : 0;
       }
 
-      __syncwarp();
+      warp.sync();
 
       // `char_idx_start` represents the start character index of the current warp.
       for (size_type char_idx_start = 0; char_idx_start < string_length_block;
@@ -358,7 +374,7 @@ CUDF_KERNEL void url_decode_char_replacer(column_device_view const in_strings,
           out_idx[local_warp_id] += (out_offset + out_size);
         }
 
-        __syncwarp();
+        warp.sync();
       }
     }
   }
@@ -369,7 +385,7 @@ CUDF_KERNEL void url_decode_char_replacer(column_device_view const in_strings,
 //
 std::unique_ptr<column> url_decode(strings_column_view const& strings,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   size_type strings_count = strings.size();
   if (strings_count == 0) return make_empty_column(type_id::STRING);
@@ -416,7 +432,7 @@ std::unique_ptr<column> url_decode(strings_column_view const& strings,
 
 std::unique_ptr<column> url_decode(strings_column_view const& input,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::url_decode(input, stream, mr);

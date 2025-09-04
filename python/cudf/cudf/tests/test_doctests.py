@@ -1,15 +1,16 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION.
 import contextlib
 import doctest
 import inspect
 import io
 import itertools
-import os
 
 import numpy as np
 import pytest
+from packaging import version
 
 import cudf
+from cudf.core._compat import PANDAS_CURRENT_SUPPORTED_VERSION, PANDAS_VERSION
 
 pytestmark = pytest.mark.filterwarnings("ignore::FutureWarning")
 
@@ -32,9 +33,6 @@ def _find_doctests_in_obj(obj, finder=None, criteria=None):
     ----------
     obj : module or class
         The object to search for docstring examples.
-    finder : doctest.DocTestFinder, optional
-        The DocTestFinder object to use. If not provided, a DocTestFinder is
-        constructed.
     criteria : callable, optional
         Callable indicating whether to recurse over members of the provided
         object. If not provided, names not defined in the object's ``__all__``
@@ -72,24 +70,32 @@ def _find_doctests_in_obj(obj, finder=None, criteria=None):
 
 class TestDoctests:
     @pytest.fixture(autouse=True)
-    def chdir_to_tmp_path(cls, tmp_path):
-        # Some doctests generate files, so this fixture runs the tests in a
-        # temporary directory.
-        original_directory = os.getcwd()
-        os.chdir(tmp_path)
-        yield
-        os.chdir(original_directory)
+    def printoptions(cls):
+        # TODO: NumPy now prints scalars as `np.int8(1)`, etc. this should
+        #       be adapted evantually.
+        if version.parse(np.__version__) >= version.parse("2.0"):
+            with np.printoptions(legacy="1.25"):
+                yield
+        else:
+            yield
 
     @pytest.mark.parametrize(
         "docstring",
-        itertools.chain(*[_find_doctests_in_obj(mod) for mod in tests]),
+        itertools.chain.from_iterable(
+            _find_doctests_in_obj(mod) for mod in tests
+        ),
         ids=lambda docstring: docstring.name,
     )
-    def test_docstring(self, docstring):
+    @pytest.mark.skipif(
+        PANDAS_VERSION < PANDAS_CURRENT_SUPPORTED_VERSION,
+        reason="Doctests not expected to pass on older versions of pandas",
+    )
+    def test_docstring(self, docstring, monkeypatch, tmp_path):
         # We ignore differences in whitespace in the doctest output, and enable
         # the use of an ellipsis "..." to match any string in the doctest
         # output. An ellipsis is useful for, e.g., memory addresses or
         # imprecise floating point values.
+        monkeypatch.chdir(tmp_path)
         optionflags = doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
         runner = doctest.DocTestRunner(optionflags=optionflags)
 

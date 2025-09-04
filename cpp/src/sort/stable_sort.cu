@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "common_sort_impl.cuh"
 #include "sort_impl.cuh"
+#include "sort_radix.hpp"
 
 #include <cudf/column/column.hpp>
 #include <cudf/detail/gather.hpp>
@@ -24,6 +24,7 @@
 #include <cudf/sorting.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
@@ -33,7 +34,7 @@ std::unique_ptr<column> stable_sorted_order(table_view const& input,
                                             std::vector<order> const& column_order,
                                             std::vector<null_order> const& null_precedence,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   return sorted_order<sort_method::STABLE>(input, column_order, null_precedence, stream, mr);
 }
@@ -42,14 +43,12 @@ std::unique_ptr<table> stable_sort(table_view const& input,
                                    std::vector<order> const& column_order,
                                    std::vector<null_order> const& null_precedence,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
-  if (inplace_column_sort_fn<sort_method::STABLE>::is_usable(input)) {
-    auto output = std::make_unique<column>(input.column(0), stream, mr);
-    auto view   = output->mutable_view();
+  // fast-path sort conditions: single, fixed-width column with no nulls
+  if (input.num_columns() == 1 && is_radix_sortable(input.column(0))) {
     auto order  = (column_order.empty() ? order::ASCENDING : column_order.front());
-    cudf::type_dispatcher<dispatch_storage_type>(
-      output->type(), inplace_column_sort_fn<sort_method::STABLE>{}, view, order, stream);
+    auto output = sort_radix(input.column(0), order == order::ASCENDING, stream, mr);
     std::vector<std::unique_ptr<column>> columns;
     columns.emplace_back(std::move(output));
     return std::make_unique<table>(std::move(columns));
@@ -62,13 +61,13 @@ std::unique_ptr<table> stable_sort_by_key(table_view const& values,
                                           std::vector<order> const& column_order,
                                           std::vector<null_order> const& null_precedence,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(values.num_rows() == keys.num_rows(),
                "Mismatch in number of rows for values and keys");
 
   auto sorted_order = detail::stable_sorted_order(
-    keys, column_order, null_precedence, stream, rmm::mr::get_current_device_resource());
+    keys, column_order, null_precedence, stream, cudf::get_current_device_resource_ref());
 
   return detail::gather(values,
                         sorted_order->view(),
@@ -83,7 +82,7 @@ std::unique_ptr<column> stable_sorted_order(table_view const& input,
                                             std::vector<order> const& column_order,
                                             std::vector<null_order> const& null_precedence,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::stable_sorted_order(input, column_order, null_precedence, stream, mr);
@@ -93,7 +92,7 @@ std::unique_ptr<table> stable_sort(table_view const& input,
                                    std::vector<order> const& column_order,
                                    std::vector<null_order> const& null_precedence,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::stable_sort(input, column_order, null_precedence, stream, mr);
@@ -104,7 +103,7 @@ std::unique_ptr<table> stable_sort_by_key(table_view const& values,
                                           std::vector<order> const& column_order,
                                           std::vector<null_order> const& null_precedence,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::stable_sort_by_key(values, keys, column_order, null_precedence, stream, mr);

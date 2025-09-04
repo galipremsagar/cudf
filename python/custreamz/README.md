@@ -26,7 +26,7 @@ tips_df = consumer.read_gdf(topic="custreamz_tips",
                         partition=0,
                         start=0,
                         end=10000,
-                        message_format="CSV")
+                        message_format="csv")
 
 print(tips_df.head())
 tips_df['tip_percentage'] = tips_df['tip'] / tips_df['total_bill'] * 100
@@ -48,13 +48,13 @@ Please see the [Demo Docker Repository](https://hub.docker.com/r/rapidsai/rapids
 
 ### CUDA/GPU requirements
 
-* CUDA 11.0+
-* NVIDIA driver 450.80.02+
+* CUDA 12.0+
+* NVIDIA driver 525.60.13+
 * Volta architecture or better (Compute Capability >=7.0)
 
 ### Conda
 
-cuStreamz is installed with conda ([miniconda](https://conda.io/miniconda.html), or the full [Anaconda distribution](https://www.anaconda.com/download)) from the `rapidsai` or `rapidsai-nightly` channel:
+cuStraamz can be installed with conda (via [miniforge](https://github.com/conda-forge/miniforge)) from the `rapidsai` channel:
 
 Release:
 ```bash

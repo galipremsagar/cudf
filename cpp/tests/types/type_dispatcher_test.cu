@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/device_uvector.hpp>
@@ -49,6 +50,12 @@ TYPED_TEST(TypedDispatcherTest, TypeToId)
 {
   EXPECT_TRUE(cudf::type_dispatcher(cudf::data_type{cudf::type_to_id<TypeParam>()},
                                     type_tester<TypeParam>{}));
+  EXPECT_TRUE(cudf::type_dispatcher(cudf::data_type{cudf::type_to_id<TypeParam const>()},
+                                    type_tester<TypeParam>{}));
+  EXPECT_TRUE(cudf::type_dispatcher(cudf::data_type{cudf::type_to_id<TypeParam volatile>()},
+                                    type_tester<TypeParam>{}));
+  EXPECT_TRUE(cudf::type_dispatcher(cudf::data_type{cudf::type_to_id<TypeParam const volatile>()},
+                                    type_tester<TypeParam>{}));
 }
 
 namespace {
@@ -69,8 +76,8 @@ CUDF_KERNEL void dispatch_test_kernel(cudf::type_id id, bool* d_result)
 
 TYPED_TEST(TypedDispatcherTest, DeviceDispatch)
 {
-  auto result = cudf::detail::make_zeroed_device_uvector_sync<bool>(
-    1, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+  auto result = cudf::detail::make_zeroed_device_uvector<bool>(
+    1, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   dispatch_test_kernel<<<1, 1, 0, cudf::get_default_stream().value()>>>(
     cudf::type_to_id<TypeParam>(), result.data());
   CUDF_CUDA_TRY(cudaDeviceSynchronize());
@@ -130,8 +137,8 @@ CUDF_KERNEL void double_dispatch_test_kernel(cudf::type_id id1, cudf::type_id id
 
 TYPED_TEST(TypedDoubleDispatcherTest, DeviceDoubleDispatch)
 {
-  auto result = cudf::detail::make_zeroed_device_uvector_sync<bool>(
-    1, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+  auto result = cudf::detail::make_zeroed_device_uvector<bool>(
+    1, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   double_dispatch_test_kernel<<<1, 1, 0, cudf::get_default_stream().value()>>>(
     cudf::type_to_id<TypeParam>(), cudf::type_to_id<TypeParam>(), result.data());
   CUDF_CUDA_TRY(cudaDeviceSynchronize());
