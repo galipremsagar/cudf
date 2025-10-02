@@ -148,6 +148,28 @@ def test_series_to_pandas_arrow_type_nullable_raises(scalar):
         ser.to_pandas(nullable=True, arrow_type=True)
 
 
+def test_to_pandas_nullable_integer():
+    gsr_not_null = cudf.Series([1, 2, 3])
+    gsr_has_null = cudf.Series([1, 2, None])
+
+    psr_not_null = pd.Series([1, 2, 3], dtype="int64")
+    psr_has_null = pd.Series([1, 2, None], dtype="Int64")
+
+    assert_eq(gsr_not_null.to_pandas(), psr_not_null)
+    assert_eq(gsr_has_null.to_pandas(nullable=True), psr_has_null)
+
+
+def test_to_pandas_nullable_bool():
+    gsr_not_null = cudf.Series([True, False, True])
+    gsr_has_null = cudf.Series([True, False, None])
+
+    psr_not_null = pd.Series([True, False, True], dtype="bool")
+    psr_has_null = pd.Series([True, False, None], dtype="boolean")
+
+    assert_eq(gsr_not_null.to_pandas(), psr_not_null)
+    assert_eq(gsr_has_null.to_pandas(nullable=True), psr_has_null)
+
+
 @pytest.mark.parametrize(
     "scalar",
     [
@@ -220,9 +242,28 @@ def test_to_from_pandas_nulls(nulls):
     elif nulls == "all":
         # Fill all the values with NaT
         pd_data[:] = np.datetime64("nat", "ns")
-    gdf_data = cudf.Series.from_pandas(pd_data)
+    gdf_data = cudf.Series(pd_data)
 
     expect = pd_data
     got = gdf_data.to_pandas()
 
     assert_eq(expect, got)
+
+
+@pytest.mark.parametrize("data", [["a"], ["a", None], [None]])
+def test_string_export(data):
+    ps = pd.Series(data, dtype="str", name="nice name")
+    gs = cudf.Series(data, dtype="str", name="nice name")
+
+    expect = ps
+    got = gs.to_pandas()
+    assert_eq(expect, got)
+
+    expect = np.array(ps)
+    got = gs.to_numpy()
+    assert_eq(expect, got)
+
+    expect = pa.Array.from_pandas(ps)
+    got = gs.to_arrow()
+
+    assert pa.Array.equals(expect, got)
