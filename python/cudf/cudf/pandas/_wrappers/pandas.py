@@ -174,6 +174,7 @@ def Timestamp_Timedelta__new__(cls, *args, **kwargs):
     # hence this method is needed.
     self, _ = _fast_slow_function_call(
         lambda cls, args, kwargs: cls(*args, **kwargs),
+        None,
         cls,
         args,
         kwargs,
@@ -277,6 +278,7 @@ def _DataFrame_dtypes_apply_func(value):
 def _DataFrame__dtypes(self):
     result = _fast_slow_function_call(
         lambda self: self.dtypes,
+        None,
         self,
     )[0]
     result = _maybe_wrap_result(
@@ -289,6 +291,7 @@ def _DataFrame__dtypes(self):
 def _DataFrame_columns(self):
     result = _fast_slow_function_call(
         lambda self: self.columns,
+        None,
         self,
     )[0]
     result.force_state(_State.SLOW)
@@ -323,6 +326,7 @@ def custom_repr_html(obj):
     # for ipython
     return _fast_slow_function_call(
         lambda obj: obj._repr_html_(),
+        None,
         obj,
     )[0]
 
@@ -373,6 +377,7 @@ def Index__new__(cls, *args, **kwargs):
     # make_final_proxy_type provides.
     self, _ = _fast_slow_function_call(
         lambda cls, args, kwargs: cls(*args, **kwargs),
+        None,
         cls,
         args,
         kwargs,
@@ -2315,6 +2320,40 @@ def _unpickle_offset_obj(pickled_args):
         data.pop("_use_relativedelta")
     obj = pd._libs.tslibs.offsets.DateOffset(**data)
     return obj
+
+
+# original_hasattr = builtins.hasattr
+
+
+# def optimized_hasattr(obj, name):
+#     """
+#     Custom hasattr implementation that tries to avoid expensive lookups
+#     """
+
+#     obj_type = type(obj)
+
+#     # Fast path for proxy objects - check the wrapped object directly
+#     if obj_type is DataFrame:
+#         return original_hasattr(obj._fsproxy_wrapped, name)
+
+#     # Fast path for common built-in types that don't use __getattr__
+#     if obj_type in (int, float, str, list, dict, tuple, set, frozenset):
+#         return (
+#             name in dir(obj_type) or name in obj.__dict__
+#             if original_hasattr(obj, "__dict__")
+#             else name in dir(obj_type)
+#         )
+
+#     # Fast path using __dict__ lookup for objects that have it
+#     if original_hasattr(obj, "__dict__"):
+#         if name in obj.__dict__:
+#             return True
+
+#     # Fall back to original hasattr for complex cases (objects with custom __getattr__)
+#     return original_hasattr(obj, name)
+
+
+# builtins.hasattr = optimized_hasattr
 
 
 copyreg.dispatch_table[pd.Timestamp] = _reduce_obj

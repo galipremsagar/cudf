@@ -175,6 +175,7 @@ def make_final_proxy_type(
             lambda cls, args, kwargs: setattr(
                 self, "_fsproxy_wrapped", cls(*args, **kwargs)
             ),
+            None,
             type(self),
             args,
             kwargs,
@@ -810,6 +811,7 @@ class _CallableProxyMixin:
     __class__ = types.FunctionType  # type: ignore
 
     def __call__(self, *args, **kwargs) -> Any:
+        # kwargs["transfer_block"] = getattr(self, "_fsproxy_instance_transfer_block", None)
         result, _ = _fast_slow_function_call(
             # We cannot directly call self here because we need it to be
             # converted into either the fast or slow object (by
@@ -817,8 +819,10 @@ class _CallableProxyMixin:
             # TODO: When Python 3.11 is the minimum supported Python version
             # this can use operator.call
             call_operator,
+            getattr(self, "_fsproxy_instance_transfer_block", None),
             self,
             args,
+            # transfer_block=getattr(self, "_fsproxy_instance_transfer_block", None),
             kwargs,
         )
         return result
@@ -941,11 +945,15 @@ class _FastSlowAttribute:
                 self._attr = _MethodProxy(
                     fast_attr,
                     slow_attr,
+                    _fsproxy_instance_transfer_block=getattr(
+                        instance, "_fsproxy_instance_transfer_block", None
+                    ),
                 )
             else:
                 # for anything else, use a fast-slow attribute:
                 self._attr, _ = _fast_slow_function_call(
                     getattr,
+                    None,
                     owner,
                     self._name,
                 )
@@ -970,6 +978,7 @@ class _FastSlowAttribute:
                     )
                 return _fast_slow_function_call(
                     getattr,
+                    None,
                     instance,
                     self._name,
                 )[0]
@@ -978,7 +987,10 @@ class _FastSlowAttribute:
 
 
 class _MethodProxy(_FunctionProxy):
-    def __init__(self, fast, slow):
+    def __init__(self, fast, slow, _fsproxy_instance_transfer_block=None):
+        self._fsproxy_instance_transfer_block = (
+            _fsproxy_instance_transfer_block
+        )
         super().__init__(
             fast,
             slow,
@@ -1079,6 +1091,7 @@ def _slow_function_call():
 
 def _fast_slow_function_call(
     func: Callable,
+    transfer_block: _State | None = None,
     /,
     *args,
     **kwargs,
@@ -1094,7 +1107,12 @@ def _fast_slow_function_call(
     from .module_accelerator import disable_module_accelerator
 
     fast = False
+    is_mixed_type_error = False
+    # transfer_block = kwargs.pop("transfer_block", None)
+    # kwargs = kwargs.get("kwargs", kwargs)
     try:
+        if transfer_block is _State.SLOW:
+            raise Exception("Forcing slow path due to transfer blocking")
         with nvtx.annotate(
             "EXECUTE_FAST",
             color=_CUDF_PANDAS_NVTX_COLORS["EXECUTE_FAST"],
@@ -1139,6 +1157,13 @@ def _fast_slow_function_call(
                             f"The exception was {e}."
                         )
     except Exception as err:
+        # print(err)
+        if type(err) is AttributeError:
+            raise err
+        # if type(err) is cudf.errors.MixedTypeError:
+        #     # print("MixedTypeError encountered, forcing SLOW path.")
+        #     is_mixed_type_error = True
+
         with nvtx.annotate(
             "EXECUTE_SLOW",
             color=_CUDF_PANDAS_NVTX_COLORS["EXECUTE_SLOW"],
@@ -1154,7 +1179,10 @@ def _fast_slow_function_call(
             _slow_function_call()
             with disable_module_accelerator():
                 result = func(*slow_args, **slow_kwargs)
-    return _maybe_wrap_result(result, func, *args, **kwargs), fast
+    result = _maybe_wrap_result(result, func, *args, **kwargs)
+    if is_mixed_type_error:
+        result.force_state(_State.SLOW)
+    return result, fast
 
 
 def _transform_arg(
