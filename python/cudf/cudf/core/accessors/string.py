@@ -24,6 +24,10 @@ from cudf.utils.dtypes import (
     can_convert_to_column,
 )
 from cudf.utils.scalar import pa_scalar_to_plc_scalar
+from cudf.api.types import (
+    _is_categorical_dtype,
+    is_string_dtype,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -86,10 +90,17 @@ class StringMethods(BaseAccessor):
             if isinstance(parent.dtype, ListDtype)
             else parent.dtype
         )
-        if value_type != CUDF_STRING_DTYPE:
+        if value_type != CUDF_STRING_DTYPE and not (
+            cudf.get_option("mode.pandas_compatible") and is_string_dtype(value_type)
+        ) and not (
+            _is_categorical_dtype(value_type)
+            and is_string_dtype(value_type.categories.dtype)
+        ):
             raise AttributeError(
                 "Can only use .str accessor with string values"
             )
+        if _is_categorical_dtype(value_type):
+            parent = parent.astype(value_type.categories.dtype)
         super().__init__(parent=parent)
 
     def htoi(self) -> Series | Index:

@@ -1213,7 +1213,6 @@ def test_constructor_properties(dataframe, series, index):
     _, df = dataframe
     _, sr = series
     _, idx = index
-
     assert df._constructor is xpd.DataFrame
     assert sr._constructor is xpd.Series
     assert idx._constructor is xpd.Index

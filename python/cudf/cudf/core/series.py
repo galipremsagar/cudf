@@ -4229,6 +4229,8 @@ class DatetimeProperties(BaseDatelikeProperties):
         """
         return self._return_result_like_self(self.series._column.weekday)
 
+    day_of_week = dayofweek
+
     @property  # type: ignore
     @_performance_tracking
     def dayofyear(self) -> Series:
@@ -4559,6 +4561,65 @@ class DatetimeProperties(BaseDatelikeProperties):
         dtype: int16
         """
         return self._return_result_like_self(self.series._column.days_in_month)
+
+    daysinmonth = days_in_month
+
+    @property
+    def freq(self) -> str | None:
+        """
+        Returns the frequency of the DatetimeIndex.
+
+        Returns
+        -------
+        str or None
+            The frequency of the DatetimeIndex, None if it is not set.
+
+        Examples
+        --------
+        >>> import pandas as pd, cudf
+        >>> s = cudf.Series(
+        ...     pd.date_range(start='2000-08-01', end='2001-08-01', freq='1M'))
+        >>> s.dt.freq
+        '1M'
+        """
+        raise NotImplementedError("freq is not yet implemented.")
+
+    @property  # type: ignore
+    def tz(self) -> str | None:
+        """
+        Returns the timezone of the DatetimeIndex.
+
+        Returns
+        -------
+        str or None
+            The timezone of the DatetimeIndex, None if it is not set.
+
+        Examples
+        --------
+        >>> import pandas as pd, cudf
+        >>> s = cudf.Series(
+        ...     pd.date_range(start='2000-08-01', end='2001-08-01', freq='1M',
+        ...                   tz='US/Eastern'))
+        >>> s.dt.tz
+        'US/Eastern'
+        """
+        raise NotImplementedError("tz is not yet implemented.")
+
+    @property
+    def date(self):
+        raise NotImplementedError("date is not yet implemented.")
+
+    @property
+    def time(self):
+        raise NotImplementedError("date is not yet implemented.")
+
+    @property
+    def timetz(self):
+        raise NotImplementedError("timetz is not yet implemented.")
+
+    @property
+    def unit(self):
+        raise NotImplementedError("unit is not yet implemented.")
 
     @property  # type: ignore
     @_performance_tracking

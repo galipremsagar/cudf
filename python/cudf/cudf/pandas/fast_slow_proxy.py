@@ -10,6 +10,7 @@ import operator
 import pickle
 import types
 import warnings
+import cudf
 from collections.abc import Callable, Iterator, Mapping
 from enum import IntEnum
 from typing import Any, Literal
@@ -75,6 +76,9 @@ class _State(IntEnum):
     SLOW = 0
     FAST = 1
 
+class ProxyAttributeError(AttributeError):
+    """Custom AttributeError for proxy objects."""
+    pass
 
 class _Unusable:
     """
@@ -96,7 +100,7 @@ class _Unusable:
         raise TypeError("Unusable type. Falling back to the slow object")
 
     def __repr__(self) -> str:
-        raise AttributeError("Unusable type. Falling back to the slow object")
+        raise ProxyAttributeError("Unusable type. Falling back to the slow object")
 
 
 class _PickleConstructor:
@@ -950,6 +954,17 @@ class _FastSlowAttribute:
                     ),
                 )
             else:
+                if self._private:
+                    if instance is not None:
+                        return _maybe_wrap_result(
+                            getattr(instance._fsproxy_slow, self._name),
+                            None,  # type: ignore
+                        )
+                    else:
+                        return _maybe_wrap_result(
+                            getattr(owner._fsproxy_slow, self._name),
+                            None,  # type: ignore
+                        )
                 # for anything else, use a fast-slow attribute:
                 self._attr, _ = _fast_slow_function_call(
                     getattr,
@@ -1160,9 +1175,9 @@ def _fast_slow_function_call(
         # print(err)
         if type(err) is AttributeError:
             raise err
-        # if type(err) is cudf.errors.MixedTypeError:
-        #     # print("MixedTypeError encountered, forcing SLOW path.")
-        #     is_mixed_type_error = True
+        if type(err) is cudf.errors.MixedTypeError:
+            # print("MixedTypeError encountered, forcing SLOW path.")
+            is_mixed_type_error = True
 
         with nvtx.annotate(
             "EXECUTE_SLOW",
@@ -1180,7 +1195,7 @@ def _fast_slow_function_call(
             with disable_module_accelerator():
                 result = func(*slow_args, **slow_kwargs)
     result = _maybe_wrap_result(result, func, *args, **kwargs)
-    if is_mixed_type_error:
+    if is_mixed_type_error and isinstance(result, _FastSlowProxy):
         result.force_state(_State.SLOW)
     return result, fast
 

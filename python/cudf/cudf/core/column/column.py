@@ -1137,13 +1137,13 @@ class ColumnBase(Serializable, BinaryOperand, Reducible):
     ) -> ColumnBase:
         # Might be able to remove if we share more of
         # DatetimeColumn._binaryop & TimedeltaColumn._binaryop
-        if self.has_nulls() and other.has_nulls():
+        if self.has_nulls() and (isinstance(other, ColumnBase) and other.has_nulls()):
             result_mask = (
                 self._get_mask_as_column() & other._get_mask_as_column()
             )
         elif self.has_nulls():
             result_mask = self._get_mask_as_column()
-        elif other.has_nulls():
+        elif isinstance(other, ColumnBase) and other.has_nulls():
             result_mask = other._get_mask_as_column()
         else:
             result_mask = None
@@ -3138,7 +3138,11 @@ def as_column(
                     from_pandas=True,
                 )
             else:
-                if not isinstance(dtype, np.dtype):
+                if isinstance(dtype, (CategoricalDtype,
+                                    DecimalDtype,
+                                    IntervalDtype,
+                                    ListDtype,
+                                    StructDtype)):
                     dtype = dtype.to_pandas()
                 arbitrary = pd.Series(arbitrary, dtype=dtype)
         return as_column(arbitrary, nan_as_null=nan_as_null, dtype=dtype)

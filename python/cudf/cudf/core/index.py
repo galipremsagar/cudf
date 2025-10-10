@@ -27,6 +27,9 @@ from cudf.api.types import (
     is_list_like,
     is_scalar,
 )
+from cudf.api.types import (
+    is_string_dtype,
+)
 from cudf.core._compat import PANDAS_LT_300
 from cudf.core._internals import copying, sorting, stream_compaction
 from cudf.core.accessors import StringMethods
@@ -218,6 +221,10 @@ class Index(SingleColumnFrame):  # type: ignore[misc]
         # Subclasses should initialize with
         # SingleColumnFrame.__init__(self, {name: column})
         return None
+
+    @property
+    def _constructor(self):
+        return Index
 
     @property
     def _constructor_expanddim(self):
@@ -1891,6 +1898,10 @@ class Index(SingleColumnFrame):  # type: ignore[misc]
         result.name = name
         return result
 
+    @cached_property
+    def inferred_type(self) -> str:
+        return str(self.dtype)
+
     @_performance_tracking
     def memory_usage(self, deep: bool = False) -> int:
         return self._column.memory_usage
@@ -2505,7 +2516,7 @@ class Index(SingleColumnFrame):  # type: ignore[misc]
     @copy_docstring(StringMethods)
     @_performance_tracking
     def str(self):
-        if self.dtype == CUDF_STRING_DTYPE:
+        if self.dtype == CUDF_STRING_DTYPE or (cudf.get_option("mode.pandas_compatible") and is_string_dtype(self.dtype)) or (isinstance(self, CategoricalIndex) and is_string_dtype(self.dtype.categories.dtype)):
             return StringMethods(parent=self)
         else:
             raise AttributeError(
@@ -2604,6 +2615,14 @@ class RangeIndex(Index):
         # There is no metadata to be copied for RangeIndex since it does not
         # have an underlying column.
         return self
+
+    @property
+    def _constructor(self):
+        return RangeIndex
+    
+    @cached_property
+    def inferred_type(self) -> str:
+        return "integer"
 
     @property
     @_performance_tracking
@@ -3563,6 +3582,14 @@ class DatetimeIndex(Index):
         super()._copy_type_metadata(other)
         self._freq = _validate_freq(other._freq)
         return self
+
+    @property
+    def _constructor(self):
+        return DatetimeIndex
+    
+    @cached_property
+    def inferred_type(self) -> str:
+        return "datetime64"
 
     @classmethod
     def _from_data(
@@ -4529,6 +4556,14 @@ class TimedeltaIndex(Index):
             self, ColumnAccessor({name: col}, verify=False)
         )
 
+    @property
+    def _constructor(self):
+        return TimedeltaIndex
+
+    @cached_property
+    def inferred_type(self) -> str:
+        return "datetime64"
+
     @classmethod
     @_performance_tracking
     def _from_column(
@@ -4796,8 +4831,10 @@ class CategoricalIndex(Index):
         ):
             data = data._column
         else:
+            if dtype is None or (isinstance(dtype, str) and dtype == "category"):
+                dtype = cudf.CategoricalDtype()
             data = as_column(
-                data, dtype=cudf.CategoricalDtype() if dtype is None else dtype
+                data, dtype=dtype
             )
             # dtype has already been taken care
             dtype = None
@@ -4822,6 +4859,14 @@ class CategoricalIndex(Index):
         if not isinstance(column.dtype, cudf.CategoricalDtype):
             raise ValueError("column must have a categorial type.")
         return super()._from_column(column, name=name)
+
+    @property
+    def _constructor(self):
+        return CategoricalIndex
+
+    @cached_property
+    def inferred_type(self) -> str:
+        return "categorical"
 
     @classmethod
     def from_codes(
@@ -5210,8 +5255,24 @@ class IntervalIndex(Index):
         )
 
     @property
+    def _constructor(self):
+        return IntervalIndex
+    
+    @cached_property
+    def inferred_type(self) -> str:
+        return "interval"
+
+    @property
     def closed(self) -> Literal["left", "right", "neither", "both"]:
         return self.dtype.closed
+    
+    @property
+    def closed_left(self):
+        return self.closed in ("left", "both")
+    
+    @property
+    def closed_right(self):
+        return self.closed in ("right", "both")
 
     @classmethod
     @_performance_tracking

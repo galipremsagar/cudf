@@ -27,30 +27,31 @@ def _get_color_for_nvtx(name):
 def _performance_tracking(func, domain="cudf_python"):
     """Decorator for applying performance tracking (if enabled)."""
 
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        with contextlib.ExitStack() as stack:
-            if get_option("memory_profiling"):
-                # NB: the user still needs to call `rmm.statistics.enable_statistics()`
-                #     to enable memory profiling.
-                stack.enter_context(
-                    rmm.statistics.profiler(
-                        name=rmm.statistics._get_descriptive_name_of_object(
-                            func
-                        )
-                    )
-                )
-            if nvtx.enabled():
-                stack.enter_context(
-                    nvtx.annotate(
-                        message=func.__qualname__,
-                        color=_get_color_for_nvtx(func.__qualname__),
-                        domain=domain,
-                    )
-                )
-            return func(*args, **kwargs)
+    # @functools.wraps(func)
+    # def wrapper(*args, **kwargs):
+    #     with contextlib.ExitStack() as stack:
+    #         if get_option("memory_profiling"):
+    #             # NB: the user still needs to call `rmm.statistics.enable_statistics()`
+    #             #     to enable memory profiling.
+    #             stack.enter_context(
+    #                 rmm.statistics.profiler(
+    #                     name=rmm.statistics._get_descriptive_name_of_object(
+    #                         func
+    #                     )
+    #                 )
+    #             )
+    #         if nvtx.enabled():
+    #             stack.enter_context(
+    #                 nvtx.annotate(
+    #                     message=func.__qualname__,
+    #                     color=_get_color_for_nvtx(func.__qualname__),
+    #                     domain=domain,
+    #                 )
+    #             )
+    #         return func(*args, **kwargs)
 
-    return wrapper
+    # return wrapper
+    return func
 
 
 _dask_cudf_performance_tracking = functools.partial(

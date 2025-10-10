@@ -974,6 +974,7 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
         dtype=None,
         copy=None,
         nan_as_null=no_default,
+        shortcut=False,
     ):
         if copy is not None:
             raise NotImplementedError("copy is not currently implemented.")
@@ -1016,6 +1017,11 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
                 # Checks duplicate columns and sets column metadata
                 df.columns = data.columns
                 data = df
+            if shortcut:
+                self._data = data._data
+                self._index = data.index
+                self._attrs = attrs
+                return
             col_accessor = data._data
             index, second_index = data.index, index
             second_columns = columns
@@ -3966,11 +3972,12 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
 
         """
         dtypes = [dtype for _, dtype in self._dtypes]
-        common_dtype = find_common_type(dtypes)
-        if common_dtype.kind != "b" and any(
-            dtype.kind == "b" for dtype in dtypes
-        ):
-            raise MixedTypeError("Cannot create a column with mixed types")
+        if len(dtypes):
+            common_dtype = find_common_type(dtypes)
+            if common_dtype.kind != "b" and any(
+                dtype.kind == "b" for dtype in dtypes
+            ):
+                raise MixedTypeError("Cannot create a column with mixed types")
 
         if any(dt == CUDF_STRING_DTYPE for dt in dtypes):
             raise NotImplementedError(
@@ -5995,7 +6002,8 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
             )
         if nrows is not None:
             raise NotImplementedError("nrows is currently not supported.")
-
+        if not isinstance(data, np.ndarray):
+            raise TypeError("data must be a numpy ndarray")
         if data.ndim != 1 and data.ndim != 2:
             raise ValueError(
                 f"records dimension expected 1 or 2 but found {data.ndim}"
@@ -8778,7 +8786,7 @@ def from_pandas(obj, nan_as_null=no_default):
         nan_as_null = False if get_option("mode.pandas_compatible") else None
 
     if isinstance(obj, pd.DataFrame):
-        return DataFrame(obj, nan_as_null=nan_as_null)
+        return DataFrame(obj, nan_as_null=nan_as_null, shortcut=True)
     elif isinstance(obj, pd.Series):
         return Series(obj, nan_as_null=nan_as_null)
     # This carveout for cudf.pandas is undesirable, but fixes crucial issues

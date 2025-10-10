@@ -110,6 +110,38 @@ class Aggregation:
     prod = product
 
     @classmethod
+    def shift(cls, periods: int) -> Self:
+        raise NotImplementedError("shift aggregation is not implemented")
+
+    @classmethod
+    def ffill(cls) -> Self:
+        raise NotImplementedError("ffill aggregation is not implemented")
+
+    @classmethod
+    def bfill(cls) -> Self:
+        raise NotImplementedError("bfill aggregation is not implemented")
+
+    @classmethod
+    def ngroup(cls) -> Self:
+        raise NotImplementedError("ngroup aggregation is not implemented")
+
+    @classmethod
+    def pct_change(cls, periods: int = 1) -> Self:
+        raise NotImplementedError("pct_change aggregation is not implemented")
+
+    @classmethod
+    def sem(cls, ddof: int = 1) -> Self:
+        raise NotImplementedError("sem aggregation is not implemented")
+
+    @classmethod
+    def diff(cls, periods: int = 1) -> Self:
+        raise NotImplementedError("diff aggregation is not implemented")
+
+    @classmethod
+    def skew(cls) -> Self:
+        raise NotImplementedError("skew aggregation is not implemented")
+    
+    @classmethod
     def sum_of_squares(cls) -> Self:
         return cls(plc.aggregation.sum_of_squares())
 

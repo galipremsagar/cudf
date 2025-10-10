@@ -1646,10 +1646,9 @@ class Frame(BinaryOperand, Scannable, Serializable):
             (left_column, right_column, reflect, fill_value),
         ) in operands.items():
             output_mask = None
+            left_is_column = isinstance(left_column, ColumnBase)
+            right_is_column = isinstance(right_column, ColumnBase)
             if fill_value is not None:
-                left_is_column = isinstance(left_column, ColumnBase)
-                right_is_column = isinstance(right_column, ColumnBase)
-
                 if left_is_column and right_is_column:
                     # If both columns are nullable, pandas semantics dictate
                     # that nulls that are present in both left_column and

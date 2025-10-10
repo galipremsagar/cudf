@@ -250,6 +250,11 @@ _CategoricalAccessor = make_intermediate_proxy_type(
     pd.core.arrays.categorical.CategoricalAccessor,
 )
 
+SparseAccessor = make_intermediate_proxy_type(
+    "SparseAccessor",
+    _Unusable,
+    pd.core.arrays.sparse.accessor.SparseAccessor,
+)
 
 def _DataFrame__dir__(self):
     # Column names that are string identifiers are added to the dir of the
@@ -317,6 +322,14 @@ DataFrame = make_final_proxy_type(
         "columns": property(_DataFrame_columns),
         "attrs": _FastSlowAttribute("attrs"),
         "__array_ufunc__": _FastSlowAttribute("__array_ufunc__"),
+        "style": _FastSlowAttribute("style", private=True),
+        "_mgr": _FastSlowAttribute("_mgr", private=True),
+        "plot": _FastSlowAttribute("plot", private=True),
+        "sparse": _FastSlowAttribute("sparse", private=True),
+        "expanding": _FastSlowAttribute("expanding", private=True),
+        "_AXIS_LEN": _FastSlowAttribute("_AXIS_LEN", private=True),
+        "_AXIS_TO_AXIS_NUMBER": _FastSlowAttribute("_AXIS_TO_AXIS_NUMBER", private=True),
+        "_AXIS_ORDERS": _FastSlowAttribute("_AXIS_ORDERS", private=True),
     },
 )
 
@@ -366,6 +379,12 @@ Series = make_final_proxy_type(
         "_accessors": set(),
         "dtype": property(_Series_dtype),
         "attrs": _FastSlowAttribute("attrs"),
+        "_mgr": _FastSlowAttribute("_mgr", private=True),
+        "array": _FastSlowAttribute("array", private=True),
+        "sparse": _FastSlowAttribute("sparse", private=True),
+        "_AXIS_LEN": _FastSlowAttribute("_AXIS_LEN", private=True),
+        "_AXIS_TO_AXIS_NUMBER": _FastSlowAttribute("_AXIS_TO_AXIS_NUMBER", private=True),
+        "_AXIS_ORDERS": _FastSlowAttribute("_AXIS_ORDERS", private=True),
     },
 )
 
@@ -422,6 +441,7 @@ Index = make_final_proxy_type(
         "_data": _FastSlowAttribute("_data", private=True),
         "_mask": _FastSlowAttribute("_mask", private=True),
         "name": _FastSlowAttribute("name"),
+        "nbytes": _FastSlowAttribute("nbytes", private=True),
     },
 )
 
@@ -436,6 +456,7 @@ RangeIndex = make_final_proxy_type(
         "__init__": _DELETE,
         "__setattr__": Index__setattr__,
         "name": _FastSlowAttribute("name"),
+        "nbytes": _FastSlowAttribute("nbytes", private=True),
     },
 )
 
@@ -466,6 +487,7 @@ ArrowDtype = make_final_proxy_type(
     },
 )
 
+
 SparseArray = make_final_proxy_type(
     "SparseDtype",
     _Unusable,
@@ -485,6 +507,7 @@ CategoricalIndex = make_final_proxy_type(
         "__init__": _DELETE,
         "__setattr__": Index__setattr__,
         "name": _FastSlowAttribute("name"),
+        "nbytes": _FastSlowAttribute("nbytes", private=True),
     },
 )
 
@@ -520,6 +543,8 @@ DatetimeIndex = make_final_proxy_type(
         "_data": _FastSlowAttribute("_data", private=True),
         "_mask": _FastSlowAttribute("_mask", private=True),
         "name": _FastSlowAttribute("name"),
+        "array": _FastSlowAttribute("array", private=True),
+        "nbytes": _FastSlowAttribute("nbytes", private=True),
     },
 )
 
@@ -559,6 +584,8 @@ TimedeltaIndex = make_final_proxy_type(
         "_data": _FastSlowAttribute("_data", private=True),
         "_mask": _FastSlowAttribute("_mask", private=True),
         "name": _FastSlowAttribute("name"),
+        "array": _FastSlowAttribute("array", private=True),
+        "nbytes": _FastSlowAttribute("nbytes", private=True),
     },
 )
 
@@ -684,14 +711,14 @@ Grouper = make_final_proxy_type(
         **{
             k: getattr(fast, k)
             for k in {"key", "level", "freq", "closed", "label"}
-            if getattr(fast, k) is not None
+            if getattr(fast, k, None) is not None
         }
     ),
     slow_to_fast=lambda slow: cudf.Grouper(
         **{
             k: getattr(slow, k)
             for k in {"key", "level", "freq", "closed", "label"}
-            if getattr(slow, k) is not None
+            if getattr(slow, k, None) is not None
         }
     ),
 )
@@ -912,6 +939,8 @@ IntervalIndex = make_final_proxy_type(
         "_data": _FastSlowAttribute("_data", private=True),
         "_mask": _FastSlowAttribute("_mask", private=True),
         "name": _FastSlowAttribute("name"),
+        "array": _FastSlowAttribute("array", private=True),
+        "nbytes": _FastSlowAttribute("nbytes", private=True),
     },
 )
 
