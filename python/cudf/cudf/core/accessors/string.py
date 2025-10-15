@@ -28,6 +28,7 @@ from cudf.api.types import (
     _is_categorical_dtype,
     is_string_dtype,
 )
+from cudf.core.accessors.lists import ListMethods
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -2324,6 +2325,8 @@ class StringMethods(BaseAccessor):
         2    f
         dtype: object
         """
+        if isinstance(self._column.dtype, ListDtype):
+            return ListMethods(self._parent).get(i)  # type: ignore[return-value]
         str_lens = self.len()
         if i < 0:
             next_index = i - 1

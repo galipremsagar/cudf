@@ -1900,7 +1900,10 @@ class Index(SingleColumnFrame):  # type: ignore[misc]
 
     @cached_property
     def inferred_type(self) -> str:
-        return str(self.dtype)
+        infer_type = str(self.dtype)
+        if infer_type == "object":
+            return "string"
+        return infer_type
 
     @_performance_tracking
     def memory_usage(self, deep: bool = False) -> int:

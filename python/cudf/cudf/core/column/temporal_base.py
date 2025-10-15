@@ -27,6 +27,7 @@ from cudf.utils.dtypes import (
     is_pandas_nullable_extension_dtype,
 )
 from cudf.utils.utils import is_na_like
+from cudf.core.mixins import Scannable
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     from cudf.core.column.string import StringColumn
 
 
-class TemporalBaseColumn(ColumnBase):
+class TemporalBaseColumn(ColumnBase, Scannable):
     """
     Base class for TimeDeltaColumn and DatetimeColumn.
     """
@@ -47,6 +48,12 @@ class TemporalBaseColumn(ColumnBase):
     _UNDERLYING_DTYPE = np.dtype(np.int64)
     _NP_SCALAR: np.datetime64 | np.timedelta64
     _PD_SCALAR: pd.Timestamp | pd.Timedelta
+    _VALID_SCANS = {
+        "cumsum",
+        "cumprod",
+        "cummin",
+        "cummax",
+    }
 
     def __init__(
         self,
@@ -310,12 +317,24 @@ class TemporalBaseColumn(ColumnBase):
     def can_cast_safely(self, to_dtype: DtypeObj) -> bool:
         if to_dtype.kind == self.dtype.kind:  # type: ignore[union-attr]
             to_res, _ = np.datetime_data(to_dtype)
+            if cudf.get_option("mode.pandas_compatible"):
+                max_val = self.max()
+                if isinstance(max_val, (pd.Timedelta, pd.Timestamp)):
+                    max_val = max_val.to_numpy()
+                max_val = max_val.astype(self._UNDERLYING_DTYPE, copy=False)
+                min_val = self.min()
+                if isinstance(min_val, (pd.Timedelta, pd.Timestamp)):
+                    min_val = min_val.to_numpy()
+                min_val = min_val.astype(self._UNDERLYING_DTYPE, copy=False)
+            else:
+                max_val = self.max().astype(self._UNDERLYING_DTYPE, copy=False)
+                min_val = self.min().astype(self._UNDERLYING_DTYPE, copy=False)
             max_dist = np.timedelta64(
-                self.max().astype(self._UNDERLYING_DTYPE, copy=False),
+                max_val,
                 self.time_unit,
             )
             min_dist = np.timedelta64(
-                self.min().astype(self._UNDERLYING_DTYPE, copy=False),
+                min_val,
                 self.time_unit,
             )
             max_to_res = np.timedelta64(

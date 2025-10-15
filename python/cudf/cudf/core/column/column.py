@@ -9,7 +9,7 @@ from functools import cached_property
 from itertools import chain
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
-
+from decimal import Decimal
 import cupy as cp
 import numpy as np
 import pandas as pd
@@ -74,6 +74,7 @@ from cudf.utils.dtypes import (
     is_pandas_nullable_extension_dtype,
     min_signed_type,
     np_dtypes_to_pandas_dtypes,
+    get_dtype_of_same_kind,
 )
 from cudf.utils.scalar import pa_scalar_to_plc_scalar
 from cudf.utils.utils import (
@@ -1137,11 +1138,12 @@ class ColumnBase(Serializable, BinaryOperand, Reducible):
     ) -> ColumnBase:
         # Might be able to remove if we share more of
         # DatetimeColumn._binaryop & TimedeltaColumn._binaryop
+        # import pdb;pdb.set_trace()
         if self.has_nulls() and (isinstance(other, ColumnBase) and other.has_nulls()):
             result_mask = (
                 self._get_mask_as_column() & other._get_mask_as_column()
             )
-        elif self.has_nulls():
+        elif self.has_nulls() and (not isinstance(other, ColumnBase) and other not in {np.nan, None, pd.NaT, float("nan")} and not (isinstance(other, Decimal) and other.is_nan()) and not (isinstance(other, float) and np.isnan(other))):
             result_mask = self._get_mask_as_column()
         elif isinstance(other, ColumnBase) and other.has_nulls():
             result_mask = other._get_mask_as_column()
@@ -1149,7 +1151,7 @@ class ColumnBase(Serializable, BinaryOperand, Reducible):
             result_mask = None
 
         result_col = as_column(
-            bool_fill_value, dtype=np.dtype(np.bool_), length=len(self)
+            bool_fill_value, dtype=get_dtype_of_same_kind(self.dtype, np.dtype(np.bool_)), length=len(self)
         )
         if result_mask is not None:
             result_col = result_col.set_mask(result_mask.as_mask())
@@ -1686,7 +1688,10 @@ class ColumnBase(Serializable, BinaryOperand, Reducible):
             result.dtype,
             (cudf.Decimal128Dtype, cudf.Decimal64Dtype, cudf.Decimal32Dtype),
         ):
-            result.dtype.precision = dtype.precision  # type: ignore[union-attr]
+            if cudf.get_option("mode.pandas_compatible") and not isinstance(dtype, DecimalDtype):
+                result._dtype = dtype
+            else:
+                result.dtype.precision = dtype.precision  # type: ignore[union-attr]
         if cudf.get_option("mode.pandas_compatible") and result.dtype != dtype:
             result._dtype = dtype
         return result

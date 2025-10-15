@@ -330,6 +330,7 @@ DataFrame = make_final_proxy_type(
         "_AXIS_LEN": _FastSlowAttribute("_AXIS_LEN", private=True),
         "_AXIS_TO_AXIS_NUMBER": _FastSlowAttribute("_AXIS_TO_AXIS_NUMBER", private=True),
         "_AXIS_ORDERS": _FastSlowAttribute("_AXIS_ORDERS", private=True),
+        "flags": _FastSlowAttribute("flags", private=True),
     },
 )
 
@@ -385,6 +386,7 @@ Series = make_final_proxy_type(
         "_AXIS_LEN": _FastSlowAttribute("_AXIS_LEN", private=True),
         "_AXIS_TO_AXIS_NUMBER": _FastSlowAttribute("_AXIS_TO_AXIS_NUMBER", private=True),
         "_AXIS_ORDERS": _FastSlowAttribute("_AXIS_ORDERS", private=True),
+        "flags": _FastSlowAttribute("flags", private=True),
     },
 )
 
@@ -442,6 +444,7 @@ Index = make_final_proxy_type(
         "_mask": _FastSlowAttribute("_mask", private=True),
         "name": _FastSlowAttribute("name"),
         "nbytes": _FastSlowAttribute("nbytes", private=True),
+        "array": _FastSlowAttribute("array", private=True),
     },
 )
 
@@ -457,6 +460,7 @@ RangeIndex = make_final_proxy_type(
         "__setattr__": Index__setattr__,
         "name": _FastSlowAttribute("name"),
         "nbytes": _FastSlowAttribute("nbytes", private=True),
+        "array": _FastSlowAttribute("array", private=True),
     },
 )
 
@@ -508,6 +512,7 @@ CategoricalIndex = make_final_proxy_type(
         "__setattr__": Index__setattr__,
         "name": _FastSlowAttribute("name"),
         "nbytes": _FastSlowAttribute("nbytes", private=True),
+        "array": _FastSlowAttribute("array", private=True),
     },
 )
 

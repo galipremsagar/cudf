@@ -233,6 +233,8 @@ class DecimalBaseColumn(NumericalBaseColumn):
                     other = other.astype(self.dtype)
             other_cudf_dtype = other.dtype
         elif isinstance(other, (int, Decimal)):
+            if cudf.get_option("mode.pandas_compatible") and not isinstance(self.dtype, DecimalDtype):
+                raise NotImplementedError("hi")
             other_cudf_dtype = self.dtype._from_decimal(Decimal(other))
         elif is_na_like(other):
             other = pa.scalar(None, type=cudf_dtype_to_pa_type(self.dtype))

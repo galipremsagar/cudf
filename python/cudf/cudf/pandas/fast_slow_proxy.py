@@ -1173,8 +1173,8 @@ def _fast_slow_function_call(
                         )
     except Exception as err:
         # print(err)
-        if type(err) is AttributeError:
-            raise err
+        # if type(err) is AttributeError:
+        #     raise err
         if type(err) is cudf.errors.MixedTypeError:
             # print("MixedTypeError encountered, forcing SLOW path.")
             is_mixed_type_error = True

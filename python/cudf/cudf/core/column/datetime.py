@@ -637,6 +637,13 @@ class DatetimeColumn(TemporalBaseColumn):
         else:
             return result_col
 
+    def _scan(self, op: str):
+        if op not in {"cummin", "cummax"}:
+            raise TypeError(f"Accumulation {op} not supported for {type(self)}")
+        return self.scan(op.replace("cum", ""), True)._with_type_metadata(
+            self.dtype
+        )
+
     def _with_type_metadata(self, dtype) -> DatetimeColumn:
         if isinstance(dtype, pd.DatetimeTZDtype):
             return DatetimeTZColumn(

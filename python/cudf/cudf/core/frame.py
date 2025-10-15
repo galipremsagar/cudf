@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import cupy
 import numpy as np
 import pyarrow as pa
+import pandas as pd
 from typing_extensions import Self
 
 import pylibcudf as plc
@@ -181,6 +182,17 @@ class Frame(BinaryOperand, Scannable, Serializable):
         )
         return cls._from_data(col_accessor)
 
+    @_performance_tracking
+    def nans_to_nulls(self):
+        result = []
+        for col in self._columns:
+            converted = col.nans_to_nulls()
+            if converted is col:
+                converted = converted.copy()
+            result.append(converted)
+        return self._from_data_like_self(
+            self._data._from_columns_like_self(result)
+        )
     @classmethod
     @_performance_tracking
     def _from_data(cls, data: MutableMapping) -> Self:
@@ -1681,7 +1693,7 @@ class Frame(BinaryOperand, Scannable, Serializable):
                 if reflect
                 else getattr(operator, fn)(left_column, right_column)
             )
-            if isinstance(outcol, bool) and fn in {"__eq__", "__ne__"}:
+            if isinstance(outcol, bool) and fn in {"__eq__", "__ne__"} and right_column is not pd.NA:
                 # Both columns returned NotImplemented, Python compared using is/is not
                 # TODO: A better solution is to ensure each Column._binaryop
                 # implementation accounts for this case.

@@ -85,6 +85,7 @@ from cudf.core.index import (
 )
 from cudf.core.indexed_frame import (
     IndexedFrame,
+    Frame,
     _FrameIndexer,
     _indices_from_labels,
     doc_reset_index_template,
@@ -3769,6 +3770,7 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
     def rename(
         self,
         mapper=None,
+        *,
         index=None,
         columns=None,
         axis=0,
@@ -6422,7 +6424,7 @@ class DataFrame(IndexedFrame, GetAttrGetItemMixin):
         # https://github.com/rapidsai/cudf/issues/7556
 
         def make_false_column_like_self():
-            return as_column(False, length=len(self), dtype="bool")
+            return as_column(False, length=len(self), dtype=np.dtype("bool"))
 
         # Preprocess different input types into a mapping from column names to
         # a list of values to check.
@@ -8829,6 +8831,10 @@ def from_pandas(obj, nan_as_null=no_default):
 def merge(left, right, *args, **kwargs):
     if isinstance(left, Series):
         left = left.to_frame()
+    if not isinstance(left, Frame):
+        raise TypeError("left must be a Series or DataFrame")
+    if not isinstance(right, Frame):
+        raise TypeError("right must be a Series or DataFrame")
     return left.merge(right, *args, **kwargs)
 
 
