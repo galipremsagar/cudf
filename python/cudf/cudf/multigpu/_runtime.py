@@ -83,6 +83,7 @@ class DeviceRuntime:
         initial_pool_fraction: float = 0.05,
         max_pool_fraction: float = 0.90,
         validate_transfers: bool = True,
+        memory_resource: str = "pool",
     ) -> None:
         if devices is None:
             devices = visible_devices()
@@ -121,11 +122,27 @@ class DeviceRuntime:
                     )
                     initial = _align_down(int(free * initial_pool_fraction))
                     maximum = _align_down(int(free * max_pool_fraction))
-                    mr = rmm.mr.PoolMemoryResource(
-                        rmm.mr.CudaMemoryResource(),
-                        initial_pool_size=initial,
-                        maximum_pool_size=maximum,
-                    )
+                    if memory_resource == "async":
+                        # cudaMallocAsync returns memory to the driver once a
+                        # pool exceeds its release threshold. A classic RMM
+                        # pool never does, so a long sequence of queries keeps
+                        # every peak it ever reached and eventually cannot
+                        # satisfy a large request even though little is live.
+                        mr = rmm.mr.CudaAsyncMemoryResource(
+                            initial_pool_size=initial,
+                            release_threshold=initial,
+                        )
+                    elif memory_resource == "pool":
+                        mr = rmm.mr.PoolMemoryResource(
+                            rmm.mr.CudaMemoryResource(),
+                            initial_pool_size=initial,
+                            maximum_pool_size=maximum,
+                        )
+                    else:
+                        raise ValueError(
+                            f"unknown memory_resource {memory_resource!r}; "
+                            "use 'pool' or 'async'"
+                        )
                     rmm.mr.set_per_device_resource(d, mr)
                     self._mrs[d] = mr
             finally:

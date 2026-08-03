@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import os
 import signal
 import time
@@ -65,6 +66,10 @@ def main() -> None:
     parser.add_argument("--devices", default=None)
     parser.add_argument("--pool-fraction", type=float, default=0.90)
     parser.add_argument("--initial-pool-fraction", type=float, default=0.05)
+    parser.add_argument("--memory-resource", default="pool",
+                        choices=["pool", "async"],
+                        help="'async' returns memory to the driver between "
+                             "queries; needed at large scale factors")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--strict", action="store_true",
                         help="turn any pandas fallback into an error")
@@ -88,6 +93,7 @@ def main() -> None:
         npartitions=args.npartitions,
         max_pool_fraction=args.pool_fraction,
         initial_pool_fraction=args.initial_pool_fraction,
+        memory_resource=args.memory_resource,
     )
 
     import cudf.multigpu as mgpu
@@ -112,6 +118,11 @@ def main() -> None:
     print(f"\n{'query':>6}  {'status':<10}{'time':>10}  detail")
     print("-" * 78)
     for number in numbers:
+        # Chunked frames form reference cycles (indexers and accessors hold the
+        # frame), so without an explicit collection the previous query's device
+        # memory is still held when the next one starts. At 300 GB that is the
+        # difference between finishing and running out.
+        gc.collect()
         query = getattr(PDSHQueries, f"q{number}")
         best = None
         try:
