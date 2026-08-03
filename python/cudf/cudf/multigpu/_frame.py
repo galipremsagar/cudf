@@ -792,6 +792,13 @@ class _FallbackMixin:
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
+        # Attribute-style column access (``df.price``). pandas code uses this
+        # constantly, and under the accelerated-pandas backend the proxy
+        # resolves it against this instance -- so without it, every such
+        # access falls back and drags the frame to host memory.
+        columns = getattr(self, "_column_names_for_attrs", None)
+        if columns is not None and name in columns:
+            return self[name]
         # ``__getattr__`` also fires when a *defined* property raises
         # AttributeError internally.  Surfacing that as "no such attribute"
         # hides real bugs, so distinguish the two cases explicitly.
@@ -1223,6 +1230,14 @@ class ChunkedDataFrame(_ChunkedCommon):
     @property
     def columns(self):
         return self._meta.columns
+
+    @property
+    def _column_names_for_attrs(self):
+        """Column names, for attribute-style access. Never raises."""
+        try:
+            return self._meta.columns
+        except Exception:
+            return ()
 
     @columns.setter
     def columns(self, value) -> None:

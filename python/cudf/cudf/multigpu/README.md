@@ -61,14 +61,23 @@ python -m cudf.multigpu.tpch_pdsh --path /data/tpch/sf100c --scale 100
 python -m cudf.multigpu.tpch_pdsh --path /data/tpch/sf1c --scale 1 --validate
 ```
 
-At SF1, all 22 queries run and all 22 results match single-GPU `cudf.pandas`
-exactly. `--validate` re-runs the same queries on stock single-GPU
-`cudf.pandas` in a subprocess and compares; `--strict` turns any silent
-fall-back-to-pandas into an error, which matters because a fallback copies the
-whole frame to host memory.
+Results on 8 × 97 GiB, all with `--strict` (any fall-back-to-pandas raises):
+
+| scale | queries | total | notes |
+| --- | --- | --- | --- |
+| SF1   | 22/22 | 10.3 s | all 22 results match single-GPU `cudf.pandas` |
+| SF100 | 22/22 | 117 s  | q1 is 91 s of that: cold start; the rest ~1 s each |
+
+**Always use `--strict` when assessing coverage.** A fall-back to pandas
+returns the *right answer* — it just computes it on the host. It is therefore
+invisible if you only check results, and it was: 18 of the 22 queries initially
+"passed", and matched the single-GPU reference, while never touching the GPUs.
+The tell was SF100 sitting at 0% GPU utilization with 181 GiB of resident host
+memory. `--validate` checks answers; `--strict` checks that the answers were
+actually computed where you think.
 
 For reference, stock single-GPU `cudf.pandas` also completes all 22 queries at
-SF1 with `CUDF_PANDAS_FAIL_ON_FALLBACK=1`, i.e. with no CPU fallback:
+SF1 with no CPU fallback:
 
 ```
 CUDF_PANDAS_FAIL_ON_FALLBACK=1 python -m cudf.pandas._benchmarks.pdsh all \
