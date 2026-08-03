@@ -126,15 +126,25 @@ def build(
     return _wrap_like(runtime.run_many(jobs), targets, runtime)
 
 
-def concat(objs: Sequence[ChunkedFrame], **kwargs) -> ChunkedFrame:
-    """Concatenate multi-GPU frames row-wise, preserving chunk placement."""
+def concat(objs: Sequence[Any], **kwargs) -> ChunkedFrame:
+    """Concatenate multi-GPU frames row-wise, preserving chunk placement.
+
+    Chunks are not moved: the result simply owns every input's chunks in
+    order, so concatenating is free.
+    """
+    from ._frame import unwrap_proxy
+
     chunks: list[Any] = []
     devices: list[int] = []
     runtime = None
-    for obj in objs:
+    resolved = [unwrap_proxy(obj) for obj in objs]
+    for obj in resolved:
         if not isinstance(obj, ChunkedFrame):
             raise TypeError(f"expected a chunked frame, got {type(obj).__name__}")
         runtime = runtime or obj.runtime
         chunks.extend(obj._chunks)
         devices.extend(obj._devices)
-    return _wrap_like(chunks, devices, runtime)
+    out = _wrap_like(chunks, devices, runtime)
+    if kwargs.get("ignore_index"):
+        out = out.reset_index(drop=True)
+    return out

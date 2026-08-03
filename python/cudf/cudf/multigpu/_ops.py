@@ -89,6 +89,42 @@ def _normalize_agg_spec(spec, columns: Sequence[Hashable], keys: Sequence[Hashab
     return plan, multi
 
 
+def _named_aggregations(kwargs: dict) -> list[tuple]:
+    """Parse pandas' named-aggregation kwargs into ``[(out, column, agg)]``.
+
+    Accepts both ``pd.NamedAgg(column=..., aggfunc=...)`` and the bare
+    ``(column, aggfunc)`` tuple form.
+    """
+    plan: list[tuple] = []
+    for name, value in kwargs.items():
+        column = getattr(value, "column", None)
+        aggfunc = getattr(value, "aggfunc", None)
+        if column is None and isinstance(value, tuple) and len(value) == 2:
+            column, aggfunc = value
+        if column is None or aggfunc is None:
+            continue
+        plan.append((name, column, aggfunc))
+    return plan
+
+
+def _local_named_agg(chunk, keys, plan, as_index, sort, dropna):
+    grouped = chunk.groupby(keys, as_index=False, sort=sort, dropna=dropna)
+    spec: dict = {}
+    for _out, column, agg in plan:
+        spec.setdefault(column, [])
+        if agg not in spec[column]:
+            spec[column].append(agg)
+    aggregated = grouped.agg(spec)
+    aggregated.columns = [
+        c if not isinstance(c, tuple) else (c[0] if c[1] == "" else f"{c[0]}__{c[1]}")
+        for c in aggregated.columns.to_flat_index()
+    ]
+    out = aggregated[list(keys)].copy()
+    for name, column, agg in plan:
+        out[name] = aggregated[f"{column}__{agg}"]
+    return out.set_index(list(keys)) if as_index else out
+
+
 def _partial_name(col: Hashable, agg: str) -> str:
     return f"__mg_{col}__{agg}"
 
@@ -134,16 +170,42 @@ class ChunkedGroupBy:
         return max(self._frame.nchunks, self._frame.runtime.n_devices)
 
     # -- entry points ------------------------------------------------
-    def agg(self, spec, **kwargs):
+    def agg(self, spec=None, **kwargs):
         frame = self._frame_as_dataframe()
         keys = self._keys
-        plan, multi = _normalize_agg_spec(spec, list(frame.columns), keys)
+        named = _named_aggregations(kwargs)
+        if spec is None and named:
+            plan, multi = named, False
+            kwargs = {k: v for k, v in kwargs.items() if k not in dict(
+                (name, None) for name, _c, _a in named
+            )}
+        elif spec is None:
+            raise TypeError(
+                "agg() needs either an aggregation spec or named aggregations"
+            )
+        else:
+            plan, multi = _normalize_agg_spec(spec, list(frame.columns), keys)
         aggs = {a for _o, _c, a in plan}
         if aggs and aggs <= (set(_DECOMPOSABLE) | {"mean"}):
             result = self._tree_agg(frame, plan, multi)
-        else:
+        elif spec is not None:
             result = self._shuffle_agg(spec, **kwargs)
+        else:
+            result = self._shuffle_agg_plan(plan)
         return self._maybe_squeeze(result, spec)
+
+    def _shuffle_agg_plan(self, plan):
+        """Shuffle-then-aggregate for a named-aggregation plan."""
+        frame = self._frame_as_dataframe()
+        shuffled = hash_shuffle(frame, self._keys, nparts=self._nparts())
+        return shuffled.map_chunks(
+            _local_named_agg,
+            keys=self._keys,
+            plan=plan,
+            as_index=self._as_index,
+            sort=self._sort,
+            dropna=self._dropna,
+        )
 
     def _maybe_squeeze(self, result, spec):
         """``gb["v"].sum()`` is a Series -- but only when ``as_index=True``.

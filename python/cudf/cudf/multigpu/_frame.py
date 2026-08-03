@@ -35,6 +35,11 @@ __all__ = ["ChunkedFrame", "ChunkedDataFrame", "ChunkedSeries", "ChunkedIndex"]
 #: meant to be indistinguishable from a pandas frame.
 SHOW_PLACEMENT_IN_REPR = True
 
+#: Chunks to split into when a frame is constructed directly (e.g.
+#: ``pd.DataFrame({...})`` under the accelerated-pandas backend). ``None``
+#: means one chunk per GPU. Set by ``pandas_compat.install``.
+DEFAULT_NPARTITIONS: int | None = None
+
 
 def _banner(label: str, frame) -> str:
     return f"<{label} {frame._repr_summary()}>\n" if SHOW_PLACEMENT_IN_REPR else ""
@@ -77,6 +82,46 @@ def _to_host(obj):
     if isinstance(obj, _FRAME_TYPES):
         return obj.to_pandas()
     return obj
+
+
+def _construct(cudf_type, data, kwargs):
+    """Build a single-GPU cuDF object on the calling thread's device."""
+    if data is None:
+        return cudf_type(**kwargs)
+    return cudf_type(data, **kwargs)
+
+
+def _construct_distributed(cudf_type, data, kwargs, runtime):
+    """Build from user data and spread the result over the GPUs.
+
+    Direct construction has to distribute like ``from_pandas`` does; leaving
+    the result on one device would quietly make everything derived from it
+    single-GPU.
+    """
+    from . import _transfer
+
+    source = runtime.devices[0]
+    built = runtime.run(source, _construct, cudf_type, data, kwargs)
+    nrows = len(built)
+    npartitions = DEFAULT_NPARTITIONS or runtime.n_devices
+    npartitions = max(1, min(npartitions, nrows))
+    if npartitions <= 1:
+        return [built], [source]
+
+    devices = list(runtime.devices)
+    targets = [devices[i % len(devices)] for i in range(npartitions)]
+    bounds = _even_bounds(nrows, npartitions)
+    pieces = runtime.run(
+        source,
+        lambda o, b: [o.iloc[b[i] : b[i + 1]] for i in range(len(b) - 1)],
+        built,
+        bounds,
+    )
+    moved = _transfer.move_batch(
+        [(piece, source, target) for piece, target in zip(pieces, targets)],
+        runtime=runtime,
+    )
+    return moved, targets
 
 
 def _to_device(obj):
@@ -147,11 +192,21 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
 
     def __init__(
         self,
-        chunks: Sequence[Any],
-        devices: Sequence[int],
+        chunks: Sequence[Any] = None,
+        devices: Sequence[int] | None = None,
         runtime: DeviceRuntime | None = None,
         lengths: Sequence[int] | None = None,
+        **kwargs: Any,
     ) -> None:
+        # Two calling conventions. Internally this is (chunks, devices, ...).
+        # Externally -- e.g. `pd.DataFrame({...})` under the accelerated-pandas
+        # backend -- it is a normal constructor, and `devices` is absent. In
+        # that case build the object with cuDF and keep it as a single chunk.
+        if devices is None:
+            runtime = runtime or get_runtime()
+            chunks, devices = _construct_distributed(
+                type(self)._cudf_type, chunks, kwargs, runtime
+            )
         chunks = list(chunks)
         devices = [int(d) for d in devices]
         if len(chunks) != len(devices):

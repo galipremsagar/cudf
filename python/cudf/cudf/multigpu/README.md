@@ -45,6 +45,36 @@ python -m cudf.multigpu.demo --gib 500 --chunks-per-device 4 \
 python -m cudf.multigpu.coverage --list
 ```
 
+## TPC-H / PDS-H
+
+cuDF's own PDS-H queries (`cudf.pandas._benchmarks.pdsh`) run unmodified on
+this backend. Generate data with
+[tpchgen-rs](https://github.com/clflushopt/tpchgen-rs), convert the DECIMAL and
+DATE columns the benchmarks cannot do arithmetic on, then run:
+
+```
+pip install tpchgen-cli
+tpchgen-cli parquet -s 100 --output-dir=/data/tpch/sf100
+python -m cudf.multigpu.tpch_convert --src /data/tpch/sf100 --dst /data/tpch/sf100c
+
+python -m cudf.multigpu.tpch_pdsh --path /data/tpch/sf100c --scale 100
+python -m cudf.multigpu.tpch_pdsh --path /data/tpch/sf1c --scale 1 --validate
+```
+
+At SF1, all 22 queries run and all 22 results match single-GPU `cudf.pandas`
+exactly. `--validate` re-runs the same queries on stock single-GPU
+`cudf.pandas` in a subprocess and compares; `--strict` turns any silent
+fall-back-to-pandas into an error, which matters because a fallback copies the
+whole frame to host memory.
+
+For reference, stock single-GPU `cudf.pandas` also completes all 22 queries at
+SF1 with `CUDF_PANDAS_FAIL_ON_FALLBACK=1`, i.e. with no CPU fallback:
+
+```
+CUDF_PANDAS_FAIL_ON_FALLBACK=1 python -m cudf.pandas._benchmarks.pdsh all \
+    --executor in-memory --path /data/tpch/sf1c
+```
+
 ## How it works
 
 | module | role |
@@ -91,10 +121,11 @@ materializes two frame-sized temporaries. At 500 GiB that is 200+ GiB. Use
 df.map_chunks(lambda c: (c["a"] * c["b"] + c["c"]) > 0.25).sum()
 ```
 
-**String UDFs are rejected.** cuDF compiles them with raw device pointers baked
-into the PTX and caches the kernel globally, so reusing it on another GPU reads
-foreign memory. `apply` raises rather than returning a wrong answer. Numeric
-UDFs are fine.
+**String UDFs work, but only because cuDF's caches are now device-aware.**
+cuDF bakes libcudf's character-table device pointers into the generated PTX and
+caches the compiled kernel. libcudf's tables are already per-CUDA-context, so
+the bug was purely in the Python cache keys; `cudf/utils/device.py` now
+supplies the device component of those keys.
 
 **Keep `CUDF_SPILL=0`.** cuDF's spill manager has no notion of which GPU a
 buffer belongs to and can restore one onto the wrong device. `init()` warns if
@@ -102,21 +133,38 @@ spilling is on.
 
 ## Known gaps
 
-* `Index` coverage is thin (13%); most index methods take the fallback.
+* `Index` coverage is thin (15%); most index methods take the fallback.
 * No lazy evaluation or expression fusion, so no cross-operation optimization.
 * No spilling to host, so the working set plus intermediates must fit in
   aggregate GPU memory.
-* `rank`, `duplicated`, `pivot`, `rolling`, `resample` and `melt` are
-  fallback-only; they need shuffles or boundary exchanges that are not written
-  yet. They are deliberately *not* mapped per chunk, which would silently
-  return chunk-local answers.
+* `rank`, `pivot`, `pivot_table`, `rolling` and `resample` are fallback-only;
+  they need shuffles or boundary exchanges that are not written yet. They are
+  deliberately *not* mapped per chunk, which would silently return chunk-local
+  answers. (`duplicated`, `factorize`, `melt`, `interpolate` and
+  `convert_dtypes` were in this group and are now implemented properly.)
+* `.loc` supports `:` or a boolean mask for rows; label-based row lookup would
+  need a global index.
 * Chunk placement is static round-robin; there is no rebalancing when a filter
   skews chunk sizes. Call `.rechunk()` explicitly.
 
-## Change outside this package
+## Changes outside this package
+
+All three are cuDF bugs that only show up with more than one device in play.
+
+`cudf/utils/device.py` (new) — one place that decides the device component of a
+cache key. Single-GPU processes never query the device, so nothing gets slower.
 
 `cudf/utils/scalar.py` — `pa_scalar_to_plc_scalar` cached `plc.Scalar` objects
 (which own *device* memory) keyed only on the pyarrow value, so a scalar
-allocated on GPU 0 could be handed to a kernel on GPU 3. The cache is now keyed
-on the current device too, behind a flag so single-GPU processes keep the
-existing fast path.
+allocated on GPU 0 could be handed to a kernel on GPU 3. Now keyed on the
+device as well.
+
+`cudf/core/udf/utils.py` — `make_cache_key`, which both UDF caches funnel
+through, likewise ignored the device while the cached PTX has device pointers
+compiled into it.
+
+`cudf/core/udf/nrt_utils.py` — `nrt_enabled()` mutated a process-global numba
+config and restored it in a `finally`. With several threads compiling at once,
+whichever finished first switched NRT off underneath the others and their
+kernels failed to link (`Unresolved extern function 'NRT_decref'`). Now
+reentrant, with a lock and a depth count.

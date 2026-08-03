@@ -110,6 +110,7 @@ def install(
     from . import _frame
 
     _frame.SHOW_PLACEMENT_IN_REPR = False
+    _frame.DEFAULT_NPARTITIONS = npartitions
 
     from cudf.pandas import fast_slow_proxy as fsp
 
@@ -196,11 +197,29 @@ def _install_io_overrides(npartitions: int | None) -> None:
         frame = _io.read_csv(path, npartitions=npartitions, **kwargs)
         return wrap_fast(frame)
 
+    original_concat = pd.concat
+
+    def concat(objs, *args, **kwargs):
+        """Concatenate chunked frames without moving any chunk."""
+        from ._creation import concat as chunked_concat
+        from ._frame import ChunkedFrame
+
+        items = list(objs)
+        if items and all(
+            isinstance(_unwrap(item), ChunkedFrame) for item in items
+        ):
+            axis = kwargs.get("axis", args[0] if args else 0)
+            if axis in (0, "index"):
+                return wrap_fast(chunked_concat(items, **kwargs))
+        return original_concat(objs, *args, **kwargs)
+
     read_parquet.__name__ = "read_parquet"
     read_csv.__name__ = "read_csv"
+    concat.__name__ = "concat"
     try:
         pd.read_parquet = read_parquet
         pd.read_csv = read_csv
+        pd.concat = concat
     except Exception as exc:  # pragma: no cover - module proxy may be sealed
         warnings.warn(
             f"could not install multi-GPU pandas readers ({exc}); "
@@ -208,6 +227,12 @@ def _install_io_overrides(npartitions: int | None) -> None:
             UserWarning,
             stacklevel=3,
         )
+
+
+def _unwrap(obj):
+    from ._frame import unwrap_proxy
+
+    return unwrap_proxy(obj)
 
 
 def _intermediate_replacements() -> dict:

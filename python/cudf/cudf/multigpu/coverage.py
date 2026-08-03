@@ -28,11 +28,22 @@ from cudf.multigpu._frame import (
 
 #: names implemented as true distributed algorithms (not per-chunk mapping)
 DISTRIBUTED_ALGORITHMS = {
+    # shuffle-backed
     "groupby", "merge", "join", "sort_values", "drop_duplicates", "set_index",
-    "value_counts", "unique", "nunique", "quantile", "median", "cumsum",
-    "cumprod", "cummax", "cummin", "shift", "diff", "pct_change", "sum", "min",
-    "max", "count", "mean", "std", "var", "prod", "product", "any", "all",
-    "idxmin", "idxmax", "head", "tail", "reset_index", "describe",
+    "value_counts", "unique", "nunique", "duplicated", "factorize",
+    # reductions
+    "sum", "min", "max", "count", "mean", "std", "var", "prod", "product",
+    "any", "all", "idxmin", "idxmax", "quantile", "median", "describe",
+    "skew", "kurtosis", "kurt", "corr", "cov", "agg", "aggregate",
+    "memory_usage", "mode",
+    # scans and boundary-crossing
+    "cumsum", "cumprod", "cummax", "cummin", "shift", "diff", "pct_change",
+    "ffill", "bfill", "pad", "backfill", "interpolate",
+    # whole-frame reshaping
+    "melt", "convert_dtypes",
+    # ordered / positional
+    "head", "tail", "reset_index", "nlargest", "nsmallest", "sample",
+    # materialization
     "to_pandas", "to_parquet", "to_arrow",
 }
 
