@@ -63,9 +63,21 @@ def _host_rss_gib() -> float:
         return float("nan")
 
 
+def _device_free_total() -> tuple[int, int]:
+    from cuda.bindings import runtime as cudart
+
+    cudart.cudaSetDevice(0)
+    err, free, total = cudart.cudaMemGetInfo()
+    return free, total
+
+
 def _report_placement(label: str = "tables") -> None:
     import cudf.multigpu as mgpu
 
+    if not mgpu.is_initialized():
+        free, total = _device_free_total()
+        print(f"  {label}: {(total - free) / GIB:.2f} GiB on 1 GPU")
+        return
     runtime = mgpu.get_runtime()
     info = runtime.memory_info()
     used = {d: (total - free) for d, (free, total) in info.items()}
@@ -80,6 +92,12 @@ def _report_placement(label: str = "tables") -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", required=True)
+    parser.add_argument("--backend", default="multigpu",
+                        choices=["multigpu", "cudf"],
+                        help="'cudf' runs stock single-GPU cudf.pandas through "
+                             "this same harness, for an apples-to-apples "
+                             "comparison (set CUDA_VISIBLE_DEVICES to pick "
+                             "the GPU)")
     parser.add_argument("--queries", default="all")
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--suffix", default=".parquet")
@@ -106,21 +124,44 @@ def main() -> None:
         os.environ["CUDF_PANDAS_FAIL_ON_FALLBACK"] = "1"
 
     # Must precede any import of pandas or the benchmark module.
-    import cudf.multigpu.pandas_compat as pandas_compat
+    if args.backend == "multigpu":
+        import cudf.multigpu.pandas_compat as pandas_compat
 
-    devices = [int(x) for x in args.devices.split(",")] if args.devices else None
-    pandas_compat.install(
-        devices=devices,
-        npartitions=args.npartitions,
-        max_pool_fraction=args.pool_fraction,
-        initial_pool_fraction=args.initial_pool_fraction,
-        memory_resource=args.memory_resource,
-    )
+        devices = (
+            [int(x) for x in args.devices.split(",")] if args.devices else None
+        )
+        pandas_compat.install(
+            devices=devices,
+            npartitions=args.npartitions,
+            max_pool_fraction=args.pool_fraction,
+            initial_pool_fraction=args.initial_pool_fraction,
+            memory_resource=args.memory_resource,
+        )
+        import cudf.multigpu as mgpu
 
-    import cudf.multigpu as mgpu
+        runtime = mgpu.get_runtime()
+        print(f"backend: multi-GPU, {runtime.n_devices} devices "
+              f"{list(runtime.devices)}")
+    else:
+        import cudf.pandas
 
-    runtime = mgpu.get_runtime()
-    print(f"multi-GPU backend: {runtime.n_devices} devices {list(runtime.devices)}")
+        cudf.pandas.install()
+        import rmm
+        from rmm.allocators.cupy import rmm_cupy_allocator
+        import cupy
+
+        free, _total = _device_free_total()
+        align = lambda n: (int(n) // 256) * 256  # RMM requires 256B multiples
+        rmm.mr.set_current_device_resource(
+            rmm.mr.PoolMemoryResource(
+                rmm.mr.CudaMemoryResource(),
+                initial_pool_size=align(free * args.initial_pool_fraction),
+                maximum_pool_size=align(free * args.pool_fraction),
+            )
+        )
+        cupy.cuda.set_allocator(rmm_cupy_allocator)
+        print(f"backend: single-GPU cudf.pandas "
+              f"({os.environ.get('CUDA_VISIBLE_DEVICES', 'all')} visible)")
     print(f"dataset: {args.path}  (scale {args.scale})")
 
     from cudf.pandas._benchmarks.pdsh import PDSHQueries
