@@ -30,6 +30,15 @@ from ._runtime import DeviceRuntime, get_runtime
 
 __all__ = ["ChunkedFrame", "ChunkedDataFrame", "ChunkedSeries", "ChunkedIndex"]
 
+#: Prefix repr() with a chunk-placement banner. Useful when working with these
+#: types directly; turned off by the cudf.pandas backend, where the object is
+#: meant to be indistinguishable from a pandas frame.
+SHOW_PLACEMENT_IN_REPR = True
+
+
+def _banner(label: str, frame) -> str:
+    return f"<{label} {frame._repr_summary()}>\n" if SHOW_PLACEMENT_IN_REPR else ""
+
 
 # ----------------------------------------------------------------------
 # helpers executed on a device worker thread
@@ -103,8 +112,42 @@ def _reject_string_udf(dtype_items) -> None:
         )
 
 
+class _ChunkedMeta(type):
+    """Resolves un-implemented cuDF names at the *class* level.
+
+    ``_FallbackMixin.__getattr__`` handles instances, but cudf.pandas looks
+    attributes up on the fast *class* (``getattr(owner._fsproxy_fast, name)``
+    in cudf/pandas/fast_slow_proxy.py). Without a class-level hook every
+    unimplemented name would resolve to ``_Unusable`` and silently take the
+    pandas path, so the whole frame would round-trip to host memory.
+    """
+
+    def __getattr__(cls, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        cudf_type = getattr(cls, "_cudf_type", None)
+        if cudf_type is None or not hasattr(cudf_type, name):
+            raise AttributeError(
+                f"type object {cls.__name__!r} has no attribute {name!r}"
+            )
+        target = getattr(cudf_type, name)
+        if isinstance(target, property) or not callable(target):
+            descriptor = property(
+                lambda self, _name=name: self._single_gpu_fallback_property(_name)
+            )
+        else:
+            def descriptor(self, *args, _name=name, **kwargs):
+                return self._single_gpu_fallback(_name, args, kwargs)
+
+            descriptor.__name__ = name
+            descriptor.__doc__ = getattr(target, "__doc__", None)
+        # Cache on the class so the next lookup is a plain attribute hit.
+        setattr(cls, name, descriptor)
+        return getattr(cls, name)
+
+
 # ----------------------------------------------------------------------
-class ChunkedFrame:
+class ChunkedFrame(metaclass=_ChunkedMeta):
     """Base class for row-partitioned multi-GPU frames."""
 
     #: the single-GPU cuDF type this wraps
@@ -684,7 +727,12 @@ class _FallbackMixin:
         # ``__getattr__`` also fires when a *defined* property raises
         # AttributeError internally.  Surfacing that as "no such attribute"
         # hides real bugs, so distinguish the two cases explicitly.
-        if hasattr(type(self), name):
+        #
+        # Probe the class dicts directly rather than with ``hasattr``: the
+        # metaclass synthesizes a dispatcher for any cuDF name on demand, so
+        # ``hasattr(type(self), name)`` is true for everything and would make
+        # this branch swallow the normal fallback path.
+        if any(name in vars(klass) for klass in type(self).__mro__):
             raise AttributeError(
                 f"{type(self).__name__}.{name} exists but raised "
                 "AttributeError while being evaluated; the original error was "
@@ -793,11 +841,11 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
 
     # -- row slicing -------------------------------------------------
     def head(self, n: int = 5):
-        """First ``n`` rows, gathered onto one GPU as an ordinary cuDF object."""
+        """First ``n`` rows, collected onto a single GPU (still chunked)."""
         return self._edge(n, from_start=True)
 
     def tail(self, n: int = 5):
-        """Last ``n`` rows, gathered onto one GPU as an ordinary cuDF object."""
+        """Last ``n`` rows, collected onto a single GPU (still chunked)."""
         return self._edge(n, from_start=False)
 
     def _edge(self, n: int, from_start: bool):
@@ -819,11 +867,14 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
             remaining -= take
         if not from_start:
             picks.reverse()
+        device = self._devices[0]
         if not picks:
-            return self._runtime.run(
-                self._devices[0], _call, self._chunks[0], "head", (0,), {}
+            result = self._runtime.run(
+                device, _call, self._chunks[0], "head", (0,), {}
             )
-        return _transfer.gather_concat(picks, self._devices[0], self._runtime)
+        else:
+            result = _transfer.gather_concat(picks, device, self._runtime)
+        return _wrap_like([result], [device], self._runtime)
 
     def _global_iloc(self, start: int, stop: int, step: int = 1):
         """Positional row slice -> a new multi-GPU frame."""
@@ -952,7 +1003,8 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
         pooled = _transfer.gather_concat(
             list(zip(candidates, self._devices)), device, self._runtime
         )
-        return self._runtime.run(device, _call, pooled, name, args, {"keep": keep})
+        result = self._runtime.run(device, _call, pooled, name, args, {"keep": keep})
+        return _wrap_like([result], [device], self._runtime)
 
     def mode(self, **kwargs):
         from ._stats import mode
@@ -1165,7 +1217,7 @@ class ChunkedDataFrame(_ChunkedCommon):
             tail = self.tail(5).to_pandas()
             body = repr(pd.concat([head, tail]))
             body += f"\n\n[{total} rows x {len(self.columns)} columns]"
-        return f"<ChunkedDataFrame {self._repr_summary()}>\n{body}"
+        return _banner("ChunkedDataFrame", self) + body
 
 
 class _Const:
@@ -1217,7 +1269,8 @@ class ChunkedSeries(_ChunkedCommon):
         gathered = _transfer.gather_concat(
             list(zip(parts, self._devices)), device, self._runtime, ignore_index=True
         )
-        return self._runtime.run(device, lambda s: s.unique(), gathered)
+        result = self._runtime.run(device, lambda s: s.unique(), gathered)
+        return _wrap_like([result], [device], self._runtime)
 
     def _distinct_reduce(self, name: str, *args, **kwargs):
         return int(len(self.unique()))
@@ -1324,7 +1377,7 @@ class ChunkedSeries(_ChunkedCommon):
             tail = self.tail(5).to_pandas()
             body = repr(pd.concat([head, tail]))
             body += f"\n\n[{total} rows]"
-        return f"<ChunkedSeries {self._repr_summary()}>\n{body}"
+        return _banner("ChunkedSeries", self) + body
 
 
 class _Accessor:
@@ -1393,7 +1446,7 @@ class ChunkedIndex(_ChunkedCommon):
         return self._meta.dtype
 
     def __repr__(self) -> str:
-        return f"<ChunkedIndex {self._repr_summary()}>\n{self.head(5).to_pandas()!r}"
+        return _banner("ChunkedIndex", self) + repr(self.head(5).to_pandas())
 
 
 # ----------------------------------------------------------------------

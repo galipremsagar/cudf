@@ -571,3 +571,86 @@ def test_non_rowwise_methods_are_not_mapped_per_chunk():
             f"{name} is mapped per chunk but is not row-wise; it would compute "
             "a chunk-local answer instead of a global one"
         )
+
+
+# ----------------------------------------------------------------------
+# cudf.pandas backend
+#
+# install() has to run before anything imports pandas, so these run in a
+# subprocess rather than in the test session.
+# ----------------------------------------------------------------------
+_PANDAS_BACKEND_SCRIPT = '''
+import json, warnings
+warnings.filterwarnings("ignore")
+import cudf.multigpu.pandas_compat as mgp
+mgp.install(npartitions={nparts})
+
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(3)
+n = 20_000
+df = pd.DataFrame({{
+    "k": rng.integers(0, 30, n),
+    "g": [f"g{{i}}" for i in rng.integers(0, 5, n)],
+    "v": rng.normal(size=n),
+}})
+
+fast = df._fsproxy_fast
+out = {{
+    "is_proxy": hasattr(df, "_fsproxy_fast"),
+    "fast_type": type(fast).__name__,
+    "nchunks": getattr(fast, "nchunks", 0),
+    "ndevices": len(set(getattr(fast, "devices", ()))),
+    "len": len(df),
+    "sum": float(df["v"].sum()),
+    "mean": float(df["v"].mean()),
+    "groupby": {{str(k): float(v) for k, v in df.groupby("g")["v"].sum().to_dict().items()}},
+    "groupby_type": type(df.groupby("g")["v"].sum()).__name__,
+    "filter_len": len(df[df["v"] > 0]),
+    "head_repr_is_pandas_like": not repr(df.head(3)).startswith("<Chunked"),
+    "sorted_head": [float(x) for x in df.sort_values("v")["v"].head(3)],
+}}
+df["w"] = df["v"] * 2
+out["assign_sum"] = float(df["w"].sum())
+print("RESULT" + json.dumps(out))
+'''
+
+
+def test_cudf_pandas_backend_uses_all_gpus(runtime):
+    import json
+    import subprocess
+    import sys
+
+    script = _PANDAS_BACKEND_SCRIPT.format(nparts=NPARTS)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    line = next(
+        line for line in proc.stdout.splitlines() if line.startswith("RESULT")
+    )
+    out = json.loads(line[len("RESULT") :])
+
+    # pandas objects really are backed by the multi-GPU frame
+    assert out["is_proxy"]
+    assert out["fast_type"] == "ChunkedDataFrame"
+    assert out["nchunks"] == NPARTS
+    assert out["ndevices"] == NPARTS
+
+    # and the accelerated results are right
+    assert out["len"] == 20_000
+    assert out["filter_len"] > 0
+    assert len(out["groupby"]) == 5
+    assert out["groupby_type"] == "Series"
+    np.testing.assert_allclose(out["assign_sum"], out["sum"] * 2, rtol=1e-9)
+    np.testing.assert_allclose(
+        out["mean"], out["sum"] / out["len"], rtol=1e-9
+    )
+    assert out["sorted_head"] == sorted(out["sorted_head"])
+
+    # a proxied frame must not print like an internal type
+    assert out["head_repr_is_pandas_like"]

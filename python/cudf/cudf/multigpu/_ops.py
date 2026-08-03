@@ -111,6 +111,9 @@ class ChunkedGroupBy:
         self._dropna = dropna
         self._split_out = split_out
         self._kwargs = kwargs
+        #: set by __getitem__ when a single column was selected, in which case
+        #: aggregations return a Series rather than a one-column DataFrame
+        self._single_column = None
 
     # -- helpers -----------------------------------------------------
     @property
@@ -135,8 +138,21 @@ class ChunkedGroupBy:
         plan, multi = _normalize_agg_spec(spec, list(frame.columns), keys)
         aggs = {a for _o, _c, a in plan}
         if aggs and aggs <= (set(_DECOMPOSABLE) | {"mean"}):
-            return self._tree_agg(frame, plan, multi)
-        return self._shuffle_agg(spec, **kwargs)
+            result = self._tree_agg(frame, plan, multi)
+        else:
+            result = self._shuffle_agg(spec, **kwargs)
+        return self._maybe_squeeze(result, spec)
+
+    def _maybe_squeeze(self, result, spec):
+        """``gb["v"].sum()`` is a Series, not a one-column DataFrame."""
+        column = self._single_column
+        if column is None or isinstance(spec, (list, tuple)):
+            return result
+        if isinstance(spec, dict) and not isinstance(spec.get(column), str):
+            return result
+        if isinstance(result, ChunkedDataFrame) and column in result.columns:
+            return result[column]
+        return result
 
     aggregate = agg
 
@@ -221,6 +237,10 @@ class ChunkedGroupBy:
         new._single_column = key if isinstance(key, (str, int)) else None
         return new
 
+    def _agg_columns(self):
+        frame = self._frame_as_dataframe()
+        return [c for c in frame.columns if c not in self._keys]
+
     def apply(self, func, *args, **kwargs):
         frame = self._frame_as_dataframe()
         shuffled = hash_shuffle(frame, self._keys, nparts=self._nparts())
@@ -242,6 +262,8 @@ for _agg in ("sum", "min", "max", "mean", "prod", "any", "all", "std", "var",
 
     def _make(agg=_agg):
         def method(self, *args, **kwargs):
+            if self._single_column is not None:
+                return self.agg({self._single_column: agg})
             return self.agg(agg)
 
         method.__name__ = agg
