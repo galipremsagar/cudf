@@ -63,11 +63,11 @@ python -m cudf.multigpu.tpch_pdsh --path /data/tpch/sf1c --scale 1 --validate
 
 Results on 8 × 97 GiB, all with `--strict` (any fall-back-to-pandas raises):
 
-| scale | queries | total | notes |
-| --- | --- | --- | --- |
-| SF1   | 22/22 | 9.9 s | all 22 results also match single-GPU `cudf.pandas` |
-| SF100 | 22/22 | 117 s | q1 is 91 s of that: cold start; the rest ~1 s each |
-| SF300 | 19/22 | 31 s  | q8/q9/q10 exhaust all 713 GiB (see below) |
+| scale | on GPU | on CPU | failed | total |
+| --- | --- | --- | --- | --- |
+| SF1   | 22/22 (100%) | 0 | 0 | 9.9 s (also 22/22 matching single-GPU cuDF) |
+| SF100 | 22/22 (100%) | 0 | 0 | 28.3 s |
+| SF300 | 19/22 (86%)  | 0 | 3 (OOM) | 30.8 s |
 
 SF300 is ~1.8 billion lineitem rows; reading it lands 97 GiB across the 8 GPUs
 in 1.6 s. The three failures are genuine capacity, not correctness: q8, q9 and
@@ -77,13 +77,25 @@ neither of which this POC has. Note also that a `gc.collect()` between queries
 is required at this scale -- chunked frames form reference cycles, so without
 it the previous query's device memory is still held when the next one starts.
 
-**Always use `--strict` when assessing coverage.** A fall-back to pandas
-returns the *right answer* — it just computes it on the host. It is therefore
-invisible if you only check results, and it was: 18 of the 22 queries initially
-"passed", and matched the single-GPU reference, while never touching the GPUs.
-The tell was SF100 sitting at 0% GPU utilization with 181 GiB of resident host
-memory. `--validate` checks answers; `--strict` checks that the answers were
-actually computed where you think.
+**A fall-back to pandas returns the right answer — it just computes it on the
+host.** It is therefore invisible if you only check results, and it was: 18 of
+the 22 queries initially "passed", and matched the single-GPU reference, while
+never touching the GPUs.
+
+Two detectors, and you need both:
+
+* `--strict` sets `CUDF_PANDAS_FAIL_ON_FALLBACK=1`. This only covers
+  cudf.pandas' *function-call* path. **Attribute access falls back through the
+  proxy's `__getattr__`, which never consults that variable**, so `--strict`
+  alone reported a clean 22/22 at SF100 while q1 was in fact running on the CPU
+  for 91 of the run's 117 seconds.
+* The runner therefore also measures host RSS growth per query and prints it.
+  Any fallback has to copy the frame to host, so a multi-GiB jump gives it away
+  no matter which path took it. That is what the `hostRSS` column is for, and
+  what the "on GPU: n/n" line is computed from.
+
+`--validate` checks the answers; the two detectors above check that the answers
+were computed where you think.
 
 For reference, stock single-GPU `cudf.pandas` also completes all 22 queries at
 SF1 with no CPU fallback:

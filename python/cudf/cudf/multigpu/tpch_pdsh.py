@@ -32,6 +32,10 @@ from typing import Any
 
 GIB = 1 << 30
 
+#: host RSS growth (GiB) during one query above which it must have been
+#: computed on the CPU -- a GPU query keeps only its small result on the host
+FALLBACK_RSS_GIB = 2.0
+
 
 class _RunConfig:
     """The three attributes the PDS-H query bodies actually read."""
@@ -40,6 +44,23 @@ class _RunConfig:
         self.dataset_path = dataset_path
         self.scale_factor = scale_factor
         self.suffix = suffix
+
+
+def _host_rss_gib() -> float:
+    """Resident host memory of this process, in GiB.
+
+    An independent fallback detector. ``CUDF_PANDAS_FAIL_ON_FALLBACK`` only
+    guards cudf.pandas' function-call path; attribute access falls back
+    through the proxy's ``__getattr__``, which never consults it. A fallback
+    always copies the frame to host, so a large RSS jump gives that away
+    regardless of which path took it.
+    """
+    try:
+        with open("/proc/self/statm") as handle:
+            pages = int(handle.read().split()[1])
+        return pages * 4096 / GIB
+    except Exception:
+        return float("nan")
 
 
 def _report_placement(label: str = "tables") -> None:
@@ -113,10 +134,12 @@ def main() -> None:
 
     results: dict[int, Any] = {}
     timings: dict[int, float] = {}
+    host_growth: dict[int, float] = {}
     failures: dict[int, str] = {}
 
-    print(f"\n{'query':>6}  {'status':<10}{'time':>10}  detail")
+    print(f"\n{'query':>6}  {'status':<10}{'time':>10}{'hostRSS':>10}  detail")
     print("-" * 78)
+    baseline_rss = _host_rss_gib()
     for number in numbers:
         # Chunked frames form reference cycles (indexers and accessors hold the
         # frame), so without an explicit collection the previous query's device
@@ -125,6 +148,7 @@ def main() -> None:
         gc.collect()
         query = getattr(PDSHQueries, f"q{number}")
         best = None
+        rss_before = _host_rss_gib()
         try:
             with _deadline(args.timeout):
               for _ in range(args.iterations):
@@ -136,20 +160,29 @@ def main() -> None:
                 best = elapsed if best is None else min(best, elapsed)
             results[number] = host
             timings[number] = best
-            print(f"{number:>6}  {'ok':<10}{best:>9.3f}s  {len(host)} rows")
+            grew = _host_rss_gib() - rss_before
+            host_growth[number] = grew
+            flag = "  <-- ran on CPU" if grew > FALLBACK_RSS_GIB else ""
+            print(f"{number:>6}  {'ok':<10}{best:>9.3f}s{grew:>+9.1f}G  "
+                  f"{len(host)} rows{flag}")
             if args.print_results:
                 print(host.head(5).to_string())
         except Exception as exc:
             failures[number] = f"{type(exc).__name__}: {exc}"
-            print(f"{number:>6}  {'ERROR':<10}{'-':>10}  "
-                  f"{type(exc).__name__}: {str(exc)[:100]}")
+            print(f"{number:>6}  {'ERROR':<10}{'-':>10}{'':>10}  "
+                  f"{type(exc).__name__}: {str(exc)[:90]}")
             if args.traceback:
                 traceback.print_exc()
 
     print("-" * 78)
     ok = len(timings)
+    on_cpu = [n for n, g in host_growth.items() if g > FALLBACK_RSS_GIB]
+    on_gpu = [n for n in timings if n not in on_cpu]
     print(f"{ok}/{len(numbers)} queries ran; "
           f"total {sum(timings.values()):.2f}s")
+    print(f"  on GPU: {len(on_gpu)}/{len(numbers)}"
+          + (f"   fell back to CPU: {sorted(on_cpu)}" if on_cpu else
+             "   (no query fell back to CPU)"))
     _report_placement("device memory")
 
     if failures:
