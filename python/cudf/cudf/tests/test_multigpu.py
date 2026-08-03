@@ -400,3 +400,174 @@ def test_parquet_plan_is_balanced_and_complete(pdf, tmp_path):
     cudf.from_pandas(pdf).to_parquet(path / "f.parquet", row_group_size_rows=1_000)
     _plans, rows, _bytes = parquet_row_group_plan([str(path / "f.parquet")], 4)
     assert sum(rows) == len(pdf)
+
+
+# ----------------------------------------------------------------------
+# scans and boundary-crossing operations
+#
+# These run with fallback warnings escalated to errors, so a test only passes
+# if the operation really was distributed rather than gathered onto one GPU.
+# ----------------------------------------------------------------------
+@pytest.fixture
+def strict_fallback():
+    """Turn the single-GPU fallback warning into an error.
+
+    Matched on message rather than category so that unrelated warnings (Numba
+    occupancy hints, for one) do not masquerade as a fallback.
+    """
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "error", message=".*no distributed implementation.*"
+        )
+        yield
+
+
+@pytest.mark.parametrize("how", ["cumsum", "cumprod", "cummax", "cummin"])
+def test_series_scan(strict_fallback, mdf, pdf, how):
+    got = getattr(mdf["c"], how)().to_pandas().reset_index(drop=True)
+    expected = getattr(pdf["c"], how)().reset_index(drop=True)
+    np.testing.assert_allclose(got.to_numpy(), expected.to_numpy(), rtol=1e-9)
+
+
+@pytest.mark.parametrize("how", ["cumsum", "cummax", "cummin"])
+def test_frame_scan(strict_fallback, mdf, pdf, how):
+    columns = ["b", "c"]
+    got = getattr(mdf[columns], how)().to_pandas().reset_index(drop=True)
+    expected = getattr(pdf[columns], how)().reset_index(drop=True)
+    np.testing.assert_allclose(got.to_numpy(), expected.to_numpy(), rtol=1e-9)
+
+
+@pytest.mark.parametrize("periods", [1, 3, -1, -2, 10**9])
+def test_shift_across_chunk_boundaries(strict_fallback, mdf, pdf, periods):
+    got = mdf["c"].shift(periods).to_pandas().reset_index(drop=True)
+    expected = pdf["c"].shift(periods).reset_index(drop=True)
+    np.testing.assert_allclose(
+        got.to_numpy(dtype=float), expected.to_numpy(dtype=float), equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("periods", [1, -3])
+def test_diff(strict_fallback, mdf, pdf, periods):
+    got = mdf["c"].diff(periods).to_pandas().reset_index(drop=True)
+    expected = pdf["c"].diff(periods).reset_index(drop=True)
+    np.testing.assert_allclose(
+        got.to_numpy(dtype=float), expected.to_numpy(dtype=float), equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("how", ["ffill", "bfill"])
+def test_directional_fill_crosses_chunks(strict_fallback, mdf, pdf, how):
+    got = getattr(mdf["a"], how)().to_pandas().reset_index(drop=True)
+    expected = getattr(pdf["a"], how)().reset_index(drop=True)
+    np.testing.assert_allclose(
+        got.to_numpy(dtype=float), expected.to_numpy(dtype=float), equal_nan=True
+    )
+
+
+# ----------------------------------------------------------------------
+# distributed statistics
+# ----------------------------------------------------------------------
+def test_skew_and_kurtosis(strict_fallback, mdf, pdf):
+    columns = ["a", "b", "c"]
+    np.testing.assert_allclose(
+        mdf[columns].skew().to_numpy(dtype=float),
+        pdf[columns].skew().to_numpy(dtype=float),
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        mdf[columns].kurtosis().to_numpy(dtype=float),
+        pdf[columns].kurtosis().to_numpy(dtype=float),
+        rtol=1e-5,
+    )
+
+
+def test_cov_and_corr_use_pairwise_complete_rows(strict_fallback, mdf, pdf):
+    # column "a" carries nulls, so a naive per-column mean gives a different
+    # (wrong) answer than pandas here.
+    columns = ["a", "b", "c"]
+    np.testing.assert_allclose(
+        mdf[columns].cov().to_numpy(dtype=float),
+        pdf[columns].cov().to_numpy(dtype=float),
+        rtol=1e-8,
+    )
+    np.testing.assert_allclose(
+        mdf[columns].corr().to_numpy(dtype=float),
+        pdf[columns].corr().to_numpy(dtype=float),
+        rtol=1e-8,
+    )
+
+
+def test_agg(strict_fallback, mdf, pdf):
+    np.testing.assert_allclose(
+        mdf[["b", "c"]].agg("sum").to_numpy(dtype=float),
+        pdf[["b", "c"]].agg("sum").to_numpy(dtype=float),
+    )
+
+
+def test_memory_usage_sums_across_devices(mdf):
+    usage = mdf.memory_usage()
+    assert usage.sum() > 0
+    assert set(usage.index) >= set(mdf.columns)
+
+
+# ----------------------------------------------------------------------
+# sampling, top-k, UDFs
+# ----------------------------------------------------------------------
+def test_top_k(strict_fallback, mdf, pdf):
+    np.testing.assert_array_equal(
+        mdf.nlargest(10, "b")["b"].to_pandas().to_numpy(),
+        pdf.nlargest(10, "b")["b"].to_numpy(),
+    )
+    np.testing.assert_array_equal(
+        mdf.nsmallest(7, "b")["b"].to_pandas().to_numpy(),
+        pdf.nsmallest(7, "b")["b"].to_numpy(),
+    )
+
+
+def test_sample_stays_distributed(strict_fallback, mdf):
+    sampled = mdf.sample(frac=0.1)
+    assert sampled.nchunks == mdf.nchunks
+    assert len(sampled) == pytest.approx(len(mdf) * 0.1, rel=0.05)
+    assert len(mdf.sample(n=1000)) == 1000
+
+
+def test_numeric_udf_runs_per_chunk(strict_fallback, mdf, pdf):
+    got = mdf["b"].apply(lambda x: x * 2 + 1).to_pandas().reset_index(drop=True)
+    expected = pdf["b"].apply(lambda x: x * 2 + 1).reset_index(drop=True)
+    np.testing.assert_array_equal(got.to_numpy(), expected.to_numpy())
+
+
+def test_string_udf_is_rejected_not_silently_wrong(mdf):
+    with pytest.raises(NotImplementedError, match="string"):
+        mdf["g"].apply(lambda s: s.upper())
+
+
+def test_query_and_eval(strict_fallback, mdf, pdf):
+    assert len(mdf.query("b > 500")) == int((pdf["b"] > 500).sum())
+    # same-dtype operands: cuDF's AST evaluator rejects mixed int/float here,
+    # on one GPU as well as several.
+    np.testing.assert_allclose(
+        mdf.eval("c + c").sum(), (pdf["c"] + pdf["c"]).sum()
+    )
+
+
+def test_non_rowwise_methods_are_not_mapped_per_chunk():
+    """Guard against re-adding methods that would give per-chunk-local answers."""
+    from cudf.multigpu._frame import _FallbackMixin
+
+    unsafe = ["duplicated", "factorize", "melt", "interpolate", "convert_dtypes"]
+    for name in unsafe:
+        owner = next(
+            (
+                klass
+                for klass in mgpu.ChunkedDataFrame.__mro__
+                if klass is not _FallbackMixin and name in vars(klass)
+            ),
+            None,
+        )
+        assert owner is None, (
+            f"{name} is mapped per chunk but is not row-wise; it would compute "
+            "a chunk-local answer instead of a global one"
+        )

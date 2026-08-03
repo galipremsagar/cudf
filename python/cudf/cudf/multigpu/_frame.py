@@ -81,6 +81,28 @@ def _map_to_host(fn: Callable, obj):
     return _to_host(fn(obj))
 
 
+def _reject_string_udf(dtype_items) -> None:
+    """Refuse UDFs over string columns on the multi-GPU path.
+
+    cuDF lowers string UDFs by baking raw device pointers into the generated
+    PTX and caching the compiled kernel globally (cudf/core/udf/
+    strings_lowering.py). Those pointers belong to whichever device compiled
+    first, so reusing the kernel on another GPU reads freed or foreign memory.
+    """
+    bad = [
+        str(name)
+        for name, dtype in dtype_items
+        if pd.api.types.is_string_dtype(dtype)
+    ]
+    if bad:
+        raise NotImplementedError(
+            f"UDFs over string columns ({', '.join(bad)}) are not supported on "
+            "the multi-GPU path: cuDF caches string UDF kernels with device "
+            "pointers compiled into them, which are not valid on another GPU. "
+            "Use .map_chunks() with a vectorized expression, or .str accessors."
+        )
+
+
 # ----------------------------------------------------------------------
 class ChunkedFrame:
     """Base class for row-partitioned multi-GPU frames."""
@@ -480,6 +502,12 @@ def _combine_moments(counts, means, m2s):
 
 
 #: methods that are purely row-wise: run them unchanged on every chunk
+#: Strictly row-wise methods: the answer for a row depends only on that row,
+#: so applying them chunk by chunk and concatenating is exactly equivalent.
+#: Anything that inspects other rows (interpolate), reorders rows (melt),
+#: numbers rows (factorize), compares across rows (duplicated), or can infer a
+#: different result *type* per chunk (convert_dtypes) does NOT belong here --
+#: it would silently produce per-chunk-local answers.
 _MAP_METHODS_COMMON = (
     "abs", "add", "astype", "between", "ceil", "clip", "copy", "cos",
     "div", "divide", "dot", "eq", "exp", "fillna", "floor", "floordiv",
@@ -487,17 +515,17 @@ _MAP_METHODS_COMMON = (
     "multiply", "ne", "notna", "notnull", "nans_to_nulls", "pow", "radd",
     "rdiv", "repeat", "rfloordiv", "rmod", "rmul", "round", "rpow", "rsub",
     "rtruediv", "sin", "sqrt", "sub", "subtract", "tan", "truediv", "where",
-    "mask", "replace", "rename", "pipe", "truncate", "convert_dtypes",
-    "interpolate", "to_dict",
+    "mask", "replace", "rename", "pipe",
 )
 
 _MAP_METHODS_DATAFRAME = (
     "assign", "drop", "eval", "query", "select_dtypes", "insert", "pop",
-    "rename_axis", "add_prefix", "add_suffix", "applymap", "keys",
+    "rename_axis", "add_prefix", "add_suffix", "applymap",
+    "hash_values", "interleave_columns",
 )
 
 _MAP_METHODS_SERIES = (
-    "map", "str_cat", "explode", "to_frame", "factorize",
+    "map", "str_cat", "explode", "to_frame", "hash_values",
 )
 
 #: reductions with an associative host-side combine
@@ -560,13 +588,56 @@ class _ReductionMixin:
     def std(self, ddof: int = 1, **kwargs):
         return self.var(ddof=ddof, **kwargs) ** 0.5
 
-    def skew(self, *args, **kwargs):
-        return self._single_gpu_fallback("skew", args, kwargs)
+    def skew(self, **kwargs):
+        from ._stats import skew
 
-    def kurtosis(self, *args, **kwargs):
-        return self._single_gpu_fallback("kurtosis", args, kwargs)
+        return skew(self, **kwargs)
+
+    def kurtosis(self, **kwargs):
+        from ._stats import kurtosis
+
+        return kurtosis(self, **kwargs)
 
     kurt = kurtosis
+
+    def agg(self, func, *args, **kwargs):
+        """Frame-level aggregation, dispatched to the distributed reductions."""
+        if isinstance(func, str):
+            return getattr(self, func)(*args, **kwargs)
+        if isinstance(func, (list, tuple)):
+            return pd.DataFrame(
+                {name: getattr(self, name)() for name in func}
+            ).T
+        if isinstance(func, dict):
+            return pd.Series(
+                {
+                    column: getattr(self[column], name)()
+                    for column, name in func.items()
+                }
+            )
+        raise TypeError(f"unsupported aggregation {func!r}")
+
+    aggregate = agg
+
+    def memory_usage(self, index: bool = True, deep: bool = False):
+        """Bytes used per column, summed over every GPU."""
+        parts = self._run_chunks(
+            lambda c: _to_host(c.memory_usage(index=index, deep=deep))
+        )
+        return _stack(parts).sum()
+
+    def ffill(self, **kwargs):
+        from ._stats import fill_directional
+
+        return fill_directional(self, forward=True, **kwargs)
+
+    def bfill(self, **kwargs):
+        from ._stats import fill_directional
+
+        return fill_directional(self, forward=False, **kwargs)
+
+    pad = ffill
+    backfill = bfill
 
     def median(self, *args, **kwargs):
         return self.quantile(0.5, *args, **kwargs)
@@ -796,7 +867,110 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
             self._runtime.run_many(jobs), self._devices, self._runtime
         )
 
+    # -- scans and boundary-crossing ops ------------------------------
+    def cumsum(self, **kwargs):
+        from ._scan import cumulative
+
+        return cumulative(self, "cumsum", **kwargs)
+
+    def cumprod(self, **kwargs):
+        from ._scan import cumulative
+
+        return cumulative(self, "cumprod", **kwargs)
+
+    def cummax(self, **kwargs):
+        from ._scan import cumulative
+
+        return cumulative(self, "cummax", **kwargs)
+
+    def cummin(self, **kwargs):
+        from ._scan import cumulative
+
+        return cumulative(self, "cummin", **kwargs)
+
+    def shift(self, periods: int = 1, **kwargs):
+        from ._scan import shift
+
+        return shift(self, periods, **kwargs)
+
+    def diff(self, periods: int = 1, **kwargs):
+        from ._scan import diff
+
+        return diff(self, periods, **kwargs)
+
+    def pct_change(self, periods: int = 1, **kwargs):
+        from ._scan import pct_change
+
+        return pct_change(self, periods, **kwargs)
+
+    # -- sampling and top-k -------------------------------------------
+    def sample(self, n: int | None = None, frac: float | None = None, **kwargs):
+        """Sample rows independently on each GPU.
+
+        ``frac`` samples that fraction of every chunk, so the result stays
+        distributed.  ``n`` splits the request proportionally across chunks.
+        """
+        if frac is None and n is None:
+            frac = None
+            n = 1
+        if frac is not None:
+            return self.map_chunks(lambda c: c.sample(frac=frac, **kwargs))
+        lengths = self.chunk_lengths
+        total = sum(lengths) or 1
+        quotas = [min(length, round(n * length / total)) for length in lengths]
+        # fix up rounding so the total is exactly n
+        deficit = n - sum(quotas)
+        for i in range(len(quotas)):
+            if deficit == 0:
+                break
+            step = 1 if deficit > 0 else -1
+            if 0 <= quotas[i] + step <= lengths[i]:
+                quotas[i] += step
+                deficit -= step
+        jobs = [
+            (device, _call, (chunk, "sample", (), {"n": quotas[i], **kwargs}), {})
+            for i, (chunk, device) in enumerate(zip(self._chunks, self._devices))
+        ]
+        return _wrap_like(
+            self._runtime.run_many(jobs), self._devices, self._runtime
+        )
+
+    def nlargest(self, n: int, columns=None, keep: str = "first"):
+        """Top ``n`` rows: take the top ``n`` on each GPU, then merge."""
+        return self._top_k(n, columns, keep, largest=True)
+
+    def nsmallest(self, n: int, columns=None, keep: str = "first"):
+        return self._top_k(n, columns, keep, largest=False)
+
+    def _top_k(self, n: int, columns, keep: str, largest: bool):
+        name = "nlargest" if largest else "nsmallest"
+        args = (n,) if columns is None else (n, columns)
+        candidates = self._run_chunks(
+            lambda c: _call(c, name, args, {"keep": keep})
+        )
+        device = self._devices[0]
+        pooled = _transfer.gather_concat(
+            list(zip(candidates, self._devices)), device, self._runtime
+        )
+        return self._runtime.run(device, _call, pooled, name, args, {"keep": keep})
+
+    def mode(self, **kwargs):
+        from ._stats import mode
+
+        return mode(self, **kwargs)
+
     # -- misc --------------------------------------------------------
+    @property
+    def empty(self) -> bool:
+        return len(self) == 0
+
+    def equals(self, other) -> bool:
+        if isinstance(other, ChunkedFrame):
+            if len(self) != len(other):
+                return False
+            other = other.to_pandas()
+        return bool(self.to_pandas().equals(other))
+
     def persist(self):
         return self
 
@@ -907,6 +1081,25 @@ class ChunkedDataFrame(_ChunkedCommon):
         return pd.Series(
             {col: self[col].nunique(*args, **kwargs) for col in self.columns}
         )
+
+    def corr(self, method: str = "pearson", **kwargs):
+        from ._stats import corr
+
+        return corr(self, method=method, **kwargs)
+
+    def cov(self, **kwargs):
+        from ._stats import cov
+
+        return cov(self, **kwargs)
+
+    def apply(self, func, axis: int = 1, **kwargs):
+        """Row-wise UDF, compiled and run independently on each GPU."""
+        if axis != 1:
+            raise NotImplementedError(
+                "multi-GPU apply supports axis=1 (row-wise) only"
+            )
+        _reject_string_udf(self._meta.dtypes.items())
+        return self.map_chunks(lambda c: c.apply(func, axis=axis, **kwargs))
 
     def describe(self, *args, **kwargs):
         numeric = self._meta.select_dtypes("number").columns
@@ -1031,6 +1224,11 @@ class ChunkedSeries(_ChunkedCommon):
 
     def nunique(self, *args, **kwargs) -> int:
         return self._distinct_reduce("nunique", *args, **kwargs)
+
+    def apply(self, func, *args, **kwargs):
+        """Elementwise UDF, compiled and run independently on each GPU."""
+        _reject_string_udf([(self.name, self._meta.dtype)])
+        return self.map_chunks(lambda c: c.apply(func, *args, **kwargs))
 
     def value_counts(self, **kwargs):
         from ._ops import series_value_counts
