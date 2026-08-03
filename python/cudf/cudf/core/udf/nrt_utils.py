@@ -3,6 +3,7 @@
 
 import contextvars
 import os
+import threading
 from contextlib import contextmanager
 from functools import cache
 from importlib.util import find_spec
@@ -54,6 +55,16 @@ def _append_search_path(search_paths, path):
     return os.pathsep.join(paths)
 
 
+#: ``numba_config`` is process-global, so concurrent users of ``nrt_enabled``
+#: must not each save-and-restore it independently: whichever thread exits
+#: first would switch NRT off underneath the others, and their kernels would
+#: fail to link with "Unresolved extern function 'NRT_decref'". Nesting is
+#: tracked with a depth count so only the outermost exit restores.
+_nrt_lock = threading.RLock()
+_nrt_depth = 0
+_nrt_saved: tuple | None = None
+
+
 @contextmanager
 def nrt_enabled():
     """
@@ -61,22 +72,34 @@ def nrt_enabled():
     config. CUDA_ENABLE_NRT may be toggled dynamically
     for a single kernel launch, so we use this context
     to enable it for those that we know need it.
+
+    Reentrant and thread-safe: the config stays enabled as long as any thread
+    is inside the context, which matters when several CUDA devices are being
+    driven from separate threads at once.
     """
-    original_nrt_value = getattr(numba_config, "CUDA_ENABLE_NRT", False)
-    original_nvrtc_search_paths = getattr(
-        numba_config, "CUDA_NVRTC_EXTRA_SEARCH_PATHS", ""
-    )
-    nvrtc_search_paths = original_nvrtc_search_paths or ""
+    global _nrt_depth, _nrt_saved
+
+    with _nrt_lock:
+        if _nrt_depth == 0:
+            _nrt_saved = (
+                getattr(numba_config, "CUDA_ENABLE_NRT", False),
+                getattr(numba_config, "CUDA_NVRTC_EXTRA_SEARCH_PATHS", ""),
+            )
+            numba_config.CUDA_ENABLE_NRT = True
+            if (include_dir := _get_libcudf_rapids_include_dir()) is not None:
+                numba_config.CUDA_NVRTC_EXTRA_SEARCH_PATHS = (
+                    _append_search_path(_nrt_saved[1] or "", include_dir)
+                )
+        _nrt_depth += 1
 
     try:
-        numba_config.CUDA_ENABLE_NRT = True
-        if (include_dir := _get_libcudf_rapids_include_dir()) is not None:
-            numba_config.CUDA_NVRTC_EXTRA_SEARCH_PATHS = _append_search_path(
-                nvrtc_search_paths, include_dir
-            )
         yield
     finally:
-        numba_config.CUDA_ENABLE_NRT = original_nrt_value
-        numba_config.CUDA_NVRTC_EXTRA_SEARCH_PATHS = (
-            original_nvrtc_search_paths
-        )
+        with _nrt_lock:
+            _nrt_depth -= 1
+            if _nrt_depth == 0 and _nrt_saved is not None:
+                (
+                    numba_config.CUDA_ENABLE_NRT,
+                    numba_config.CUDA_NVRTC_EXTRA_SEARCH_PATHS,
+                ) = _nrt_saved
+                _nrt_saved = None

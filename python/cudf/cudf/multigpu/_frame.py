@@ -90,26 +90,18 @@ def _map_to_host(fn: Callable, obj):
     return _to_host(fn(obj))
 
 
-def _reject_string_udf(dtype_items) -> None:
-    """Refuse UDFs over string columns on the multi-GPU path.
+def unwrap_proxy(obj):
+    """Return the chunked frame behind a cudf.pandas proxy, if there is one.
 
-    cuDF lowers string UDFs by baking raw device pointers into the generated
-    PTX and caching the compiled kernel globally (cudf/core/udf/
-    strings_lowering.py). Those pointers belong to whichever device compiled
-    first, so reusing the kernel on another GPU reads freed or foreign memory.
+    Under the accelerated-pandas backend our frames arrive wrapped in proxy
+    objects, which are not instances of ChunkedFrame. Without unwrapping,
+    operand checks like ``isinstance(right, ChunkedFrame)`` in ``merge`` see a
+    stranger and take the wrong path.
     """
-    bad = [
-        str(name)
-        for name, dtype in dtype_items
-        if pd.api.types.is_string_dtype(dtype)
-    ]
-    if bad:
-        raise NotImplementedError(
-            f"UDFs over string columns ({', '.join(bad)}) are not supported on "
-            "the multi-GPU path: cuDF caches string UDF kernels with device "
-            "pointers compiled into them, which are not valid on another GPU. "
-            "Use .map_chunks() with a vectorized expression, or .str accessors."
-        )
+    if isinstance(obj, ChunkedFrame):
+        return obj
+    fast = getattr(obj, "_fsproxy_fast", None)
+    return fast if isinstance(fast, ChunkedFrame) else obj
 
 
 class _ChunkedMeta(type):
@@ -461,6 +453,25 @@ def _even_bounds(total: int, nchunks: int) -> list[int]:
     return bounds
 
 
+def drop_empty_chunks(frame: "ChunkedFrame") -> "ChunkedFrame":
+    """Drop zero-row chunks, keeping at least one.
+
+    Needed after ``groupby.apply``: cuDF returns the *input* schema when the
+    input is empty, rather than the schema the UDF produces, so an empty chunk
+    poisons the concatenation with the pre-aggregation columns.
+    """
+    lengths = frame.chunk_lengths
+    keep = [i for i, length in enumerate(lengths) if length > 0]
+    if not keep or len(keep) == len(lengths):
+        return frame
+    return type(frame)(
+        [frame._chunks[i] for i in keep],
+        [frame._devices[i] for i in keep],
+        frame.runtime,
+        lengths=[lengths[i] for i in keep],
+    )
+
+
 def _wrap_like(chunks: Sequence[Any], devices: Sequence[int], runtime):
     """Wrap per-chunk results in the right multi-GPU class."""
     sample = next((c for c in chunks if c is not None), None)
@@ -477,6 +488,7 @@ def _wrap_like(chunks: Sequence[Any], devices: Sequence[int], runtime):
 # operand substitution: let a chunked operand appear anywhere in args
 # ----------------------------------------------------------------------
 def _find_chunked(value, out: list) -> None:
+    value = unwrap_proxy(value)
     if isinstance(value, ChunkedFrame):
         out.append(value)
     elif isinstance(value, (list, tuple)):
@@ -488,6 +500,7 @@ def _find_chunked(value, out: list) -> None:
 
 
 def _substitute(value, i: int):
+    value = unwrap_proxy(value)
     if isinstance(value, ChunkedFrame):
         return value._chunks[i]
     if isinstance(value, tuple):
@@ -1011,6 +1024,22 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
 
         return mode(self, **kwargs)
 
+    # -- whole-frame reshaping ----------------------------------------
+    def duplicated(self, subset=None, keep="first"):
+        from ._reshape import duplicated
+
+        return duplicated(self, subset=subset, keep=keep)
+
+    def interpolate(self, method: str = "linear", **kwargs):
+        from ._reshape import interpolate
+
+        return interpolate(self, method=method, **kwargs)
+
+    def convert_dtypes(self, **kwargs):
+        from ._reshape import convert_dtypes
+
+        return convert_dtypes(self, **kwargs)
+
     # -- misc --------------------------------------------------------
     @property
     def empty(self) -> bool:
@@ -1085,15 +1114,66 @@ class _ILocIndexer:
         return out
 
 
+class _LocIndexer:
+    """Label-based selection.
+
+    Row selection is limited to a full slice or a boolean mask: anything else
+    needs a global index lookup, which a row-partitioned frame cannot answer
+    without a shuffle.  Column selection is unrestricted.
+    """
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def __getitem__(self, key):
+        frame = self._frame
+        rows, columns = (key if isinstance(key, tuple) else (key, None))
+
+        if isinstance(rows, slice):
+            if rows.start is not None or rows.stop is not None:
+                raise NotImplementedError(
+                    "loc row slicing by label is not supported on a "
+                    "row-partitioned frame; use .iloc with positions"
+                )
+            result = frame
+        elif isinstance(rows, ChunkedSeries):
+            result = frame._map_method("__getitem__", rows)
+        else:
+            raise NotImplementedError(
+                "loc row selection supports ':' or a boolean mask; got "
+                f"{type(rows).__name__}"
+            )
+
+        if columns is None:
+            return result
+        return result._map_method("__getitem__", columns)
+
+    def __setitem__(self, key, value):
+        rows, columns = (key if isinstance(key, tuple) else (key, None))
+        if not (isinstance(rows, slice) and rows.start is None and rows.stop is None):
+            raise NotImplementedError("loc assignment supports ':' rows only")
+        self._frame[columns] = value
+
+
 class ChunkedDataFrame(_ChunkedCommon):
     """A :class:`cudf.DataFrame` partitioned by rows across several GPUs."""
 
     _cudf_type = cudf.DataFrame
 
+    @property
+    def loc(self):
+        return _LocIndexer(self)
+
     # -- schema ------------------------------------------------------
     @property
     def columns(self):
         return self._meta.columns
+
+    @columns.setter
+    def columns(self, value) -> None:
+        names = list(value)
+        self._run_chunks(_set_columns, _Const(names))
+        self._meta_cache = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -1150,7 +1230,6 @@ class ChunkedDataFrame(_ChunkedCommon):
             raise NotImplementedError(
                 "multi-GPU apply supports axis=1 (row-wise) only"
             )
-        _reject_string_udf(self._meta.dtypes.items())
         return self.map_chunks(lambda c: c.apply(func, axis=axis, **kwargs))
 
     def describe(self, *args, **kwargs):
@@ -1197,6 +1276,11 @@ class ChunkedDataFrame(_ChunkedCommon):
 
         return set_index(self, keys, **kwargs)
 
+    def melt(self, id_vars=None, value_vars=None, **kwargs):
+        from ._reshape import melt
+
+        return melt(self, id_vars=id_vars, value_vars=value_vars, **kwargs)
+
     def value_counts(self, subset=None, **kwargs):
         cols = list(self.columns) if subset is None else list(subset)
         return self.groupby(cols).size().sort_values(ascending=False)
@@ -1225,6 +1309,11 @@ class _Const:
 
     def __init__(self, value):
         self.value = value
+
+
+def _set_columns(chunk, names):
+    chunk.columns = names.value if isinstance(names, _Const) else names
+    return chunk
 
 
 def _setitem(chunk, value, key):
@@ -1278,9 +1367,18 @@ class ChunkedSeries(_ChunkedCommon):
     def nunique(self, *args, **kwargs) -> int:
         return self._distinct_reduce("nunique", *args, **kwargs)
 
+    def factorize(self, sort: bool = False, **kwargs):
+        from ._reshape import factorize
+
+        return factorize(self, sort=sort, **kwargs)
+
     def apply(self, func, *args, **kwargs):
-        """Elementwise UDF, compiled and run independently on each GPU."""
-        _reject_string_udf([(self.name, self._meta.dtype)])
+        """Elementwise UDF, compiled and run independently on each GPU.
+
+        String UDFs work too: cuDF's compiled-kernel cache is device-aware
+        (``cudf/utils/device.py``), so each GPU keeps its own PTX with its own
+        character-table pointers.
+        """
         return self.map_chunks(lambda c: c.apply(func, *args, **kwargs))
 
     def value_counts(self, **kwargs):
@@ -1293,9 +1391,13 @@ class ChunkedSeries(_ChunkedCommon):
 
         return drop_duplicates(self, **kwargs)
 
-    def sort_values(self, **kwargs):
+    def sort_values(self, by=None, **kwargs):
         from ._ops import sort_values
 
+        # `by` is accepted (and ignored when it names this series) so that code
+        # written against a DataFrame keeps working if a step yields a Series.
+        if by is not None and by not in (self.name, [self.name]):
+            raise KeyError(f"cannot sort a Series by {by!r}")
         return sort_values(self, None, **kwargs)
 
     def groupby(self, by, **kwargs):
@@ -1381,55 +1483,55 @@ class ChunkedSeries(_ChunkedCommon):
 
 
 class _Accessor:
-    """Forwards ``.str`` / ``.dt`` / ``.cat`` / ``.list`` methods per chunk."""
+    """Forwards ``.str`` / ``.dt`` / ``.cat`` / ``.list`` methods per chunk.
 
-    def __init__(self, series: ChunkedSeries, namespace: str) -> None:
+    Resolves eagerly. An earlier version returned a lazy object that only did
+    the work when something touched it, which deadlocked: cuDF's ``as_column``
+    calls ``getattr`` on assigned values, so ``df["y"] = df["x"].dt.year``
+    resolved the accessor *inside* a device worker thread, which then tried to
+    dispatch back to that same single-threaded worker.
+    """
+
+    def __init__(self, series: "ChunkedSeries", namespace: str) -> None:
         self._series = series
         self._namespace = namespace
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
-        # ``.str.upper()`` is a call while ``.dt.year`` is a value; the
-        # returned object resolves to whichever is used.
-        return _AccessorAttr(self._series, self._namespace, name)
-
-
-class _AccessorAttr:
-    """Resolves to a mapped value (property) or a mapped call (method)."""
-
-    def __init__(self, series, namespace, name):
-        self._series = series
-        self._namespace = namespace
-        self._name = name
-
-    def _mapped(self, args=(), kwargs=None, call: bool = False):
-        kwargs = kwargs or {}
         series = self._series
-        namespace, name = self._namespace, self._name
+        namespace = self._namespace
 
-        def run(chunk):
-            attr = getattr(getattr(chunk, namespace), name)
-            return attr(*args, **kwargs) if call else attr
-
-        return _wrap_like(
-            series._run_chunks(run), series._devices, series._runtime
+        # Ask one chunk whether this name is a method or a value. Metadata
+        # only -- it never touches the data.
+        is_method = series._runtime.run(
+            series._devices[0],
+            lambda chunk: callable(getattr(getattr(chunk, namespace), name)),
+            series._chunks[0],
         )
 
-    def __call__(self, *args, **kwargs):
-        return self._mapped(args, kwargs, call=True)
+        if not is_method:
+            return _wrap_like(
+                series._run_chunks(
+                    lambda c: getattr(getattr(c, namespace), name)
+                ),
+                series._devices,
+                series._runtime,
+            )
 
-    def _resolve(self):
-        return self._mapped(call=False)
+        def method(*args, **kwargs):
+            return _wrap_like(
+                series._run_chunks(
+                    lambda c: getattr(getattr(c, namespace), name)(
+                        *args, **kwargs
+                    )
+                ),
+                series._devices,
+                series._runtime,
+            )
 
-    def __getattr__(self, item):
-        return getattr(self._resolve(), item)
-
-    def __repr__(self):
-        return repr(self._resolve())
-
-    def __len__(self):
-        return len(self._resolve())
+        method.__name__ = name
+        return method
 
 
 class ChunkedIndex(_ChunkedCommon):

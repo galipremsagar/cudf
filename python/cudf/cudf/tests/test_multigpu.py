@@ -533,15 +533,33 @@ def test_sample_stays_distributed(strict_fallback, mdf):
     assert len(mdf.sample(n=1000)) == 1000
 
 
+@pytest.mark.filterwarnings("ignore::UserWarning")  # NVRTC header deprecation noise
 def test_numeric_udf_runs_per_chunk(strict_fallback, mdf, pdf):
     got = mdf["b"].apply(lambda x: x * 2 + 1).to_pandas().reset_index(drop=True)
     expected = pdf["b"].apply(lambda x: x * 2 + 1).reset_index(drop=True)
     np.testing.assert_array_equal(got.to_numpy(), expected.to_numpy())
 
 
-def test_string_udf_is_rejected_not_silently_wrong(mdf):
-    with pytest.raises(NotImplementedError, match="string"):
-        mdf["g"].apply(lambda s: s.upper())
+@pytest.mark.filterwarnings("ignore::UserWarning")  # NVRTC header deprecation noise
+def test_string_udf_runs_on_every_gpu(mdf, pdf):
+    """String UDFs compile per device rather than sharing one PTX.
+
+    cuDF bakes libcudf's character-table device pointers into the generated
+    PTX and caches the compiled kernel; keyed without the device, a kernel
+    built on GPU 0 reads foreign memory on GPU 3.
+    """
+    got = mdf["g"].apply(lambda s: s.upper()).to_pandas().reset_index(drop=True)
+    expected = pdf["g"].str.upper().reset_index(drop=True)
+    np.testing.assert_array_equal(got.to_numpy(), expected.to_numpy())
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")  # NVRTC header deprecation noise
+def test_string_udf_returning_scalar(mdf, pdf):
+    got = mdf["g"].apply(lambda s: len(s)).to_pandas().reset_index(drop=True)
+    expected = pdf["g"].str.len().reset_index(drop=True)
+    np.testing.assert_array_equal(
+        got.to_numpy().astype("int64"), expected.to_numpy().astype("int64")
+    )
 
 
 def test_query_and_eval(strict_fallback, mdf, pdf):
@@ -553,24 +571,75 @@ def test_query_and_eval(strict_fallback, mdf, pdf):
     )
 
 
-def test_non_rowwise_methods_are_not_mapped_per_chunk():
-    """Guard against re-adding methods that would give per-chunk-local answers."""
-    from cudf.multigpu._frame import _FallbackMixin
+def test_non_rowwise_methods_are_not_in_the_rowwise_tables():
+    """These must never be added to the per-chunk mapping tables.
 
-    unsafe = ["duplicated", "factorize", "melt", "interpolate", "convert_dtypes"]
-    for name in unsafe:
-        owner = next(
-            (
-                klass
-                for klass in mgpu.ChunkedDataFrame.__mro__
-                if klass is not _FallbackMixin and name in vars(klass)
-            ),
-            None,
-        )
-        assert owner is None, (
-            f"{name} is mapped per chunk but is not row-wise; it would compute "
-            "a chunk-local answer instead of a global one"
-        )
+    Each has a real distributed implementation (see the tests below). Mapping
+    them per chunk instead would return a chunk-local answer that looks
+    plausible and is silently wrong.
+    """
+    from cudf.multigpu import _frame
+
+    unsafe = {"duplicated", "factorize", "melt", "interpolate", "convert_dtypes"}
+    tables = (
+        set(_frame._MAP_METHODS_COMMON)
+        | set(_frame._MAP_METHODS_DATAFRAME)
+        | set(_frame._MAP_METHODS_SERIES)
+    )
+    assert not (unsafe & tables), f"{unsafe & tables} must not be mapped per chunk"
+
+
+# ----------------------------------------------------------------------
+# whole-frame reshaping: answers must be global, not chunk-local
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("keep", ["first", "last", False])
+def test_duplicated_is_global(strict_fallback, mdf, pdf, keep):
+    got = mdf["k"].duplicated(keep=keep).to_pandas().reset_index(drop=True)
+    expected = pdf["k"].duplicated(keep=keep).reset_index(drop=True)
+    np.testing.assert_array_equal(got.to_numpy(), expected.to_numpy())
+    # a chunk-local answer would miss duplicates that span chunks
+    assert int(got.sum()) == int(expected.sum())
+
+
+def test_duplicated_on_subset(strict_fallback, mdf, pdf):
+    got = mdf.duplicated(subset=["k", "g"]).to_pandas().reset_index(drop=True)
+    expected = pdf.duplicated(subset=["k", "g"]).reset_index(drop=True)
+    np.testing.assert_array_equal(got.to_numpy(), expected.to_numpy())
+
+
+def test_factorize_codes_are_global(strict_fallback, mdf, pdf):
+    codes, uniques = mdf["g"].factorize()
+    # decoding the codes must reproduce the original column
+    decoded = np.asarray(uniques)[codes.to_pandas().to_numpy()]
+    np.testing.assert_array_equal(decoded, pdf["g"].to_numpy())
+    assert len(uniques) == pdf["g"].nunique()
+
+
+def test_melt_preserves_pandas_row_order(strict_fallback, runtime, pdf):
+    small = pdf[["k", "b", "c"]].head(400)
+    frame = mgpu.from_pandas(small, npartitions=NPARTS)
+    got = frame.melt(id_vars=["k"], value_vars=["b", "c"]).to_pandas()
+    expected = small.melt(id_vars=["k"], value_vars=["b", "c"])
+    np.testing.assert_array_equal(
+        got["variable"].to_numpy(), expected["variable"].to_numpy()
+    )
+    np.testing.assert_array_equal(got["k"].to_numpy(), expected["k"].to_numpy())
+
+
+def test_interpolate_across_chunk_boundaries(strict_fallback, mdf, pdf):
+    got = mdf["a"].interpolate().to_pandas().reset_index(drop=True)
+    expected = pdf["a"].interpolate().reset_index(drop=True)
+    np.testing.assert_allclose(
+        got.to_numpy(dtype=float),
+        expected.to_numpy(dtype=float),
+        equal_nan=True,
+    )
+
+
+def test_convert_dtypes_uses_one_schema(strict_fallback, mdf):
+    converted = mdf.convert_dtypes()
+    per_chunk = converted._run_chunks(lambda c: tuple(str(d) for d in c.dtypes))
+    assert len(set(per_chunk)) == 1, "chunks disagree on dtypes after conversion"
 
 
 # ----------------------------------------------------------------------

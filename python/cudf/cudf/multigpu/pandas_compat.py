@@ -149,6 +149,7 @@ def install(
     from cudf import pandas as cudf_pandas
 
     cudf_pandas.install()
+    _install_io_overrides(npartitions)
     _installed = True
 
     warnings.warn(
@@ -160,6 +161,53 @@ def install(
         UserWarning,
         stacklevel=2,
     )
+
+
+def wrap_fast(obj):
+    """Wrap a chunked frame in the pandas proxy that fronts it."""
+    from cudf.pandas import fast_slow_proxy as fsp
+
+    proxy_type = fsp.get_final_type_map().get(type(obj))
+    if proxy_type is None:
+        return obj
+    return proxy_type._fsproxy_wrap(obj, None)
+
+
+def _install_io_overrides(npartitions: int | None) -> None:
+    """Point pandas' readers at the multi-GPU readers.
+
+    Without this, ``pd.read_parquet`` resolves to ``cudf.read_parquet``, which
+    materializes the entire file on one device before anything can partition
+    it -- exactly the limit this package exists to remove. The multi-GPU reader
+    assigns row groups to devices first and each GPU reads only its share.
+    """
+    import pandas as pd
+
+    from . import _io
+
+    def read_parquet(path, columns=None, **kwargs):
+        kwargs.pop("engine", None)
+        frame = _io.read_parquet(
+            path, columns=columns, npartitions=npartitions, **kwargs
+        )
+        return wrap_fast(frame)
+
+    def read_csv(path, **kwargs):
+        frame = _io.read_csv(path, npartitions=npartitions, **kwargs)
+        return wrap_fast(frame)
+
+    read_parquet.__name__ = "read_parquet"
+    read_csv.__name__ = "read_csv"
+    try:
+        pd.read_parquet = read_parquet
+        pd.read_csv = read_csv
+    except Exception as exc:  # pragma: no cover - module proxy may be sealed
+        warnings.warn(
+            f"could not install multi-GPU pandas readers ({exc}); "
+            "pd.read_parquet will build each table on a single GPU",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def _intermediate_replacements() -> dict:

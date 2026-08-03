@@ -92,16 +92,20 @@ class DeviceRuntime:
         self.devices: tuple[int, ...] = tuple(devices)
         self._mrs: dict[int, Any] = {}
         self._executors: dict[int, ThreadPoolExecutor] = {}
+        #: worker thread ident -> the device it is pinned to
+        self._worker_devices: dict[int, int] = {}
         self._closed = False
         self._lock = threading.Lock()
 
         # --- 0. Make cuDF's process-wide caches device-aware.
-        # cuDF caches converted pyarrow scalars, which own *device* memory.
-        # Without this, `df + 1` evaluated on GPU 3 can reuse a scalar that
-        # was allocated on GPU 0 and fault.
-        from cudf.utils.scalar import enable_multi_device_scalar_cache
+        # cuDF caches values that only work on the device that made them:
+        # converted pyarrow scalars (device memory) and compiled UDF kernels
+        # (PTX with libcudf's character-table device pointers baked in).
+        # Without this, `df + 1` or a string UDF evaluated on GPU 3 can reuse
+        # something allocated on GPU 0 and fault.
+        from cudf.utils.device import enable_multi_device_caches
 
-        enable_multi_device_scalar_cache()
+        enable_multi_device_caches()
         _check_unsupported_features()
 
         # --- 1. Install a memory resource per device.
@@ -135,10 +139,12 @@ class DeviceRuntime:
                 initializer=_pin_thread_to_device,
                 initargs=(d,),
             )
-        # Force each worker to actually start and pin itself now, so that
-        # later failures are not attributed to unrelated work.
+        # Force each worker to start and pin itself now, so later failures are
+        # not attributed to unrelated work, and record which thread is which so
+        # re-entrant calls can be detected.
         for d in self.devices:
-            self._executors[d].submit(_current_device).result()
+            ident = self._executors[d].submit(threading.get_ident).result()
+            self._worker_devices[ident] = d
 
         # --- 3. Verify that cross-device copies actually work.
         # On some multi-GPU boxes ``cudaDeviceCanAccessPeer`` reports true and
@@ -156,10 +162,29 @@ class DeviceRuntime:
         return len(self.devices)
 
     def submit(self, device: int, fn: Callable, *args, **kwargs) -> Future:
-        """Submit ``fn`` to run on ``device``'s worker thread."""
+        """Submit ``fn`` to run on ``device``'s worker thread.
+
+        A call made *from* a worker thread that targets that same worker's
+        device runs inline. Each device has exactly one worker, so queueing
+        such a call would wait for a thread that is already busy waiting --
+        i.e. deadlock. This happens for real: cuDF's ``as_column`` calls
+        ``getattr`` on the values it is given, which can re-enter this layer
+        from inside a chunk operation.
+        """
         if self._closed:
             raise RuntimeError("DeviceRuntime has been shut down")
+        if self._worker_devices.get(threading.get_ident()) == device:
+            future: Future = Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 - propagated via future
+                future.set_exception(exc)
+            return future
         return self._executors[device].submit(fn, *args, **kwargs)
+
+    def current_worker_device(self) -> int | None:
+        """The device this thread is pinned to, or ``None`` if not a worker."""
+        return self._worker_devices.get(threading.get_ident())
 
     def run(self, device: int, fn: Callable, *args, **kwargs) -> Any:
         """Run ``fn`` on ``device`` and return its result."""
@@ -276,12 +301,12 @@ class DeviceRuntime:
             if self._closed:
                 return
             self._closed = True
-            # Cached device scalars must die before their memory resources do:
+            # Cached device values must die before their memory resources do:
             # ``plc.Scalar`` does not keep its MR alive, so freeing them after
             # the pools are gone segfaults at interpreter exit.
-            from cudf.utils.scalar import clear_scalar_cache
+            from cudf.utils.device import clear_device_caches
 
-            clear_scalar_cache()
+            clear_device_caches()
             for ex in self._executors.values():
                 ex.shutdown(wait=True)
             self._executors.clear()

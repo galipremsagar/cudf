@@ -22,6 +22,7 @@ from numba.types import CPointer, Record, Tuple, int64, void
 
 import rmm
 
+from cudf.utils.device import cache_device_key, register_device_cache
 from cudf._lib import strings_udf
 from cudf.core.buffer import as_buffer
 from cudf.core.dtype.validators import is_dtype_obj_string
@@ -150,6 +151,11 @@ def make_cache_key(udf, sig):
     """
     Build a cache key for a user defined function. Used to avoid
     recompiling the same function for the same set of types
+
+    The current device is part of the key. String UDFs are lowered with
+    libcudf's character-table *device pointers* baked into the generated PTX
+    (see ``strings_lowering.py``), and those tables are per-CUDA-context, so a
+    kernel compiled on one GPU reads foreign memory if reused on another.
     """
     codebytes = udf.__code__.co_code
     constants = udf.__code__.co_consts
@@ -161,7 +167,7 @@ def make_cache_key(udf, sig):
     else:
         cvarbytes = b""
 
-    return names, constants, codebytes, cvarbytes, sig
+    return names, constants, codebytes, cvarbytes, sig, cache_device_key()
 
 
 def compile_udf(udf, type_signature):
@@ -351,3 +357,13 @@ def column_to_string_view_array_init_heap(col: plc.Column) -> Buffer:
 
 class UDFError(RuntimeError):
     pass
+
+
+def _clear_udf_caches() -> None:
+    """Drop compiled-UDF caches (their PTX embeds device pointers)."""
+    precompiled.clear()
+    _udf_code_cache.clear()
+    _make_free_string_kernel.cache_clear()
+
+
+register_device_cache(_clear_udf_caches)

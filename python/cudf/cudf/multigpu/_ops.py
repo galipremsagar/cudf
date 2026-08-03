@@ -32,6 +32,8 @@ from ._frame import (
     ChunkedSeries,
     _concat_parts,
     _wrap_like,
+    drop_empty_chunks,
+    unwrap_proxy,
 )
 from ._shuffle import assign_targets, hash_shuffle, map_shuffle
 
@@ -144,9 +146,15 @@ class ChunkedGroupBy:
         return self._maybe_squeeze(result, spec)
 
     def _maybe_squeeze(self, result, spec):
-        """``gb["v"].sum()`` is a Series, not a one-column DataFrame."""
+        """``gb["v"].sum()`` is a Series -- but only when ``as_index=True``.
+
+        With ``as_index=False`` pandas keeps the grouping key as a column and
+        returns a DataFrame, which callers then merge on.
+        """
         column = self._single_column
-        if column is None or isinstance(spec, (list, tuple)):
+        if column is None or not self._as_index:
+            return result
+        if isinstance(spec, (list, tuple)):
             return result
         if isinstance(spec, dict) and not isinstance(spec.get(column), str):
             return result
@@ -242,16 +250,20 @@ class ChunkedGroupBy:
         return [c for c in frame.columns if c not in self._keys]
 
     def apply(self, func, *args, **kwargs):
+        """Run a per-group UDF after moving each group onto a single GPU."""
         frame = self._frame_as_dataframe()
         shuffled = hash_shuffle(frame, self._keys, nparts=self._nparts())
-        return shuffled.map_chunks(
+        applied = shuffled.map_chunks(
             _local_apply,
             keys=self._keys,
             func=func,
             args=args,
             kwargs=kwargs,
             dropna=self._dropna,
+            as_index=self._as_index,
+            sort=self._sort,
         )
+        return drop_empty_chunks(applied)
 
     def __repr__(self) -> str:
         return f"<ChunkedGroupBy by={self._by} over {self._frame.nchunks} chunks>"
@@ -336,10 +348,13 @@ def _combine_size(chunk, keys, as_index, sort):
     return result.rename(columns={"__mg_size": "size"})
 
 
-def _local_apply(chunk, keys, func, args, kwargs, dropna):
-    if len(chunk) == 0:
-        return chunk.head(0)
-    return chunk.groupby(keys, dropna=dropna).apply(func, *args, **kwargs)
+def _local_apply(chunk, keys, func, args, kwargs, dropna, as_index, sort):
+    # as_index must be threaded through: with as_index=False pandas returns the
+    # group key as a column and the result as a DataFrame, and callers go on to
+    # assign .columns or sort by the key.
+    return chunk.groupby(
+        keys, dropna=dropna, as_index=as_index, sort=sort
+    ).apply(func, *args, **kwargs)
 
 
 # ----------------------------------------------------------------------
@@ -362,6 +377,8 @@ def merge(
     partitioning intact.  Otherwise both sides are hash-partitioned on the join
     keys so that matching rows meet on the same GPU.
     """
+    left = unwrap_proxy(left)
+    right = unwrap_proxy(right)
     if on is None and left_on is None and right_on is None:
         on = [c for c in left.columns if c in _columns_of(right)]
         if not on:
@@ -483,11 +500,24 @@ def sort_values(
     is_series = isinstance(frame, ChunkedSeries)
     nparts = nparts or max(frame.nchunks, runtime.n_devices)
     if nparts == 1 or len(frame) == 0:
-        return frame.map_chunks(
+        out = frame.map_chunks(
             lambda c: _local_sort(c, by, ascending, na_position, is_series)
         )
+        return out.reset_index(drop=True) if ignore_index else out
 
     keys = _as_list(by)
+    directions = (
+        list(ascending) if isinstance(ascending, (list, tuple)) else None
+    )
+    leading_ascending = directions[0] if directions else bool(ascending)
+
+    # Range-partition on the leading key only when the sort directions differ
+    # between keys. Bucketing by a multi-column lexicographic comparison is
+    # only order-preserving when every key sorts the same way. Using just the
+    # first key stays correct because rows sharing a first-key value always
+    # land in the same bucket, so the local sort settles the rest.
+    if directions is not None and len(set(directions)) > 1:
+        keys = keys[:1]
 
     # 1. sample the key space from every chunk (host-side, tiny)
     samples = frame._run_chunks(
@@ -506,7 +536,9 @@ def sort_values(
 
     # 2. assign every row a bucket, then shuffle so buckets are contiguous
     part_ids = frame.map_chunks(
-        lambda c: _bucket_of(c, keys, splitters, is_series, ascending, n_buckets)
+        lambda c: _bucket_of(
+            c, keys, splitters, is_series, leading_ascending, n_buckets
+        )
     )
     shuffled = map_shuffle(frame, part_ids, n_buckets)
 
