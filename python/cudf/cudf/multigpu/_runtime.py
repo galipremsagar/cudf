@@ -288,12 +288,9 @@ class DeviceRuntime:
         def _recv(_ignored):
             dst = DeviceBuffer(size=n)
             _chk(cudart.cudaMemset(dst.ptr, 0, n), "validate memset")
-            _chk(
-                cudart.cudaMemcpyPeer(
-                    dst.ptr, _current_device(), src.ptr, src_dev, n
-                ),
-                "validate peer copy",
-            )
+            from ._transfer import copy_across_devices
+
+            copy_across_devices(dst.ptr, src.ptr, n)
             _chk(cudart.cudaDeviceSynchronize(), "validate sync")
             out = np.zeros(n, dtype=np.uint8)
             _chk(

@@ -64,6 +64,49 @@ class _BufferView:
         }
 
 
+def is_managed(ptr: int) -> bool:
+    """Whether ``ptr`` is a cudaMallocManaged allocation."""
+    err, attrs = cudart.cudaPointerGetAttributes(int(ptr))
+    if err != cudart.cudaError_t.cudaSuccess:
+        return False
+    return attrs.type == cudart.cudaMemoryType.cudaMemoryTypeManaged
+
+
+def copy_across_devices(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Copy between two device allocations that may live on different GPUs.
+
+    Managed allocations are staged through host memory. A direct
+    managed-to-managed copy is silently wrong on hardware where P2P is
+    advertised but not functional -- it yields zeros -- and a managed pointer
+    is not owned by a device, so the peer-copy API cannot express the intent
+    either. Plain device allocations take the direct path, which is correct
+    and reaches full PCIe bandwidth.
+    """
+    if not (is_managed(src_ptr) or is_managed(dst_ptr)):
+        _chk(
+            cudart.cudaMemcpyAsync(
+                dst_ptr, src_ptr, nbytes,
+                cudart.cudaMemcpyKind.cudaMemcpyDefault, 0,
+            ),
+            "cudaMemcpyAsync",
+        )
+        return
+    import numpy as np
+
+    staging = np.empty(nbytes, dtype=np.uint8)
+    host = staging.ctypes.data
+    _chk(
+        cudart.cudaMemcpy(host, src_ptr, nbytes,
+                          cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost),
+        "managed stage out",
+    )
+    _chk(
+        cudart.cudaMemcpy(dst_ptr, host, nbytes,
+                          cudart.cudaMemcpyKind.cudaMemcpyHostToDevice),
+        "managed stage in",
+    )
+
+
 def _layout(sizes: Sequence[int]) -> tuple[list[int], int]:
     """Offsets for packing ``sizes`` back-to-back with alignment."""
     offsets = []
@@ -122,12 +165,7 @@ def _receive(
         src_ptr, nbytes = spec
         if nbytes == 0:
             continue
-        _chk(
-            cudart.cudaMemcpyPeerAsync(
-                base_ptr + offset, dst_device, src_ptr, src_device, nbytes, 0
-            ),
-            "cudaMemcpyPeerAsync",
-        )
+        copy_across_devices(base_ptr + offset, src_ptr, nbytes)
     _chk(cudart.cudaStreamSynchronize(0), "transfer stream sync")
 
     new_frames: list[Any] = []
