@@ -213,13 +213,38 @@ def _install_io_overrides(npartitions: int | None) -> None:
                 return wrap_fast(chunked_concat(items, **kwargs))
         return original_concat(objs, *args, **kwargs)
 
+    original_to_datetime = pd.to_datetime
+
+    def to_datetime(arg, *args, **kwargs):
+        """Convert per chunk, instead of through pandas' scalar-cache path.
+
+        ``pd.to_datetime`` first calls ``should_cache``, which builds a set of
+        the values to decide whether caching pays -- so it hashes every element
+        of the frame. That is meaningless work for a column already on the GPUs,
+        and on a chunked frame it lands in pandas' own implementation and drags
+        the whole column to the host. The conversion itself is elementwise, so
+        chunks convert independently and nothing has to move.
+        """
+        from ._frame import ChunkedFrame
+
+        inner = _unwrap(arg)
+        if isinstance(inner, ChunkedFrame):
+            return wrap_fast(
+                inner.map_chunks(
+                    lambda c: cudf.to_datetime(c, *args, **kwargs)
+                )
+            )
+        return original_to_datetime(arg, *args, **kwargs)
+
     read_parquet.__name__ = "read_parquet"
     read_csv.__name__ = "read_csv"
     concat.__name__ = "concat"
+    to_datetime.__name__ = "to_datetime"
     try:
         pd.read_parquet = read_parquet
         pd.read_csv = read_csv
         pd.concat = concat
+        pd.to_datetime = to_datetime
     except Exception as exc:  # pragma: no cover - module proxy may be sealed
         warnings.warn(
             f"could not install multi-GPU pandas readers ({exc}); "

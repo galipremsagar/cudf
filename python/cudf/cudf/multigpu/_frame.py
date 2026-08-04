@@ -1350,6 +1350,14 @@ class _LocIndexer:
 class ChunkedDataFrame(_ChunkedCommon):
     """A :class:`cudf.DataFrame` partitioned by rows across several GPUs."""
 
+    #: pandas identifies its own types structurally rather than by isinstance:
+    #: ``ABCSeries.__instancecheck__`` reads ``inst._typ`` and compares it to a
+    #: string. Without it, ``pd.to_datetime`` and friends raise AttributeError
+    #: on a chunked frame, which cudf.pandas turns into a silent CPU fallback --
+    #: so the query still answers correctly, just not on the GPU.
+    _typ = "dataframe"
+
+
     _cudf_type = cudf.DataFrame
 
     @property
@@ -1539,6 +1547,14 @@ def _setitem(chunk, value, key):
 
 class ChunkedSeries(_ChunkedCommon):
     """A :class:`cudf.Series` partitioned by rows across several GPUs."""
+
+    #: pandas identifies its own types structurally rather than by isinstance:
+    #: ``ABCSeries.__instancecheck__`` reads ``inst._typ`` and compares it to a
+    #: string. Without it, ``pd.to_datetime`` and friends raise AttributeError
+    #: on a chunked frame, which cudf.pandas turns into a silent CPU fallback --
+    #: so the query still answers correctly, just not on the GPU.
+    _typ = "series"
+
 
     _cudf_type = cudf.Series
 
@@ -1752,6 +1768,14 @@ class _Accessor:
 
 class ChunkedIndex(_ChunkedCommon):
     """A :class:`cudf.Index` partitioned across several GPUs."""
+
+    #: pandas identifies its own types structurally rather than by isinstance:
+    #: ``ABCSeries.__instancecheck__`` reads ``inst._typ`` and compares it to a
+    #: string. Without it, ``pd.to_datetime`` and friends raise AttributeError
+    #: on a chunked frame, which cudf.pandas turns into a silent CPU fallback --
+    #: so the query still answers correctly, just not on the GPU.
+    _typ = "index"
+
 
     _cudf_type = cudf.Index
 

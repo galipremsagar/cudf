@@ -8,7 +8,11 @@ from decimal import Decimal
 
 import pandas as pd
 
-_ZERO = Decimal("0.00")
+# Sums are taken in float64, not Decimal: libcudf has no groupby sum for
+# decimal columns, so an exact-decimal translation silently falls back to
+# pandas on the GPU. TPC-DS money values are far inside float64's exact range
+# and the answer is compared to DuckDB at rtol=1e-6.
+_ZERO = 0.0
 _START = "2000-08-23"
 _END = "2000-09-06"
 _MEASURES = ["sales", "returns_", "profit"]
@@ -33,6 +37,8 @@ def _channel_rows(sales, returns, dates, dimension, sales_key, dim_key, id_colum
 
     columns = ["outlet_sk", "sales_price", "profit", "return_amt", "net_loss"]
     both = pd.concat([sales[columns], returns[columns]], ignore_index=True)
+    for name in ("sales_price", "profit", "return_amt", "net_loss"):
+        both[name] = both[name].astype("float64")
 
     joined = both.merge(
         dimension, left_on="outlet_sk", right_on=dim_key, how="inner"
