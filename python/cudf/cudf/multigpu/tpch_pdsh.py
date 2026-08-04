@@ -30,6 +30,8 @@ import time
 import traceback
 from typing import Any
 
+from cuda.bindings import runtime as cudart
+
 GIB = 1 << 30
 
 #: host RSS growth (GiB) during one query above which it must have been
@@ -44,6 +46,21 @@ class _RunConfig:
         self.dataset_path = dataset_path
         self.scale_factor = scale_factor
         self.suffix = suffix
+
+
+def _context_is_dead() -> bool:
+    """Whether the CUDA context has taken a sticky error.
+
+    Some CUDA errors -- an illegal address, a hardware fault -- poison the
+    context: every subsequent call fails regardless of what it asks for. A
+    trivial allocation is the cheapest way to ask, since it needs no kernel
+    launch and would only fail here for that reason.
+    """
+    err, ptr = cudart.cudaMalloc(256)
+    if err == cudart.cudaError_t.cudaSuccess:
+        cudart.cudaFree(ptr)
+        return False
+    return True
 
 
 def _host_rss_gib() -> float:
@@ -216,6 +233,18 @@ def main() -> None:
                   f"{type(exc).__name__}: {str(exc)[:90]}")
             if args.traceback:
                 traceback.print_exc()
+            if _context_is_dead():
+                # A sticky CUDA error leaves the context unusable, so every
+                # later query fails on its first allocation no matter how
+                # small. Continuing would print 21 more failures that say
+                # nothing about those queries -- and a reader counting them
+                # would conclude the workload failed, rather than that it
+                # stopped. Report what was actually measured and stop.
+                aborted = [n for n in numbers[numbers.index(number) + 1:]]
+                print(f"{'':>6}  {'ABORTED':<10}{'-':>10}{'':>10}  "
+                      f"CUDA context unusable; q{number} was fatal, "
+                      f"{len(aborted)} queries not attempted")
+                break
 
     print("-" * 78)
     ok = len(timings)

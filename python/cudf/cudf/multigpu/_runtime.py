@@ -128,16 +128,21 @@ class DeviceRuntime:
                         # working set is bounded by host RAM rather than by the
                         # GPU. Much slower when it actually migrates -- this
                         # buys the ability to run at all, not speed.
-                        upstream = rmm.mr.ManagedMemoryResource()
+                        #
+                        # Deliberately *not* wrapped in a pool. A pool suballocates
+                        # from large contiguous blocks and grows by doubling, so it
+                        # asks the driver for one enormous managed region rather
+                        # than many ordinary ones. Managed memory oversubscribes
+                        # happily -- 400 GiB on a 95 GiB device here -- but that
+                        # single doubling request is what fails, and it fails as a
+                        # sticky CUDA error rather than a clean bad_alloc. Paying
+                        # cudaMallocManaged per allocation is the cost of having
+                        # host RAM actually be reachable.
+                        mr = rmm.mr.ManagedMemoryResource()
                         try:
-                            upstream = rmm.mr.PrefetchResourceAdaptor(upstream)
+                            mr = rmm.mr.PrefetchResourceAdaptor(mr)
                         except Exception:
                             pass  # prefetch is an optimization, not required
-                        mr = rmm.mr.PoolMemoryResource(
-                            upstream,
-                            initial_pool_size=initial,
-                            maximum_pool_size=None,
-                        )
                     elif memory_resource == "async":
                         # cudaMallocAsync returns memory to the driver once a
                         # pool exceeds its release threshold. A classic RMM

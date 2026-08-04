@@ -16,9 +16,10 @@ spans 10 s to 45 min across the sweep, so the axis is log; a log axis flatters
 differences, so the multiplier between the lines is written on the chart rather
 than left to be estimated from the gap.
 
-A point is plotted only where that configuration was actually measured. Single
-GPU stops at SF300 because SF500 does not fit in 97 GiB at all -- that absence is
-the result, so it is annotated rather than interpolated over.
+A point is plotted only where that configuration was actually measured. The
+single-GPU series stops at SF300 because it was not run further -- by then it
+needed 44 minutes and was answering only 8 of 22 queries on the GPU. That is a
+limit of the measurement, not a measured limit, so the chart says which.
 
 Colour: three series, one hue each, fixed order, validated for CVD separation
 (OKLab dE >= 8 on every adjacent pair under protan/deutan/tritan). The green sits
@@ -120,14 +121,19 @@ def build(data, theme_name="light"):
     fig, (cap, cost) = plt.subplots(1, 2, figsize=(13.6, 6.0), dpi=200)
     fig.patch.set_facecolor(t["surface"])
 
+    # Scale factors are plotted at even spacing rather than on a log axis.
+    # The five sampled values are 1, 100, 300, 500, 1000, which on a log axis
+    # crowd the last three into an unreadable smear while stranding SF1. The
+    # comparison being made is between the series at each scale, not the
+    # spacing between scales, so evenness costs nothing and is stated here.
+    at = {s: i for i, s in enumerate(SCALES)}
+
     for ax in (cap, cost):
         ax.set_facecolor(t["surface"])
-        ax.set_xscale("log")
-        ax.set_xticks(SCALES)
+        ax.set_xticks(range(len(SCALES)))
         ax.set_xticklabels([f"SF{s}" for s in SCALES], fontsize=10.5,
                            color=t["muted"])
-        ax.minorticks_off()
-        ax.set_xlim(0.7, 1700)
+        ax.set_xlim(-0.35, len(SCALES) - 0.65)
         ax.grid(color=t["grid"], linewidth=0.8, zorder=0)
         ax.set_axisbelow(True)
         for side in ("top", "right"):
@@ -141,41 +147,59 @@ def build(data, theme_name="light"):
         color = t["series"][i % len(t["series"])]
         xs = sorted(points)
 
-        cap.plot(xs, [points[x][0] for x in xs], "-o", color=color,
-                 linewidth=2.0, markersize=9, markeredgecolor=t["surface"],
-                 markeredgewidth=2, zorder=3)
-        cost.plot(xs, [points[x][2] for x in xs], "-o", color=color,
-                  linewidth=2.0, markersize=9, markeredgecolor=t["surface"],
-                  markeredgewidth=2, zorder=3)
-
-        # direct label at the right end of each series -- required, since the
-        # green fails the 3:1 contrast floor and may not carry identity alone
-        cap.annotate(label, (xs[-1], points[xs[-1]][0]), xytext=(10, 0),
+        cap.plot([at[x] for x in xs], [points[x][0] for x in xs], "-o",
+                 color=color, linewidth=2.0, markersize=9,
+                 markeredgecolor=t["surface"], markeredgewidth=2, zorder=3)
+        cap.annotate(label, (at[xs[-1]], points[xs[-1]][0]), xytext=(10, 0),
                      textcoords="offset points", va="center", fontsize=9.5,
                      color=t["text"], fontweight="medium")
-        cost.annotate(_fmt(points[xs[-1]][2]),
-                      (xs[-1], points[xs[-1]][2]), xytext=(10, 0),
-                      textcoords="offset points", va="center", fontsize=9.5,
-                      color=t["text"], fontweight="medium")
 
-    # a log axis makes a 40x gap look like a short hop; say the number
+        # A run that answered fewer queries did less work, so its total is not
+        # on the same footing as a complete one. Plotting them on one line made
+        # the pool appear to get *faster* from SF500 to SF1000, when what
+        # actually happened is that seven queries ran out of memory. Complete
+        # runs carry the line; incomplete ones are drawn detached and open, and
+        # labelled with what they managed.
+        whole = [x for x in xs if points[x][1] == 22]
+        partial = [x for x in xs if points[x][1] != 22]
+        if whole:
+            cost.plot([at[x] for x in whole], [points[x][2] for x in whole],
+                      "-o", color=color, linewidth=2.0, markersize=9,
+                      markeredgecolor=t["surface"], markeredgewidth=2, zorder=3)
+            cost.annotate(_fmt(points[whole[-1]][2]),
+                          (at[whole[-1]], points[whole[-1]][2]), xytext=(10, 0),
+                          textcoords="offset points", va="center", fontsize=9.5,
+                          color=t["text"], fontweight="medium")
+        for x in partial:
+            cost.plot([at[x]], [points[x][2]], "o", color=t["surface"],
+                      markersize=9, markeredgecolor=color, markeredgewidth=2,
+                      zorder=3)
+            cost.annotate(f"only {points[x][1]}/22", (at[x], points[x][2]),
+                          xytext=(0, -18), textcoords="offset points",
+                          ha="center", fontsize=8.5, color=t["muted"],
+                          style="italic")
+
     by_label = dict(data)
     stock = by_label.get("1 GPU, stock cudf.pandas", {})
     pool = by_label.get("8 GPUs, pool", {})
+    # a log axis makes a 45x gap look like a short hop; say the number
     for scale in sorted(set(stock) & set(pool)):
+        if stock[scale][1] != 22 or pool[scale][1] != 22:
+            continue
         ratio = stock[scale][2] / pool[scale][2]
         if ratio < 2:
             continue
-        cost.annotate(f"{ratio:.0f}x", (scale, (stock[scale][2] * pool[scale][2]) ** 0.5),
-                      ha="center", va="center", fontsize=11,
+        cost.annotate(f"{ratio:.0f}x faster",
+                      (at[scale], (stock[scale][2] * pool[scale][2]) ** 0.5),
+                      ha="center", va="center", fontsize=10.5,
                       color=t["text"], fontweight="semibold",
-                      bbox=dict(boxstyle="round,pad=0.28", fc=t["surface"],
+                      bbox=dict(boxstyle="round,pad=0.3", fc=t["surface"],
                                 ec=t["grid"], lw=0.8))
 
     if stock:
         last = max(stock)
-        cap.annotate("single GPU cannot hold\nSF500 at all",
-                     (last, stock[last][0]), xytext=(6, -46),
+        cap.annotate("not run past SF300: already 44 min\nwith 8 of 22 on the GPU",
+                     (at[last], stock[last][0]), xytext=(14, -44),
                      textcoords="offset points", fontsize=9,
                      color=t["muted"], style="italic",
                      arrowprops=dict(arrowstyle="->", color=t["grid"], lw=1.0))
@@ -183,7 +207,7 @@ def build(data, theme_name="light"):
     cap.set_ylim(0, 24.5)
     cap.set_yticks([0, 5, 10, 15, 20, 22])
     cap.axhline(22, color=t["grid"], linewidth=1.0, linestyle="--", zorder=1)
-    cap.annotate("all 22", (0.78, 22), xytext=(0, 5),
+    cap.annotate("all 22", (-0.3, 22), xytext=(0, 5),
                  textcoords="offset points", fontsize=9, color=t["muted"])
     cap.set_ylabel("queries completed on GPU, of 22", fontsize=10.5,
                    color=t["muted"], labelpad=8)
@@ -204,10 +228,9 @@ def build(data, theme_name="light"):
              "that silently fell back to pandas is a failure, not a result.",
              ha="left", fontsize=10.5, color=t["muted"])
     fig.text(0.012, 0.022,
-             "Points are measured, never interpolated; a missing point means "
-             "that configuration could not run that scale. Times cover the "
-             "queries that completed, so a line with fewer completions is "
-             "being flattered.",
+             "Scale factors are evenly spaced, not to scale. Right panel: "
+             "only runs that answered all 22 queries are joined by a line -- "
+             "an open marker did less work, so its total is not comparable.",
              ha="left", fontsize=9, color=t["muted"])
     fig.subplots_adjust(left=0.075, right=0.80, top=0.80, bottom=0.135,
                         wspace=0.42)
