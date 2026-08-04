@@ -18,6 +18,8 @@ onto the same GPU, then let ordinary single-GPU cuDF do the actual work.
 from __future__ import annotations
 
 import itertools
+import os
+import sys
 from typing import Any, Hashable, Sequence
 
 import numpy as np
@@ -35,7 +37,12 @@ from ._frame import (
     drop_empty_chunks,
     unwrap_proxy,
 )
-from ._shuffle import assign_targets, hash_shuffle, map_shuffle
+from ._shuffle import (
+    assign_targets,
+    default_nparts,
+    hash_shuffle,
+    map_shuffle,
+)
 
 __all__ = [
     "ChunkedGroupBy",
@@ -47,8 +54,18 @@ __all__ = [
     "series_value_counts",
 ]
 
-#: bytes below which the right side of a join is replicated instead of shuffled
+#: bytes below which the right side of a join is always replicated
 BROADCAST_THRESHOLD = 1 << 30
+
+#: Replicating the right side costs ``right * ndevices``; shuffling instead
+#: costs roughly a copy of *both* sides plus the serialization and destination
+#: buffers on top. So broadcast whenever replication is the cheaper of the two,
+#: not just when the right side is small in absolute terms -- otherwise a
+#: mid-sized dimension table drags a huge fact table through a full shuffle.
+BROADCAST_COST_RATIO = 1.0
+
+#: set CUDF_MULTIGPU_DEBUG=1 to print each join's sizes and chosen strategy
+DEBUG = bool(os.environ.get("CUDF_MULTIGPU_DEBUG"))
 
 #: aggregation -> (local partial aggregation, combine of the partials)
 _DECOMPOSABLE = {
@@ -167,7 +184,7 @@ class ChunkedGroupBy:
     def _nparts(self) -> int:
         if self._split_out is not None:
             return self._split_out
-        return max(self._frame.nchunks, self._frame.runtime.n_devices)
+        return default_nparts(self._frame, list(self._frame.runtime.devices))
 
     # -- entry points ------------------------------------------------
     def agg(self, spec=None, **kwargs):
@@ -422,25 +439,67 @@ def _local_apply(chunk, keys, func, args, kwargs, dropna, as_index, sort):
 # ----------------------------------------------------------------------
 # join
 # ----------------------------------------------------------------------
-def merge(
-    left: ChunkedDataFrame,
-    right,
-    on=None,
-    left_on=None,
-    right_on=None,
-    how: str = "inner",
-    broadcast: bool | None = None,
-    nparts: int | None = None,
-    **kwargs,
-) -> ChunkedDataFrame:
-    """Join two frames.
+#: Plan joins instead of running them, so that a filter written after a join
+#: can be pushed underneath it (see _lazy.py). Set False to force the old
+#: execute-immediately behaviour.
+LAZY_JOINS = True
+
+
+def normalize_merge_kwargs(kwargs: dict) -> dict:
+    """Canonical merge arguments, so a plan can be compared and replayed."""
+    plan = {
+        "on": kwargs.pop("on", None),
+        "left_on": kwargs.pop("left_on", None),
+        "right_on": kwargs.pop("right_on", None),
+        "how": kwargs.pop("how", "inner"),
+        "broadcast": kwargs.pop("broadcast", None),
+        "nparts": kwargs.pop("nparts", None),
+    }
+    plan.update(kwargs)
+    return plan
+
+
+def merge(left: ChunkedDataFrame, right, **kwargs):
+    """Plan a join. Nothing is computed until the result is used.
+
+    Deferring is what makes predicate pushdown possible: a filter applied to
+    the joined frame can be rewritten into a filter on one of the inputs, so
+    the join runs on less data.
+    """
+    left = unwrap_proxy(left)
+    right = unwrap_proxy(right)
+    plan = normalize_merge_kwargs(dict(kwargs))
+    if not LAZY_JOINS or not isinstance(right, ChunkedFrame):
+        return execute_merge(left, right, plan)
+
+    from ._lazy import JoinPlan
+
+    return ChunkedDataFrame(plan=JoinPlan(left, right, plan))
+
+
+def execute_merge(left, right, plan: dict) -> ChunkedDataFrame:
+    """Actually run a planned join.
 
     Small right-hand sides are replicated to every GPU, which keeps ``left``'s
     partitioning intact.  Otherwise both sides are hash-partitioned on the join
     keys so that matching rows meet on the same GPU.
     """
+    plan = dict(plan)
+    on = plan.pop("on", None)
+    left_on = plan.pop("left_on", None)
+    right_on = plan.pop("right_on", None)
+    how = plan.pop("how", "inner")
+    broadcast = plan.pop("broadcast", None)
+    nparts = plan.pop("nparts", None)
+    kwargs = plan
+
+    # inputs may themselves be planned joins; run them first
     left = unwrap_proxy(left)
     right = unwrap_proxy(right)
+    if getattr(left, "_plan", None) is not None:
+        left._materialize()
+    if getattr(right, "_plan", None) is not None:
+        right._materialize()
     if on is None and left_on is None and right_on is None:
         on = [c for c in left.columns if c in _columns_of(right)]
         if not on:
@@ -454,7 +513,18 @@ def merge(
         )
 
     if broadcast is None:
-        broadcast = how in ("inner", "left") and right.nbytes <= BROADCAST_THRESHOLD
+        left_bytes, right_bytes = left.nbytes, right.nbytes
+        replicate_cost = right_bytes * runtime_of(left).n_devices
+        broadcast = how in ("inner", "left") and (
+            right_bytes <= BROADCAST_THRESHOLD
+            or replicate_cost <= left_bytes * BROADCAST_COST_RATIO
+        )
+        if DEBUG:
+            print(f"[multigpu] merge how={how} left={left_bytes / (1 << 30):.2f}G "
+                  f"right={right_bytes / (1 << 30):.2f}G "
+                  f"replicate={replicate_cost / (1 << 30):.2f}G -> "
+                  f"{'broadcast' if broadcast else 'shuffle'}",
+                  file=sys.stderr, flush=True)
     if broadcast:
         if how not in ("inner", "left"):
             raise ValueError(
@@ -468,8 +538,12 @@ def merge(
         )
 
     runtime = left.runtime
-    nparts = nparts or max(left.nchunks, runtime.n_devices)
     devices = list(runtime.devices)
+    if nparts is None:
+        # both sides must use the same count or matching keys land in
+        # different partitions; size it from whichever side is bigger
+        nparts = max(default_nparts(left, devices),
+                     default_nparts(right, devices))
     left_s = hash_shuffle(left, left_keys, nparts=nparts, devices=devices)
     right_s = hash_shuffle(right, right_keys, nparts=nparts, devices=devices)
 
@@ -484,6 +558,10 @@ def merge(
         for i in range(nparts)
     ]
     return _wrap_like(runtime.run_many(jobs), targets, runtime)
+
+
+def runtime_of(frame):
+    return frame.runtime
 
 
 def _broadcast_merge(

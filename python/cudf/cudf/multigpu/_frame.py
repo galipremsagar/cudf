@@ -190,14 +190,32 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
     #: the single-GPU cuDF type this wraps
     _cudf_type: type = object
 
+    #: a not-yet-executed join, or None. Kept on this class rather than a
+    #: subclass on purpose: cudf.pandas decides whether to wrap a result with
+    #: `type(result) in get_final_type_map()`, an *exact* type test, so a
+    #: subclass would silently escape the proxy -- taking --strict's
+    #: fallback detection with it.
+    _plan = None
+
     def __init__(
         self,
         chunks: Sequence[Any] = None,
         devices: Sequence[int] | None = None,
         runtime: DeviceRuntime | None = None,
         lengths: Sequence[int] | None = None,
+        *,
+        plan=None,
         **kwargs: Any,
     ) -> None:
+        if plan is not None:
+            # a planned join: no chunks until something needs them
+            self._plan = plan
+            self._chunks_: list | None = None
+            self._devices_: list | None = None
+            self._runtime = runtime or plan.runtime
+            self._lengths_cache = None
+            self._meta_cache = None
+            return
         # Two calling conventions. Internally this is (chunks, devices, ...).
         # Externally -- e.g. `pd.DataFrame({...})` under the accelerated-pandas
         # backend -- it is a normal constructor, and `devices` is absent. In
@@ -216,13 +234,55 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
             )
         if not chunks:
             raise ValueError("a ChunkedFrame needs at least one chunk")
-        self._chunks = chunks
-        self._devices = devices
+        self._chunks_ = chunks
+        self._devices_ = devices
         self._runtime = runtime or get_runtime()
         self._lengths_cache: list[int] | None = (
             list(lengths) if lengths is not None else None
         )
         self._meta_cache: Any = None
+
+    # ------------------------------------------------------------------
+    # deferred execution
+    # ------------------------------------------------------------------
+    @property
+    def _chunks(self):
+        if self._plan is not None:
+            self._materialize()
+        return self._chunks_
+
+    @_chunks.setter
+    def _chunks(self, value) -> None:
+        self._chunks_ = value
+        self._plan = None
+
+    @property
+    def _devices(self):
+        if self._plan is not None:
+            self._materialize()
+        return self._devices_
+
+    @_devices.setter
+    def _devices(self, value) -> None:
+        self._devices_ = value
+
+    def _materialize(self) -> "ChunkedFrame":
+        """Run the pending plan in place. Idempotent."""
+        plan, self._plan = self._plan, None
+        if plan is not None:
+            result = plan.execute()
+            self._chunks_ = result._chunks
+            self._devices_ = result._devices
+            self._lengths_cache = result._lengths_cache
+            # the schema was derived from the plan's inputs; re-derive it from
+            # the real result so a stale guess cannot outlive the plan
+            self._meta_cache = None
+        return self
+
+    @property
+    def is_pending(self) -> bool:
+        """True while a planned join has not been executed."""
+        return self._plan is not None
 
     # ------------------------------------------------------------------
     # structure
@@ -260,6 +320,10 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
     @property
     def _meta(self):
         """An empty single-GPU object with this frame's schema (host copy)."""
+        if self._plan is not None:
+            # derived from the inputs' schemas; deliberately not cached, so it
+            # cannot survive the plan it was derived from
+            return self._plan.meta()
         if self._meta_cache is None:
             self._meta_cache = self._runtime.run(
                 self._devices[0],
@@ -542,6 +606,21 @@ def _wrap_like(chunks: Sequence[Any], devices: Sequence[int], runtime):
 # ----------------------------------------------------------------------
 # operand substitution: let a chunked operand appear anywhere in args
 # ----------------------------------------------------------------------
+def _resolve_exprs(value, frame):
+    """Replace any deferred Expr with its value on ``frame``."""
+    from ._lazy import Expr
+
+    if isinstance(value, Expr):
+        return value.evaluate(frame)
+    if isinstance(value, tuple):
+        return tuple(_resolve_exprs(v, frame) for v in value)
+    if isinstance(value, list):
+        return [_resolve_exprs(v, frame) for v in value]
+    if isinstance(value, dict):
+        return {k: _resolve_exprs(v, frame) for k, v in value.items()}
+    return value
+
+
 def _find_chunked(value, out: list) -> None:
     value = unwrap_proxy(value)
     if isinstance(value, ChunkedFrame):
@@ -871,6 +950,18 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
     """Behaviour shared by the DataFrame and Series wrappers."""
 
     def _map_method(self, name: str, *args, **kwargs):
+        # Resolve deferred expressions here, on the calling thread. If one
+        # reaches a chunk callback instead, cuDF will getattr() it, which
+        # materializes the pending join and re-dispatches to every device --
+        # from inside a device worker, which deadlocks.
+        #
+        # The frame has to be executed first: evaluating an expression against
+        # a frame that is still pending just yields another expression, since
+        # selecting a column from a pending frame is itself deferred.
+        if self._plan is not None:
+            self._materialize()
+        args = _resolve_exprs(args, self)
+        kwargs = _resolve_exprs(kwargs, self)
         others: list[ChunkedFrame] = []
         _find_chunked(args, others)
         _find_chunked(kwargs, others)
@@ -1255,6 +1346,15 @@ class ChunkedDataFrame(_ChunkedCommon):
 
     # -- selection ---------------------------------------------------
     def __getitem__(self, key):
+        from ._lazy import Expr, _MISS
+
+        if self._plan is not None:
+            answer = self._plan.getitem(self, key)
+            if answer is not _MISS:
+                return answer
+        if isinstance(key, Expr):
+            # a portable expression applied to an already-executed frame
+            return self._map_method("__getitem__", key.evaluate(self))
         if isinstance(key, ChunkedSeries):
             return self._map_method("__getitem__", key)
         if isinstance(key, slice):
@@ -1263,6 +1363,13 @@ class ChunkedDataFrame(_ChunkedCommon):
         return self._map_method("__getitem__", key)
 
     def __setitem__(self, key, value):
+        from ._lazy import Expr
+
+        if self._plan is not None:
+            self._materialize()
+        if isinstance(value, Expr):
+            # evaluate against *this* frame so the partitioning lines up
+            value = value.evaluate(self)
         if isinstance(value, ChunkedFrame) and not self._aligned_with(value):
             value = value.repartition_like(self)
         self._run_chunks(_setitem, value if isinstance(value, ChunkedFrame) else _Const(value), key)

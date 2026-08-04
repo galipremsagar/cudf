@@ -723,3 +723,179 @@ def test_cudf_pandas_backend_uses_all_gpus(runtime):
 
     # a proxied frame must not print like an internal type
     assert out["head_repr_is_pandas_like"]
+
+
+# ----------------------------------------------------------------------
+# predicate pushdown
+#
+# The point of these is CORRECTNESS, not speed: a pushed predicate must give
+# byte-identical answers to an eagerly evaluated one, including in the cases
+# where pushing is unsafe and must not happen.
+# ----------------------------------------------------------------------
+@pytest.fixture
+def eager_merges():
+    """Force joins to execute immediately, for A/B comparison."""
+    from cudf.multigpu import _ops
+
+    previous = _ops.LAZY_JOINS
+    _ops.LAZY_JOINS = False
+    try:
+        yield
+    finally:
+        _ops.LAZY_JOINS = previous
+
+
+@pytest.fixture
+def sides(runtime):
+    rng = np.random.default_rng(11)
+    left = pd.DataFrame({
+        "k": rng.integers(0, 40, 4000),
+        "a": rng.integers(0, 1000, 4000),
+        "s": pd.Series(rng.integers(0, 4, 4000)).map(lambda i: f"t{i}"),
+    })
+    right = pd.DataFrame({
+        "k": np.arange(40),
+        "b": np.arange(40) * 3,
+        "only_right": np.arange(40) % 7,
+    })
+    return left, right
+
+
+def _both_ways(left, right, apply, how="inner"):
+    """(pushed result, eager result) as sorted pandas frames."""
+    from cudf.multigpu import _ops
+
+    out = []
+    for lazy in (True, False):
+        previous = _ops.LAZY_JOINS
+        _ops.LAZY_JOINS = lazy
+        try:
+            ml = mgpu.from_pandas(left, npartitions=NPARTS)
+            mr = mgpu.from_pandas(right, npartitions=2)
+            frame = apply(ml.merge(mr, on="k", how=how))
+            host = frame.to_pandas() if hasattr(frame, "to_pandas") else frame
+            out.append(host.sort_values(list(host.columns)).reset_index(drop=True))
+        finally:
+            _ops.LAZY_JOINS = previous
+    return out
+
+
+def test_merge_is_deferred(runtime, sides):
+    left, right = sides
+    ml = mgpu.from_pandas(left, npartitions=NPARTS)
+    mr = mgpu.from_pandas(right, npartitions=2)
+    joined = ml.merge(mr, on="k")
+    # the exact type must not change: cudf.pandas wraps results by exact type,
+    # so a subclass here would silently escape the proxy
+    assert type(joined) is mgpu.ChunkedDataFrame
+    assert joined.is_pending
+    # asking for the schema must not execute it
+    assert "only_right" in joined.columns
+    assert joined.is_pending
+    # ...but asking for data must
+    len(joined)
+    assert not joined.is_pending
+
+
+def test_pushdown_matches_eager_single_side(runtime, sides):
+    left, right = sides
+    pushed, eager = _both_ways(left, right, lambda j: j[j["a"] > 500])
+    pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_pushdown_matches_eager_compound(runtime, sides):
+    left, right = sides
+    pushed, eager = _both_ways(
+        left, right, lambda j: j[(j["a"] >= 200) & (j["a"] < 800)]
+    )
+    pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_pushdown_matches_eager_on_right_side(runtime, sides):
+    left, right = sides
+    pushed, eager = _both_ways(left, right, lambda j: j[j["only_right"] < 3])
+    pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_predicate_spanning_both_sides_is_not_pushed(runtime, sides):
+    """a > b references both inputs; neither can evaluate it alone."""
+    left, right = sides
+    pushed, eager = _both_ways(left, right, lambda j: j[j["a"] > j["b"]])
+    pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_left_join_does_not_push_into_the_right_side(runtime, sides):
+    """The null-extended side must keep its rows.
+
+    Filtering `right` before a left join would drop rows that should have come
+    back null-extended, so the row count itself would change.
+    """
+    left, right = sides
+    pushed, eager = _both_ways(
+        left, right, lambda j: j[j["only_right"] < 3], how="left"
+    )
+    pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_left_join_null_extension_counterexample(runtime):
+    """Concrete 3-row case where a wrong push changes the answer."""
+    left = pd.DataFrame({"k": [1, 2, 3], "a": [10, 20, 30]})
+    right = pd.DataFrame({"k": [1, 2], "b": [100, 999]})
+    pushed, eager = _both_ways(left, right, lambda j: j[j["b"] < 500], how="left")
+    pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_column_on_both_sides_is_not_attributed(runtime):
+    """A name on both inputs is suffixed by merge, so it identifies no side."""
+    left = pd.DataFrame({"k": [1, 2, 3, 4], "v": [1, 2, 3, 4]})
+    right = pd.DataFrame({"k": [1, 2, 3, 4], "v": [4, 3, 2, 1]})
+    from cudf.multigpu import _ops
+
+    previous = _ops.LAZY_JOINS
+    _ops.LAZY_JOINS = True
+    try:
+        ml = mgpu.from_pandas(left, npartitions=2)
+        mr = mgpu.from_pandas(right, npartitions=2)
+        joined = ml.merge(mr, on="k")
+        assert "v_x" in joined.columns and "v_y" in joined.columns
+        assert joined._plan._side_of("v") is None
+        got = joined[joined["v_x"] > 2].to_pandas()
+    finally:
+        _ops.LAZY_JOINS = previous
+    expected = left.merge(right, on="k")
+    expected = expected[expected["v_x"] > 2]
+    np.testing.assert_array_equal(
+        np.sort(got["v_x"].to_numpy()), np.sort(expected["v_x"].to_numpy())
+    )
+
+
+def test_chained_joins_push_through_both_levels(runtime, sides):
+    left, right = sides
+    extra = pd.DataFrame({"k": np.arange(40), "c": np.arange(40) * 5})
+
+    def build(lazy):
+        from cudf.multigpu import _ops
+
+        previous = _ops.LAZY_JOINS
+        _ops.LAZY_JOINS = lazy
+        try:
+            ml = mgpu.from_pandas(left, npartitions=NPARTS)
+            mr = mgpu.from_pandas(right, npartitions=2)
+            me = mgpu.from_pandas(extra, npartitions=2)
+            joined = ml.merge(mr, on="k").merge(me, on="k")
+            joined = joined[joined["a"] > 400]
+            host = joined.to_pandas()
+            return host.sort_values(list(host.columns)).reset_index(drop=True)
+        finally:
+            _ops.LAZY_JOINS = previous
+
+    pd.testing.assert_frame_equal(build(True), build(False))
+
+
+def test_expression_used_as_a_value_still_works(runtime, sides):
+    """`1 - col` is arithmetic, not a mask; it must materialize correctly."""
+    left, right = sides
+    pushed, eager = _both_ways(
+        left, right, lambda j: j.assign(scaled=(1000 - j["a"]) * 2)
+    )
+    pd.testing.assert_frame_equal(pushed, eager)

@@ -122,7 +122,23 @@ class DeviceRuntime:
                     )
                     initial = _align_down(int(free * initial_pool_fraction))
                     maximum = _align_down(int(free * max_pool_fraction))
-                    if memory_resource == "async":
+                    if memory_resource == "managed":
+                        # cudaMallocManaged: allocations may exceed device
+                        # memory and pages migrate from host on demand, so the
+                        # working set is bounded by host RAM rather than by the
+                        # GPU. Much slower when it actually migrates -- this
+                        # buys the ability to run at all, not speed.
+                        upstream = rmm.mr.ManagedMemoryResource()
+                        try:
+                            upstream = rmm.mr.PrefetchResourceAdaptor(upstream)
+                        except Exception:
+                            pass  # prefetch is an optimization, not required
+                        mr = rmm.mr.PoolMemoryResource(
+                            upstream,
+                            initial_pool_size=initial,
+                            maximum_pool_size=None,
+                        )
+                    elif memory_resource == "async":
                         # cudaMallocAsync returns memory to the driver once a
                         # pool exceeds its release threshold. A classic RMM
                         # pool never does, so a long sequence of queries keeps
@@ -141,7 +157,7 @@ class DeviceRuntime:
                     else:
                         raise ValueError(
                             f"unknown memory_resource {memory_resource!r}; "
-                            "use 'pool' or 'async'"
+                            "use 'pool', 'async' or 'managed'"
                         )
                     rmm.mr.set_per_device_resource(d, mr)
                     self._mrs[d] = mr

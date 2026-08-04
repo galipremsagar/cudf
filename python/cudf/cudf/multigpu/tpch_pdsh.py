@@ -106,9 +106,11 @@ def main() -> None:
     parser.add_argument("--pool-fraction", type=float, default=0.90)
     parser.add_argument("--initial-pool-fraction", type=float, default=0.05)
     parser.add_argument("--memory-resource", default="pool",
-                        choices=["pool", "async"],
-                        help="'async' returns memory to the driver between "
-                             "queries; needed at large scale factors")
+                        choices=["pool", "async", "managed"],
+                        help="'managed' uses cudaMallocManaged so allocations "
+                             "can exceed GPU memory and page in from host RAM; "
+                             "'async' returns memory to the driver between "
+                             "queries")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--strict", action="store_true",
                         help="turn any pandas fallback into an error")
