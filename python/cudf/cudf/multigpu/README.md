@@ -66,29 +66,38 @@ Results on 8 × 97 GiB, all with `--strict` (any fall-back-to-pandas raises):
 Both configurations measured through the same runner (`--backend cudf` for
 single GPU), so timing points and fallback detection are identical.
 
-| scale | 1 GPU | 8 GPUs | speedup |
+| scale | 1 GPU | 8 GPUs, pool | 8 GPUs, managed |
 | --- | --- | --- | --- |
-| SF1   | **2.6 s**, 22/22 on GPU | 9.8 s, 22/22 on GPU | 0.3x |
-| SF100 | 1138 s, 17/22 on GPU (5 on CPU) | **28.3 s**, 22/22 on GPU | **40x** |
-| SF300 | 2627 s, 8/22 on GPU (11 on CPU) | **30.8 s**, 19/22 on GPU | **85x** |
+| SF1    | **2.6 s**, 22/22 on GPU | 10.8 s, 22/22 on GPU | — |
+| SF100  | 1138 s, 17/22 on GPU (5 on CPU) | **25.0 s**, 22/22 on GPU | — |
+| SF300  | 2627 s, 8/22 on GPU (11 on CPU), 3 errored | **41.6 s**, 22/22 on GPU | 64 s (3 queries sampled) |
+| SF500  | not run | 108 s, 21/22 (q1 OOM) | **320 s, 22/22** |
+| SF1000 | not run | 76 s, 15/22 (7 OOM) | **897 s, 22/22** |
 
-At SF1 the chunked layer is pure overhead — a 3.7x tax on data that fits
-comfortably on one device. It is worth having only past the point where things
-stop fitting, and the totals hide *where* that happens: at SF100 the 17 queries
-that fit on one GPU are 2-3x faster there, and the entire 40x comes from the 5
-that do not, each of which cuDF quietly spills to pandas for one to six minutes
-of CPU time.
+SF1000 is 347 GiB of Parquet — 6 billion lineitem rows — answered end to end
+with no query touching the CPU. That is the headline: the aggregate 760 GiB
+behaves as one address space, and past it managed memory reaches host RAM.
 
-q8, q9 and q10 complete in neither configuration at SF300: they exceed one
-GPU (timed out after 600 s on CPU) and also exceed all 780 GiB when the
-intermediates are materialized eagerly. The SF300 totals above cover the same
-19 queries on both sides.
+Read the two axes separately, because they are different claims. **Capability**
+is where the multi-GPU layer earns its keep: one GPU is already down to 8 of 22
+queries on the GPU at SF300, and the rest are silently on pandas. **Cost** is
+where it does not: at SF1 the chunked layer is a 4x tax on data that fits
+comfortably on one device.
 
-SF300 is ~1.8 billion lineitem rows; reading it lands 97 GiB across the 8 GPUs
-in 1.6 s. The three failures are genuine capacity, not correctness: q8, q9 and
-q10 are the widest joins, and with eager evaluation their intermediates exceed
-the aggregate 713 GiB. Fixing that needs spilling or lazy/fused execution,
-neither of which this POC has. Note also that a `gc.collect()` between queries
+The two out-of-memory modes need different fixes, and neither subsumes the
+other. Join-heavy queries (q8/q9/q10, later q5/q7/q13/q21) die on intermediate
+size, and predicate pushdown fixes them by filtering the inputs rather than the
+output — that alone took SF300 from 19/22 to 22/22. q1 has no joins at all, so
+pushdown cannot help it; it is a scan whose derived columns exceed the per-GPU
+pool cap, and only managed memory rescues it.
+
+Managed memory costs about 3x (SF500: 108 s → 320 s), so it is the fallback and
+not the default. It must also be used *unwrapped*: a pool on top of it grows by
+doubling and asks the driver for one enormous contiguous region, which fails as
+a sticky CUDA error and takes the context with it, while plain managed
+allocation oversubscribes to 400 GiB on a 95 GiB device without complaint.
+
+Note also that a `gc.collect()` between queries
 is required at this scale -- chunked frames form reference cycles, so without
 it the previous query's device memory is still held when the next one starts.
 
