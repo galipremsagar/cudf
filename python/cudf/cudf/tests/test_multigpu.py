@@ -899,3 +899,62 @@ def test_expression_used_as_a_value_still_works(runtime, sides):
         left, right, lambda j: j.assign(scaled=(1000 - j["a"]) * 2)
     )
     pd.testing.assert_frame_equal(pushed, eager)
+
+
+def test_failed_plan_leaves_frame_usable():
+    """A join that raises must not leave the frame with no plan and no chunks.
+
+    cudf.pandas answers an out-of-memory fast path by falling back and calling
+    to_pandas() on the same object, so a frame corrupted by the failure raises
+    a second, unrelated error that hides the first.
+    """
+    import cudf.multigpu as mgpu
+    from cudf.multigpu._lazy import JoinPlan
+
+    left = mgpu.from_pandas(pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]}))
+    right = mgpu.from_pandas(pd.DataFrame({"a": [1, 2], "c": [7, 8]}))
+
+    class Boom(JoinPlan):
+        __slots__ = ()
+
+        def execute(self):
+            raise MemoryError("simulated allocation failure")
+
+    frame = mgpu.ChunkedDataFrame(plan=Boom(left, right, {"on": "a"}))
+    with pytest.raises(MemoryError):
+        frame._materialize()
+
+    # still pending, so the fallback path can still read it
+    assert frame.is_pending
+    with pytest.raises(MemoryError):
+        frame.to_pandas()
+
+
+def test_default_nparts_splits_only_under_pressure():
+    """The split decision must be reachable, and must actually decide.
+
+    An earlier version referenced an undefined constant inside a bare
+    ``except Exception``, so every call took the not-pressured branch. Small
+    frames still looked right, which is what made it invisible: the bug only
+    showed up as a lost query at SF500.
+    """
+    import cudf.multigpu as mgpu
+    from cudf.multigpu import _shuffle
+
+    frame = mgpu.from_pandas(pd.DataFrame({"a": range(1000)}))
+    devices = frame._devices
+    capacity = sum(t for _f, t in frame.runtime.memory_info().values())
+    base = max(frame.nchunks, len(devices))
+
+    # a frame that is trivial next to the machine is not split
+    assert _shuffle.default_nparts(frame, devices) == base
+
+    class Huge:
+        """Only the three attributes the decision reads."""
+
+        runtime = frame.runtime
+        nchunks = frame.nchunks
+        nbytes = int(capacity * 0.9)
+
+    assert (_shuffle.default_nparts(Huge, devices)
+            == len(devices) * _shuffle.PARTS_PER_DEVICE_WHEN_LARGE)

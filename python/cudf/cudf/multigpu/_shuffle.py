@@ -28,9 +28,24 @@ from ._frame import (
 __all__ = ["hash_shuffle", "map_shuffle", "assign_targets"]
 
 
-#: bytes above which a shuffle is split into more partitions than devices, so
-#: the streamed exchange has something to stream
-LARGE_FRAME_BYTES = 4 << 30
+#: Fraction of *aggregate pool capacity* above which a shuffle is split into
+#: more partitions than devices.
+#:
+#: Splitting lowers the peak -- only one group is in flight -- but the groups
+#: run in sequence, so it costs wall time whenever it was not needed. It is
+#: therefore triggered by how big the frame is relative to the memory this
+#: runtime can ever hold, which is a fixed property of the machine.
+#:
+#: Deliberately *not* measured against currently-free memory: a pool starts
+#: small and grows, so early in a query free memory looks abundant no matter
+#: how much the query is about to need, and the frames that most need splitting
+#: are exactly the ones judged safe.
+STREAM_WHEN_FRACTION_OF_CAPACITY = 0.25
+
+#: ...but a frame that is small in absolute terms can still be too big for what
+#: is left, once earlier results are resident. This is the second trigger.
+STREAM_WHEN_FRACTION_OF_FREE = 0.5
+
 PARTS_PER_DEVICE_WHEN_LARGE = 4
 
 
@@ -42,17 +57,28 @@ def assign_targets(nparts: int, devices: Sequence[int]) -> list[int]:
 def default_nparts(frame, devices: Sequence[int]) -> int:
     """How many partitions to shuffle into.
 
-    One per device is the cheapest, but it also makes the exchange a single
-    group, so the whole frame is in flight at once. Large frames get several
-    partitions per device, which costs a few more kernel launches and buys a
-    proportionally smaller peak.
+    One per device is fastest: the exchange is then a single group and every
+    GPU works at once. More partitions mean more, smaller groups, which lowers
+    the peak but serializes them, so splitting is only worth it under real
+    memory pressure -- either against what the machine can ever hold, or
+    against what is left right now.
+
+    A frame whose size cannot be determined is treated as pressured. Guessing
+    "small" here is the expensive mistake: it costs the query, whereas guessing
+    "large" only costs some wall time.
     """
     base = max(getattr(frame, "nchunks", len(devices)), len(devices))
-    try:
-        large = frame.nbytes > LARGE_FRAME_BYTES
-    except Exception:
-        large = False
-    return max(base, len(devices) * PARTS_PER_DEVICE_WHEN_LARGE) if large else base
+    info = frame.runtime.memory_info()
+    nbytes = frame.nbytes
+    capacity = sum(t for _f, t in info.values())
+    free = sum(f for f, _t in info.values())
+    pressured = (
+        nbytes > capacity * STREAM_WHEN_FRACTION_OF_CAPACITY
+        or nbytes > free * STREAM_WHEN_FRACTION_OF_FREE
+    )
+    if not pressured:
+        return base
+    return max(base, len(devices) * PARTS_PER_DEVICE_WHEN_LARGE)
 
 
 def _hash_partition_chunk(chunk, on: list, nparts: int):

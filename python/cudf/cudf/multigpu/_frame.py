@@ -267,10 +267,24 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
         self._devices_ = value
 
     def _materialize(self) -> "ChunkedFrame":
-        """Run the pending plan in place. Idempotent."""
+        """Run the pending plan in place. Idempotent.
+
+        ``_plan`` is cleared *before* executing, so that a plan which re-enters
+        ``_chunks`` while running cannot recurse forever -- but it is put back
+        if execution fails. A frame with neither a plan nor chunks is corrupt:
+        every later access returns ``None`` and raises somewhere unrelated. That
+        matters most for the failure this guards, an out-of-memory join, because
+        cudf.pandas responds to it by falling back and calling ``to_pandas()`` --
+        so the corrupt state is reached immediately, and a ``TypeError`` about
+        ``NoneType`` is what surfaces instead of the allocation failure.
+        """
         plan, self._plan = self._plan, None
         if plan is not None:
-            result = plan.execute()
+            try:
+                result = plan.execute()
+            except BaseException:
+                self._plan = plan
+                raise
             self._chunks_ = result._chunks
             self._devices_ = result._devices
             self._lengths_cache = result._lengths_cache
