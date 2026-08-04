@@ -1019,3 +1019,34 @@ def test_global_sort_places_nulls_globally(na_position, ascending):
         got["k"].dropna().reset_index(drop=True),
         expected["k"].dropna().reset_index(drop=True),
     )
+
+
+def test_multi_column_sort_with_nulls_in_trailing_keys():
+    """A null in a trailing sort key must not move a row globally.
+
+    Buckets are concatenated in order, so a row's bucket is final. Forcing any
+    row with a null in *any* key to an end bucket left the frame unsorted --
+    TPC-DS q81 got the right 367 rows in the wrong order, so head(100) returned
+    the wrong hundred.
+    """
+    import numpy as np
+
+    import cudf.multigpu as mgpu
+
+    rng = np.random.default_rng(11)
+    n = 5000
+    trailing = rng.integers(0, 100, n).astype("float64")
+    trailing[rng.choice(n, 900, replace=False)] = np.nan
+    host = pd.DataFrame({
+        "a": rng.integers(0, 900, n),          # leading key, no nulls
+        "b": trailing,                          # trailing key, many nulls
+        "c": rng.choice(list("uvwxyz"), n),
+    })
+    keys = ["a", "b", "c"]
+
+    got = mgpu.from_pandas(host).sort_values(keys, na_position="last").to_pandas()
+    expected = host.sort_values(keys, na_position="last")
+
+    pd.testing.assert_frame_equal(
+        got.reset_index(drop=True), expected.reset_index(drop=True)
+    )

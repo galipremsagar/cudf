@@ -659,11 +659,23 @@ def sort_values(
     if directions is not None and len(set(directions)) > 1:
         keys = keys[:1]
 
+    # A null anywhere in a multi-column key makes the lexicographic
+    # searchsorted an unreliable bucketing rule: the row can be placed in a
+    # bucket that no amount of sorting *within* buckets can move it out of.
+    # Bucketing on the leading key alone is always order-preserving, so nulls
+    # cost a coarser partition rather than a wrong answer.
+    if len(keys) > 1 and any(
+        frame._run_chunks(lambda c: _keys_have_nulls(c, keys, is_series))
+    ):
+        keys = keys[:1]
+
     # 1. sample the key space from every chunk (host-side, tiny)
     samples = frame._run_chunks(
         lambda c: _sample_keys(c, keys, sample_per_chunk, is_series)
     )
     pooled = pd.concat([s for s in samples if len(s)], axis=0)
+    # splitters must be real values; a null splitter orders arbitrarily
+    pooled = pooled.dropna()
     if len(pooled) == 0:
         return frame.map_chunks(
             lambda c: _local_sort(c, by, ascending, na_position, is_series)
@@ -732,14 +744,23 @@ def _bucket_of(chunk, keys, splitters, is_series, ascending, n_buckets,
     if not ascending:
         ids = (n_buckets - 1) - ids
 
-    null_key = None
-    for column in frame.columns:
-        is_null = frame[column].isna()
-        null_key = is_null if null_key is None else (null_key | is_null)
-    if null_key is not None and bool(null_key.any()):
+    # Only the *leading* key decides placement. A null in a trailing key says
+    # nothing about where the row belongs globally -- rows sharing a leading
+    # value sit in one bucket, and the local sort settles the rest. Keying this
+    # off any-column-null instead scattered rows to the end buckets and left the
+    # frame unsorted, which cost q81 the right top-100.
+    null_key = frame[frame.columns[0]].isna().reset_index(drop=True)
+    if bool(null_key.any()):
         target = 0 if na_position == "first" else n_buckets - 1
-        ids = ids.where(~null_key.reset_index(drop=True), target)
+        ids = ids.where(~null_key, target)
     return ids
+
+
+def _keys_have_nulls(chunk, keys, is_series):
+    frame = _keys_frame(chunk, keys, is_series)
+    if len(frame) == 0:
+        return False
+    return bool(frame.isna().any().any())
 
 
 def _local_sort(chunk, by, ascending, na_position, is_series):
