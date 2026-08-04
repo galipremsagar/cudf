@@ -958,3 +958,64 @@ def test_default_nparts_splits_only_under_pressure():
 
     assert (_shuffle.default_nparts(Huge, devices)
             == len(devices) * _shuffle.PARTS_PER_DEVICE_WHEN_LARGE)
+
+
+@pytest.mark.parametrize("selector", [
+    0, 2, -1, [0, 2], slice(None, 2), [True, False, True],
+])
+def test_iloc_selects_columns_by_position(selector):
+    """iloc indexes columns by position, not by label.
+
+    Passing the selector straight through to label-based selection made
+    df.iloc[:, 0] mean df[0] -- a lookup for a column named 0 -- which raised
+    KeyError for every frame whose columns are not integers.
+    """
+    import cudf.multigpu as mgpu
+
+    host = pd.DataFrame({"a": [3, 1, 2], "b": ["x", "y", "z"],
+                         "c": [1.5, 2.5, 3.5]})
+    chunked = mgpu.from_pandas(host)
+    got = chunked.iloc[:, selector]
+    expected = host.iloc[:, selector]
+    got_host = got.to_pandas() if hasattr(got, "to_pandas") else got
+    if isinstance(expected, pd.Series):
+        pd.testing.assert_series_equal(
+            got_host.reset_index(drop=True), expected.reset_index(drop=True))
+    else:
+        pd.testing.assert_frame_equal(
+            got_host.reset_index(drop=True), expected.reset_index(drop=True))
+
+
+@pytest.mark.parametrize("na_position", ["first", "last"])
+@pytest.mark.parametrize("ascending", [True, False])
+def test_global_sort_places_nulls_globally(na_position, ascending):
+    """na_position must hold across the whole frame, not within each bucket.
+
+    The global sort range-partitions into buckets and concatenates them, so a
+    row's bucket decides where it ends up. Applying na_position only in the
+    per-bucket sort leaves nulls stranded mid-frame, which surfaced as TPC-DS
+    q15 silently losing its null group to head(100).
+    """
+    import numpy as np
+
+    import cudf.multigpu as mgpu
+
+    rng = np.random.default_rng(0)
+    values = rng.integers(0, 500, size=4000).astype("float64")
+    values[rng.choice(4000, 200, replace=False)] = np.nan
+    host = pd.DataFrame({"k": values, "v": np.arange(4000)})
+
+    chunked = mgpu.from_pandas(host)
+    got = chunked.sort_values(
+        "k", ascending=ascending, na_position=na_position
+    ).to_pandas()
+    expected = host.sort_values(
+        "k", ascending=ascending, na_position=na_position
+    )
+
+    # where the nulls sit is the point; ties among equal keys are unordered
+    assert got["k"].isna().tolist() == expected["k"].isna().tolist()
+    pd.testing.assert_series_equal(
+        got["k"].dropna().reset_index(drop=True),
+        expected["k"].dropna().reset_index(drop=True),
+    )

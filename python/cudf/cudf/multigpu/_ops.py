@@ -677,7 +677,8 @@ def sort_values(
     # 2. assign every row a bucket, then shuffle so buckets are contiguous
     part_ids = frame.map_chunks(
         lambda c: _bucket_of(
-            c, keys, splitters, is_series, leading_ascending, n_buckets
+            c, keys, splitters, is_series, leading_ascending, n_buckets,
+            na_position,
         )
     )
     shuffled = map_shuffle(frame, part_ids, n_buckets)
@@ -707,7 +708,20 @@ def _sample_keys(chunk, keys, n, is_series):
     return frame.to_pandas()
 
 
-def _bucket_of(chunk, keys, splitters, is_series, ascending, n_buckets):
+def _bucket_of(chunk, keys, splitters, is_series, ascending, n_buckets,
+               na_position="last"):
+    """Which bucket each row sorts into.
+
+    Buckets are concatenated in order, so a row's bucket fixes where it lands
+    globally. ``na_position`` therefore has to be applied *here* as well as in
+    the per-bucket sort: sorting nulls to the front of whichever bucket
+    ``searchsorted`` happened to put them in still leaves them in the middle of
+    the frame. Null keys are sent to the first or last bucket outright.
+
+    This showed up as TPC-DS q15 losing a row -- the null group sorted last
+    instead of first, so ``head(100)`` cut it off and the answer was quietly
+    short one group rather than visibly wrong.
+    """
     frame = _keys_frame(chunk, keys, is_series)
     if len(frame) == 0:
         return cudf.Series([], dtype="int32")
@@ -717,6 +731,14 @@ def _bucket_of(chunk, keys, splitters, is_series, ascending, n_buckets):
     ids = cudf.Series(ids).astype("int32")
     if not ascending:
         ids = (n_buckets - 1) - ids
+
+    null_key = None
+    for column in frame.columns:
+        is_null = frame[column].isna()
+        null_key = is_null if null_key is None else (null_key | is_null)
+    if null_key is not None and bool(null_key.any()):
+        target = 0 if na_position == "first" else n_buckets - 1
+        ids = ids.where(~null_key.reset_index(drop=True), target)
     return ids
 
 

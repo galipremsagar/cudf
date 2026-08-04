@@ -1257,6 +1257,30 @@ def _reset_index_chunk(chunk, offset: int, drop: bool, kwargs: dict):
     return out
 
 
+def _columns_by_position(frame, cols) -> list:
+    """Column *labels* for an ``iloc`` column selector.
+
+    ``iloc`` indexes columns by position, so the selector has to be resolved
+    against the column order before it can be handed to label-based selection.
+    Passing it through unresolved makes ``df.iloc[:, 0]`` mean ``df[0]``, which
+    is a lookup for a column literally named ``0``.
+    """
+    names = list(frame.columns)
+    if isinstance(cols, slice):
+        return names[cols]
+    if isinstance(cols, int):
+        return [names[cols]]
+    seq = list(cols)
+    if seq and all(isinstance(v, (bool, np.bool_)) for v in seq):
+        if len(seq) != len(names):
+            raise IndexError(
+                f"boolean column mask has {len(seq)} entries, "
+                f"frame has {len(names)} columns"
+            )
+        return [n for n, keep in zip(names, seq) if keep]
+    return [names[int(v)] for v in seq]
+
+
 class _ILocIndexer:
     def __init__(self, frame):
         self._frame = frame
@@ -1277,7 +1301,8 @@ class _ILocIndexer:
                 "iloc row selection supports slices and integers"
             )
         if cols is not None:
-            out = out[cols]
+            out = out[_columns_by_position(out, cols)] if not isinstance(
+                cols, int) else out[list(out.columns)[cols]]
         return out
 
 
