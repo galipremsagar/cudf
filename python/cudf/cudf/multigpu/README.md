@@ -63,11 +63,26 @@ python -m cudf.multigpu.tpch_pdsh --path /data/tpch/sf1c --scale 1 --validate
 
 Results on 8 × 97 GiB, all with `--strict` (any fall-back-to-pandas raises):
 
-| scale | on GPU | on CPU | failed | total |
-| --- | --- | --- | --- | --- |
-| SF1   | 22/22 (100%) | 0 | 0 | 9.9 s (also 22/22 matching single-GPU cuDF) |
-| SF100 | 22/22 (100%) | 0 | 0 | 28.3 s |
-| SF300 | 19/22 (86%)  | 0 | 3 (OOM) | 30.8 s |
+Both configurations measured through the same runner (`--backend cudf` for
+single GPU), so timing points and fallback detection are identical.
+
+| scale | 1 GPU | 8 GPUs | speedup |
+| --- | --- | --- | --- |
+| SF1   | **2.6 s**, 22/22 on GPU | 9.8 s, 22/22 on GPU | 0.3x |
+| SF100 | 1138 s, 17/22 on GPU (5 on CPU) | **28.3 s**, 22/22 on GPU | **40x** |
+| SF300 | 2627 s, 8/22 on GPU (11 on CPU) | **30.8 s**, 19/22 on GPU | **85x** |
+
+At SF1 the chunked layer is pure overhead — a 3.7x tax on data that fits
+comfortably on one device. It is worth having only past the point where things
+stop fitting, and the totals hide *where* that happens: at SF100 the 17 queries
+that fit on one GPU are 2-3x faster there, and the entire 40x comes from the 5
+that do not, each of which cuDF quietly spills to pandas for one to six minutes
+of CPU time.
+
+q8, q9 and q10 complete in neither configuration at SF300: they exceed one
+GPU (timed out after 600 s on CPU) and also exceed all 780 GiB when the
+intermediates are materialized eagerly. The SF300 totals above cover the same
+19 queries on both sides.
 
 SF300 is ~1.8 billion lineitem rows; reading it lands 97 GiB across the 8 GPUs
 in 1.6 s. The three failures are genuine capacity, not correctness: q8, q9 and
