@@ -65,8 +65,16 @@ def query(run_config):
     df = df.assign(ss_net_profit=df["ss_net_profit"].astype("float64"))
 
     # The IN subquery ranks each state inside a partition of its own, so every
-    # state that sold anything is ranked 1 and passes "ranking <= 5". It admits
-    # exactly the states already present here, and is therefore dropped.
+    # state that sold anything is ranked 1 and passes "ranking <= 5"; the set it
+    # returns is exactly the set of non-NULL states already present here.
+    #
+    # What it is not is a no-op. "s_state IN (...)" is UNKNOWN, never true, when
+    # s_state is NULL, so a store with no state is excluded from the outer query
+    # however many such stores the subquery itself saw. One store carries a NULL
+    # s_state from SF10 on; leaving its rows in adds a NULL state to the rollup,
+    # which invents both a (NULL, NULL) detail group and a NULL state subtotal.
+    # Membership in a set the row's own state defines reduces to "is not NULL".
+    df = df[df["s_state"].notna()]
 
     def rolled_up(keys):
         # The count rides along in place of ``sum(min_count=1)``: a group whose

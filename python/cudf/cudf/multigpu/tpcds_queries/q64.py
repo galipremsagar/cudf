@@ -266,8 +266,16 @@ def query(run_config):
         .reset_index()
     )
 
-    left = cross_sales[cross_sales["syear"] == 1999]
-    right = cross_sales[cross_sales["syear"] == 2000][
+    # The self-join is an inner join on store name and zip, and a store whose
+    # name or zip is unknown compares unknown to every other store, so SQL
+    # keeps none of those pairs. pandas and cuDF instead match NULL to NULL, so
+    # groups behind a NULL-named store would pair up with each other. The store
+    # table first gets NULL names at SF100 (two rows), which is where the
+    # invented pairs appeared -- 477 rows against DuckDB's 472.
+    paired = cross_sales.dropna(subset=["s_store_name", "s_zip"])
+
+    left = paired[paired["syear"] == 1999]
+    right = paired[paired["syear"] == 2000][
         ["i_item_sk", "s_store_name", "s_zip", "cnt", "s1", "s2", "s3", "syear"]
     ].rename(
         columns={

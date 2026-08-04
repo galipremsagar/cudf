@@ -16,8 +16,10 @@ that is wrong in the same way twice still fails.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import os
+import signal
 import time
 import traceback
 from pathlib import Path
@@ -52,6 +54,30 @@ def _context_is_dead() -> bool:
         cudart.cudaFree(ptr)
         return False
     return True
+
+
+@contextlib.contextmanager
+def _deadline(seconds: int):
+    """Abort a query that overruns, without killing the run.
+
+    Needed for the single-GPU baseline above SF1: a query that falls back to
+    pandas on a 100 GiB table can run for hours, and one such query would
+    otherwise decide how long the whole sweep takes.
+    """
+    if not seconds:
+        yield
+        return
+
+    def _fire(signum, frame):
+        raise TimeoutError(f"query exceeded {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _to_host(result):
@@ -156,8 +182,43 @@ def _compare(got, expected, rtol: float = 1e-6) -> tuple[bool, str]:
     # every differing column is reported. Stopping at the first understates the
     # damage, which makes a broad failure look like a rounding difference.
     if bad_columns:
+        # An ORDER BY that does not fully determine the order leaves ties whose
+        # arrangement is arbitrary -- DuckDB itself returns three different
+        # orderings across five identical runs of q18. So before calling a
+        # result wrong, check whether it is the same rows in another order.
+        # This is reported distinctly and never silently: same rows in a
+        # different order is a different fact from wrong rows.
+        if _same_rows_unordered(got, expected, rtol):
+            return "tie-order", "same rows, tie order differs"
         return False, "; ".join(bad_columns)
     return True, ""
+
+
+def _same_rows_unordered(got, expected, rtol: float) -> bool:
+    """Whether the two frames hold the same rows, ignoring row order."""
+    import pandas as pd
+
+    def key(frame):
+        renamed = frame.copy()
+        renamed.columns = range(frame.shape[1])
+        for i in range(frame.shape[1]):
+            numeric = _numeric(renamed[i])
+            renamed[i] = (numeric.round(6) if numeric is not None
+                          else renamed[i].astype("string").str.strip())
+        return renamed.sort_values(list(renamed.columns),
+                                   na_position="last").reset_index(drop=True)
+
+    try:
+        left, right = key(got), key(expected)
+    except Exception:
+        return False
+    if left.shape != right.shape:
+        return False
+    for i in range(left.shape[1]):
+        a, b = left[i], right[i]
+        if not bool(((a == b) | (a.isna() & b.isna())).all()):
+            return False
+    return True
 
 
 def main() -> None:
@@ -222,6 +283,7 @@ def main() -> None:
 
     timings, failures, host_growth, mismatches = {}, {}, {}, {}
     unverified: dict = {}
+    tie_order: dict = {}
     for number in numbers:
         query = tpcds_queries.get(number)
         if query is None:
@@ -230,7 +292,8 @@ def main() -> None:
         rss_before = _host_rss_gib()
         try:
             start = time.perf_counter()
-            result = _to_host(query(config))
+            with _deadline(args.timeout):
+                result = _to_host(query(config))
             elapsed = time.perf_counter() - start
             timings[number] = elapsed
             grew = _host_rss_gib() - rss_before
@@ -255,6 +318,9 @@ def main() -> None:
                 if ok is None:
                     unverified[number] = why
                     note = f"  <-- UNVERIFIED: {why}"
+                elif ok == "tie-order":
+                    tie_order[number] = why
+                    note = f"  <-- {why}"
                 elif not ok:
                     mismatches[number] = why
                     note = f"  <-- MISMATCH: {why}"
@@ -285,6 +351,9 @@ def main() -> None:
               + (f"   fell back to CPU: {sorted(on_cpu)}" if on_cpu
                  else "   (no query fell back to CPU)"))
     if args.validate:
+        if tie_order:
+            print(f"  same rows but tie order differs (ORDER BY is not total): "
+                  f"{sorted(tie_order)}")
         print(f"  matched DuckDB: {len(correct) - len(unverified)}/{len(timings)}"
               + (f"   unverified (no reference): {sorted(unverified)}"
                  if unverified else ""))

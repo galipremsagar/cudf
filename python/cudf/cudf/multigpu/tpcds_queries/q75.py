@@ -137,12 +137,21 @@ def query(run_config):
             "sales_amt": "prev_amt",
         }
     )
+    # The two years are lined up by an equality on the four item attributes,
+    # every one of which is nullable in ``item``. GROUP BY keeps a NULL group
+    # (all the brand-less Books items land in one row per year), but SQL
+    # equality never matches NULL to NULL, whereas a pandas merge does -- which
+    # would pair those two fat groups and invent a row. Drop them on both
+    # sides, the way an inner join must.
+    current = current.dropna(subset=ITEM_KEYS)
+    previous = previous.dropna(subset=ITEM_KEYS)
+
     joined = current.merge(previous, on=ITEM_KEYS)
-    joined = joined[
-        joined["curr_cnt"].astype("float64")
-        / joined["prev_cnt"].astype("float64")
-        < 0.9
-    ]
+    ratio = joined["curr_cnt"].astype("float64") / joined[
+        "prev_cnt"
+    ].astype("float64")
+    # Division by zero is NULL in SQL, so the comparison never qualifies.
+    joined = joined[(joined["prev_cnt"] != 0) & (ratio < 0.9)]
 
     joined["sales_cnt_diff"] = joined["curr_cnt"] - joined["prev_cnt"]
     joined["sales_amt_diff"] = joined["curr_amt"] - joined["prev_amt"]

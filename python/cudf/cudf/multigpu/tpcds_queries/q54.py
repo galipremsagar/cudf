@@ -79,10 +79,21 @@ def query(run_config):
         & (date_dim["d_month_seq"] <= month_seq + 3)
     ][["d_date_sk"]]
 
+    # ca_county = s_county AND ca_state = s_state is an equi-join on columns
+    # that are both nullable, and SQL never matches NULL to NULL: a store with
+    # an unknown county joins to nothing. pandas and cuDF do match NULL to NULL,
+    # so a single such store row would pair with every address of unknown
+    # county, inventing customers. SF1 happens to have no NULL store county, so
+    # the bug only shows from SF10 up (one NULL store row there, five at SF100).
+    address_located = customer_address.dropna(subset=["ca_county", "ca_state"])
+    store_located = store.dropna(subset=["s_county", "s_state"])
+
     located = my_customers.merge(
-        customer_address, left_on="c_current_addr_sk", right_on="ca_address_sk"
+        address_located, left_on="c_current_addr_sk", right_on="ca_address_sk"
     ).merge(
-        store, left_on=["ca_county", "ca_state"], right_on=["s_county", "s_state"]
+        store_located,
+        left_on=["ca_county", "ca_state"],
+        right_on=["s_county", "s_state"],
     )[["c_customer_sk"]]
 
     recent = store_sales.merge(

@@ -51,6 +51,32 @@ def query(run_config):
         f"{path}/item{suffix}", columns=["i_item_sk", "i_item_id", "i_item_desc"]
     )
 
+    # Every join below is an inner join, and SQL never matches NULL to NULL.
+    # pandas/cuDF do, so a NULL ss_customer_sk pairs with every NULL
+    # sr_customer_sk sharing the item/ticket, inventing rows SQL never produces
+    # (SF1 has no NULL foreign keys; SF10+ has ~4.5%). Dropping NULL join keys
+    # up front is exactly what inner-join semantics imply.
+    store_sales = store_sales.dropna(
+        subset=[
+            "ss_sold_date_sk",
+            "ss_item_sk",
+            "ss_customer_sk",
+            "ss_store_sk",
+            "ss_ticket_number",
+        ]
+    )
+    store_returns = store_returns.dropna(
+        subset=[
+            "sr_returned_date_sk",
+            "sr_item_sk",
+            "sr_customer_sk",
+            "sr_ticket_number",
+        ]
+    )
+    catalog_sales = catalog_sales.dropna(
+        subset=["cs_sold_date_sk", "cs_bill_customer_sk", "cs_item_sk"]
+    )
+
     # The three money columns are DECIMALs and no GPU groupby sums a decimal.
     store_sales = store_sales.assign(
         ss_net_profit=store_sales["ss_net_profit"].astype("float64")
@@ -102,9 +128,11 @@ def query(run_config):
         }
     )
     keys = ["i_item_id", "i_item_desc", "s_store_id", "s_store_name"]
+    # min_count=1: SQL SUM over a group with no non-NULL value is NULL, where
+    # pandas would report 0. The three money columns are all nullable.
     out = df.groupby(keys, as_index=False, dropna=False)[
         ["store_sales_profit", "store_returns_loss", "catalog_sales_profit"]
-    ].sum()
+    ].sum(min_count=1)
 
     out = out.sort_values(keys, na_position="last").head(100)
     return out.reset_index(drop=True)

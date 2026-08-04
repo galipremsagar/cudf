@@ -376,6 +376,45 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
 
         return self._run_chunks(_shim, *others)
 
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        """Apply a numpy ufunc chunk-wise.
+
+        ``np.floor(series)``, ``np.sign(series)`` and friends are ordinary
+        elementwise work that cuDF already implements per chunk, but without
+        this hook numpy has no way to reach it and cudf.pandas answers by
+        copying the column to the host. TPC-DS q78 rounds a ratio with
+        ``np.floor``/``np.abs``/``np.sign`` and fell back on all three.
+
+        Only the plain ``__call__`` form is handled. ``reduce`` and
+        ``accumulate`` need data from outside a chunk, so they are declined
+        rather than answered wrongly.
+        """
+        if method != "__call__" or kwargs.get("out") is not None:
+            return NotImplemented
+        allowed = (ChunkedFrame, int, float, complex, bool, np.generic)
+        if not all(isinstance(x, allowed) for x in inputs):
+            return NotImplemented
+
+        others = [x for x in inputs[1:] if isinstance(x, ChunkedFrame)]
+        if any(not self._aligned_with(other) for other in others):
+            return NotImplemented
+
+        def apply(*chunks):
+            supplied = iter(chunks)
+            args = [
+                next(supplied) if isinstance(x, ChunkedFrame) else x
+                for x in inputs
+            ]
+            return ufunc(*args, **kwargs)
+
+        # self is always the first chunked operand map_chunks passes through,
+        # so it must lead the iterator above
+        if inputs and inputs[0] is not self:
+            leading = [x for x in inputs if isinstance(x, ChunkedFrame)]
+            if not leading or leading[0] is not self:
+                return NotImplemented
+        return self.map_chunks(apply, *others)
+
     def map_chunks(
         self, fn: Callable, *others, broadcast: Sequence[Any] = (), **kwargs
     ) -> "ChunkedFrame":

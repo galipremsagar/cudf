@@ -4,12 +4,25 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
 def _cents(series):
     """A DECIMAL(*,2) column as an exact whole number of cents."""
     return (series.astype("float64") * 100).round()
+
+
+def _round_half_away(series, digits):
+    """SQL ``round``: a half goes away from zero, not to the even neighbour.
+
+    ``Series.round`` is numpy's, which rounds a tie to even -- 0.125 becomes
+    0.12 where SQL gives 0.13. The ratio here is a quotient of two integer
+    sums, so exact halves are common and the difference is not academic.
+    """
+    scale = 10.0**digits
+    scaled = series.astype("float64") * scale
+    return np.floor(np.abs(scaled) + 0.5) / scale * np.sign(scaled)
 
 
 def _decimal_str(cents):
@@ -133,9 +146,9 @@ def query(run_config):
     joined["other_chan_sp"] = joined["ws_sp"].fillna(0.0) + joined[
         "cs_sp"
     ].fillna(0.0)
-    joined["ratio"] = (
-        joined["ss_qty"] / joined["other_chan_qty"]
-    ).round(2)
+    joined["ratio"] = _round_half_away(
+        joined["ss_qty"] / joined["other_chan_qty"], 2
+    )
 
     result = joined.sort_values(
         [

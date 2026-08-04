@@ -48,6 +48,32 @@ def query(run_config):
         f"{base}/item{suffix}", columns=["i_item_sk", "i_item_id", "i_item_desc"]
     )
 
+    # Every join below is an inner join, and SQL never matches NULL to NULL.
+    # pandas/cuDF do, so a NULL ss_customer_sk would pair with every NULL
+    # sr_customer_sk sharing the item/ticket, inventing rows that SQL does not
+    # produce (SF1 has no NULL foreign keys; SF10+ has ~4.5%). Dropping the NULL
+    # keys before the merges is exactly what the inner join semantics imply.
+    store_sales = store_sales.dropna(
+        subset=[
+            "ss_sold_date_sk",
+            "ss_item_sk",
+            "ss_customer_sk",
+            "ss_store_sk",
+            "ss_ticket_number",
+        ]
+    )
+    store_returns = store_returns.dropna(
+        subset=[
+            "sr_returned_date_sk",
+            "sr_customer_sk",
+            "sr_item_sk",
+            "sr_ticket_number",
+        ]
+    )
+    catalog_sales = catalog_sales.dropna(
+        subset=["cs_sold_date_sk", "cs_bill_customer_sk", "cs_item_sk"]
+    )
+
     d1 = date_dim[date_dim["d_quarter_name"] == "2001Q1"][["d_date_sk"]].rename(
         columns={"d_date_sk": "d1_date_sk"}
     )
