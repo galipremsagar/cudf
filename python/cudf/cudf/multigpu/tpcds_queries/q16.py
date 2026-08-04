@@ -79,13 +79,15 @@ def query(run_config):
     )
     joined = joined[joined["cr_order_number"].isna()]
 
-    result = (
-        joined.assign(_all=0)
-        .groupby("_all")
-        .agg(
-            order_count=("cs_order_number", "nunique"),
-            total_shipping_cost=("cs_ext_ship_cost", "sum"),
-            total_net_profit=("cs_net_profit", "sum"),
-        )
+    # Both money columns are DECIMAL, which libcudf cannot group-sum.
+    joined = joined.assign(
+        _all=0,
+        cs_ext_ship_cost=joined["cs_ext_ship_cost"].astype("float64"),
+        cs_net_profit=joined["cs_net_profit"].astype("float64"),
+    )
+    result = joined.groupby("_all").agg(
+        order_count=("cs_order_number", "nunique"),
+        total_shipping_cost=("cs_ext_ship_cost", "sum"),
+        total_net_profit=("cs_net_profit", "sum"),
     )
     return result.reset_index(drop=True)

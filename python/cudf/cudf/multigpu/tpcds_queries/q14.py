@@ -84,12 +84,14 @@ def query(run_config):
         ).merge(cross_items, left_on=item_col, right_on="i_item_sk")
         number_sales = (
             window.groupby(_TRIPLE, dropna=False)
-            .size()
-            .reset_index(name="number_sales")
+            .agg(number_sales=(item_col, "size"))
+            .reset_index()
         )
         priced = window[window[quantity].notna() & window[price].notna()]
+        # list_price is DECIMAL, and libcudf has no groupby sum for decimals.
         priced = priced.assign(
-            sales=priced[quantity].astype("int64") * priced[price]
+            sales=priced[quantity].astype("float64")
+            * priced[price].astype("float64")
         )
         summed = (
             priced.groupby(_TRIPLE, dropna=False)["sales"].sum().reset_index()

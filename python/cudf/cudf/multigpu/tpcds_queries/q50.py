@@ -50,8 +50,8 @@ def query(run_config):
     )
 
     d1 = date_dim[["d_date_sk"]]
-    d2 = date_dim.loc[
-        (date_dim["d_year"] == 2001) & (date_dim["d_moy"] == 8), ["d_date_sk"]
+    d2 = date_dim[(date_dim["d_year"] == 2001) & (date_dim["d_moy"] == 8)][
+        ["d_date_sk"]
     ].rename(columns={"d_date_sk": "d2_date_sk"})
 
     # SQL equality never matches NULL, but pandas merge treats NaN as a joinable

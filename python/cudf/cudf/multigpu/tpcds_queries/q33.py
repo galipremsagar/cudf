@@ -28,18 +28,25 @@ def query(run_config):
     item = pd.read_parquet(
         f"{path}/item{suffix}", columns=["i_item_sk", "i_manufact_id", "i_category"]
     )
+    # ``IN (SELECT i_manufact_id ...)`` written as a semi-join rather than as
+    # ``isin`` of a materialized ``unique()``, which would pull the distinct
+    # values back to the host.
     electronics = (
-        item[item["i_category"] == "Electronics"]["i_manufact_id"].dropna().unique()
+        item[item["i_category"] == "Electronics"][["i_manufact_id"]]
+        .dropna()
+        .drop_duplicates()
     )
-    item = item[item["i_manufact_id"].isin(electronics)][
-        ["i_item_sk", "i_manufact_id"]
-    ]
+    item = item[["i_item_sk", "i_manufact_id"]].merge(
+        electronics, on="i_manufact_id"
+    )
 
     def channel(table, date_key, address_key, item_key, value):
         sales = pd.read_parquet(
             f"{path}/{table}{suffix}",
             columns=[date_key, address_key, item_key, value],
         )
+        # The money column is a DECIMAL, which no GPU groupby can sum.
+        sales = sales.assign(**{value: sales[value].astype("float64")})
         sales = sales.merge(date_dim, left_on=date_key, right_on="d_date_sk")
         sales = sales.merge(
             customer_address, left_on=address_key, right_on="ca_address_sk"

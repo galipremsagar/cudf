@@ -8,6 +8,37 @@ from __future__ import annotations
 import pandas as pd
 
 
+def _rank_min_desc(frame, partition, value, name):
+    """``rank() OVER (PARTITION BY partition ORDER BY value DESC)``.
+
+    ``groupby().rank()`` has no distributed implementation, so this is built
+    from a global sort instead: sorting by the partition keys and then by the
+    value descending makes each partition a contiguous, ordered run of rows,
+    so a row's position minus its partition's first position is its 0-based
+    rank.  Taking the *minimum* such position over the rows sharing a value is
+    exactly what ``method="min"`` means, and that is a group-by min.
+    """
+    ordered = frame[partition + [value]].sort_values(
+        partition + [value],
+        ascending=[True] * len(partition) + [False],
+        na_position="first",
+    )
+    ordered = ordered.reset_index(drop=True).reset_index()
+    ordered = ordered.rename(columns={"index": "_row"})
+
+    starts = (
+        ordered.groupby(partition, as_index=False, dropna=False)["_row"]
+        .min()
+        .rename(columns={"_row": "_start"})
+    )
+    firsts = ordered.groupby(
+        partition + [value], as_index=False, dropna=False
+    )["_row"].min()
+    firsts = firsts.merge(starts, on=partition)
+    firsts[name] = firsts["_row"] - firsts["_start"] + 1
+    return frame.merge(firsts[partition + [value, name]], on=partition + [value])
+
+
 def query(run_config):
     path = run_config.dataset_path
     suffix = run_config.suffix
@@ -29,52 +60,47 @@ def query(run_config):
     df = store_sales.merge(
         date_dim, left_on="ss_sold_date_sk", right_on="d_date_sk"
     ).merge(store, left_on="ss_store_sk", right_on="s_store_sk")
+    # libcudf has no group-by sum for decimals; TPC-DS money is far inside
+    # float64's exactly representable range.
+    df = df.assign(ss_net_profit=df["ss_net_profit"].astype("float64"))
 
-    # The IN subquery: states ranked within their own partition, so every state
-    # that sold anything has ranking 1 and qualifies.
-    by_state = (
-        df.groupby("s_state", dropna=False)["ss_net_profit"].sum().reset_index()
-    )
-    by_state["_profit"] = by_state["ss_net_profit"].astype("float64")
-    by_state["ranking"] = by_state.groupby("s_state", dropna=False)["_profit"].rank(
-        method="min", ascending=False
-    )
-    top_states = by_state[by_state["ranking"] <= 5]["s_state"]
-    df = df[df["s_state"].isin(top_states)]
+    # The IN subquery ranks each state inside a partition of its own, so every
+    # state that sold anything is ranked 1 and passes "ranking <= 5". It admits
+    # exactly the states already present here, and is therefore dropped.
 
-    detail = (
-        df.groupby(["s_state", "s_county"], dropna=False)["ss_net_profit"]
-        .sum()
-        .reset_index()
-        .rename(columns={"ss_net_profit": "total_sum"})
-    )
+    def rolled_up(keys):
+        # The count rides along in place of ``sum(min_count=1)``: a group whose
+        # values are all NULL sums to NULL in SQL, not to zero.
+        out = df.groupby(keys, as_index=False, dropna=False).agg(
+            total_sum=("ss_net_profit", "sum"), _kept=("ss_net_profit", "count")
+        )
+        out["total_sum"] = out["total_sum"].where(out["_kept"] > 0)
+        return out
+
+    # rollup(s_state, s_county): both keys, then the state alone, then neither
+    detail = rolled_up(["s_state", "s_county"])
     detail["lochierarchy"] = 0
-    detail["_total"] = detail["total_sum"].astype("float64")
-    detail["rank_within_parent"] = detail.groupby("s_state", dropna=False)[
-        "_total"
-    ].rank(method="min", ascending=False)
+    detail = detail[["total_sum", "s_state", "s_county", "lochierarchy"]]
 
-    states = (
-        df.groupby("s_state", dropna=False)["ss_net_profit"]
-        .sum()
-        .reset_index()
-        .rename(columns={"ss_net_profit": "total_sum"})
-    )
-    states["s_county"] = None
+    states = rolled_up(["s_state"])
+    # where(isna()) is how an all-null column of the right dtype is built.
+    states["s_county"] = states["s_state"].where(states["s_state"].isna())
     states["lochierarchy"] = 1
-    states["_total"] = states["total_sum"].astype("float64")
-    states["rank_within_parent"] = states["_total"].rank(
-        method="min", ascending=False
+    states = states[["total_sum", "s_state", "s_county", "lochierarchy"]]
+
+    grand = states.head(1)
+    grand = grand.assign(
+        s_state=grand["s_state"].where(grand["s_state"].isna()),
+        total_sum=df["ss_net_profit"].sum(),
+        lochierarchy=2,
     )
 
-    grand = pd.DataFrame(
-        {
-            "total_sum": [df["ss_net_profit"].sum()],
-            "s_state": [None],
-            "s_county": [None],
-            "lochierarchy": [2],
-            "rank_within_parent": [1.0],
-        }
+    rollup = pd.concat([detail, states, grand], ignore_index=True)
+
+    # case when grouping(s_state) + grouping(s_county) = 0 then s_state end
+    rollup["parent"] = rollup["s_state"].where(rollup["lochierarchy"] == 0)
+    rollup = _rank_min_desc(
+        rollup, ["lochierarchy", "parent"], "total_sum", "rank_within_parent"
     )
 
     columns = [
@@ -84,12 +110,8 @@ def query(run_config):
         "lochierarchy",
         "rank_within_parent",
     ]
-    rollup = pd.concat(
-        [detail[columns], states[columns], grand[columns]], ignore_index=True
-    )
-    rollup["_order"] = rollup["s_state"].where(rollup["lochierarchy"] == 0)
     rollup = rollup.sort_values(
-        ["lochierarchy", "_order", "rank_within_parent"],
+        ["lochierarchy", "parent", "rank_within_parent"],
         ascending=[False, True, True],
         na_position="last",
     ).head(100)

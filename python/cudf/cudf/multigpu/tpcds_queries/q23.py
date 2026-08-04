@@ -121,24 +121,28 @@ def query(run_config):
             f"{path}/{table}{suffix}",
             columns=[date_key, item_key, customer_key, quantity, price],
         )
+        # The list price is a DECIMAL and no GPU groupby can sum one, so the
+        # amount is built in float64. SUM ignores a NULL term, hence the fill.
+        sales = sales.assign(
+            **{
+                price: sales[price].astype("float64").fillna(0.0),
+                quantity: sales[quantity].astype("float64").fillna(0.0),
+            }
+        )
         sales = sales.merge(feb2000, left_on=date_key, right_on="d_date_sk")
         sales = sales.merge(
             best_customers, left_on=customer_key, right_on="c_customer_sk"
         )
         sales = sales.merge(frequent, left_on=item_key, right_on="item_sk")
-        # The sale amount stays decimal, as it is in SQL; the float twin is
-        # only there to order by without comparing decimals element by element.
-        # SUM ignores a NULL term, so zeroing the nulls leaves the sums alone.
-        amount = sales[price].fillna(0) * sales[quantity].fillna(0).astype("int64")
-        sales = sales.assign(sales=amount, sales_value=amount.astype("float64"))
+        sales = sales.assign(sales=sales[price] * sales[quantity])
         frames.append(
             sales.groupby(
                 ["c_last_name", "c_first_name"], as_index=False, dropna=False
-            )[["sales", "sales_value"]].sum()
+            )[["sales"]].sum()
         )
 
     out = pd.concat(frames, ignore_index=True)
     out = out.sort_values(
-        ["c_last_name", "c_first_name", "sales_value"], na_position="first"
+        ["c_last_name", "c_first_name", "sales"], na_position="first"
     ).head(100)
     return out[["c_last_name", "c_first_name", "sales"]].reset_index(drop=True)

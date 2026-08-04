@@ -22,9 +22,9 @@ def query(run_config):
         ss_net_profit=store_sales["ss_net_profit"].astype("float64")
     )
 
-    threshold = 0.9 * store_sales.loc[
-        store_sales["ss_addr_sk"].isna(), "ss_net_profit"
-    ].mean()
+    threshold = (
+        0.9 * store_sales[store_sales["ss_addr_sk"].isna()]["ss_net_profit"].mean()
+    )
 
     ranked = (
         store_sales.groupby("ss_item_sk", dropna=False)["ss_net_profit"]
@@ -34,15 +34,33 @@ def query(run_config):
     )
     ranked = ranked[ranked["rank_col"] > threshold]
 
-    ascending = ranked.assign(
-        rnk=ranked["rank_col"].rank(method="min", ascending=True)
+    # rank() is computed from the value histogram rather than by ordering the
+    # rows: a distinct rank_col with c rows below it has ascending rank c+1 and
+    # descending rank (total - c - its own count) + 1, which is exactly what
+    # rank() with the SQL (= "min") tie rule gives. The histogram has one row
+    # per distinct average, so the sort and the running count behind it are
+    # over a table far smaller than the sales rows.
+    histogram = (
+        ranked.assign(_n=1)
+        .groupby("rank_col", as_index=False, dropna=False)["_n"]
+        .sum()
+        .sort_values("rank_col")
     )
-    ascending = ascending[ascending["rnk"] < 11][["item_sk", "rnk"]]
+    histogram["_below_or_equal"] = histogram["_n"].cumsum()
+    total = len(ranked)
+    histogram = histogram.assign(
+        _asc=histogram["_below_or_equal"] - histogram["_n"] + 1,
+        _desc=total - histogram["_below_or_equal"] + 1,
+    )
 
-    descending = ranked.assign(
-        rnk=ranked["rank_col"].rank(method="min", ascending=False)
-    )
-    descending = descending[descending["rnk"] < 11][["item_sk", "rnk"]]
+    def take(column):
+        wanted = histogram[histogram[column] < 11][["rank_col", column]].rename(
+            columns={column: "rnk"}
+        )
+        return ranked.merge(wanted, on="rank_col")[["item_sk", "rnk"]]
+
+    ascending = take("_asc")
+    descending = take("_desc")
 
     ascending = ascending.merge(
         item, left_on="item_sk", right_on="i_item_sk"

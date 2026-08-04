@@ -58,14 +58,21 @@ def query(run_config):
     joined = joined.merge(item, left_on="cs_item_sk", right_on="i_item_sk")
     joined = joined.merge(date_dim, left_on="cs_sold_date_sk", right_on="d_date_sk")
 
-    net = joined["cs_sales_price"] - joined["cr_refunded_cash"].fillna(0)
-    # ``net - net`` is the ELSE 0 of the query, written so that the sums keep
-    # the exact decimal type the SQL gives them rather than becoming floats.
-    zero = net - net
+    # The money columns are decimals, which no GPU groupby can sum, and the
+    # date flag becomes a column of its own so that every operand of the CASE
+    # comes from one and the same frame.
     split = pd.Timestamp("2000-03-11")
-    before = joined["d_date"] < split
-    joined["sales_before"] = net.where(before, zero)
-    joined["sales_after"] = net.where(~before, zero)
+    joined = joined.assign(
+        cs_sales_price=joined["cs_sales_price"].astype("float64"),
+        cr_refunded_cash=joined["cr_refunded_cash"].astype("float64"),
+        is_before=joined["d_date"] < split,
+    )
+    net = joined["cs_sales_price"] - joined["cr_refunded_cash"].fillna(0)
+    is_before = joined["is_before"]
+    joined = joined.assign(
+        sales_before=net.where(is_before, 0.0),
+        sales_after=net.where(~is_before, 0.0),
+    )
 
     result = (
         joined.groupby(["w_state", "i_item_id"], dropna=False)

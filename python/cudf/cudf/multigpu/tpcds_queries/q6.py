@@ -15,10 +15,15 @@ def query(run_config):
         f"{path}/date_dim{suffix}",
         columns=["d_date_sk", "d_month_seq", "d_year", "d_moy"],
     )
-    target_month = date_dim[(date_dim["d_year"] == 2001) & (date_dim["d_moy"] == 1)][
-        "d_month_seq"
-    ].unique()
-    dates = date_dim[date_dim["d_month_seq"].isin(target_month)][["d_date_sk"]]
+    # ``d_month_seq = (SELECT DISTINCT d_month_seq ...)`` as a semi-join: the
+    # distinct months are a one-column frame, so no scalar ever has to leave
+    # the GPU.
+    target_month = date_dim[
+        (date_dim["d_year"] == 2001) & (date_dim["d_moy"] == 1)
+    ][["d_month_seq"]].drop_duplicates()
+    dates = date_dim[["d_date_sk", "d_month_seq"]].merge(
+        target_month, on="d_month_seq", how="inner"
+    )[["d_date_sk"]]
 
     item = pd.read_parquet(
         f"{path}/item{suffix}",
@@ -61,10 +66,13 @@ def query(run_config):
         )
     )
 
+    # ``count(*)`` as a named ``size`` aggregate rather than ``GroupBy.size()``:
+    # customer_address has rows with a NULL ca_state, and SQL's GROUP BY keeps
+    # that as a group of its own.
     grouped = (
         joined.groupby("ca_state", dropna=False)
-        .size()
-        .reset_index(name="cnt")
+        .agg(cnt=("ss_item_sk", "size"))
+        .reset_index()
         .rename(columns={"ca_state": "state"})
     )
     grouped = grouped[grouped["cnt"] >= 10]

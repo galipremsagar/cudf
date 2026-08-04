@@ -79,5 +79,5 @@ def query(run_config):
            & (profit >= 50) & (profit <= 25000))
     )
 
-    total = merged.loc[demographic & address, "ss_quantity"].sum()
+    total = merged[demographic & address]["ss_quantity"].sum()
     return pd.DataFrame({"ss_quantity": [total]})

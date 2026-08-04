@@ -37,7 +37,9 @@ def query(run_config):
     date_dim = date_dim[
         (date_dim["d_month_seq"] >= 1200) & (date_dim["d_month_seq"] <= 1200 + 11)
     ]
-    warehouse = warehouse.assign(w_substr=warehouse["w_warehouse_name"].str[:20])
+    warehouse = warehouse.assign(
+        w_substr=warehouse["w_warehouse_name"].str.slice(0, 20)
+    )
 
     df = catalog_sales.merge(
         date_dim[["d_date_sk"]], left_on="cs_ship_date_sk", right_on="d_date_sk"

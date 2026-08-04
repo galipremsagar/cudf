@@ -86,6 +86,10 @@ def query(run_config):
         right_on="ca_address_sk",
     )
 
+    # libcudf has no group-by sum for decimals, so the money column becomes
+    # float64 first. TPC-DS amounts are far inside float64's exact range.
+    df = df.assign(cr_net_loss=df["cr_net_loss"].astype("float64"))
+
     grouped = df.groupby(
         [
             "cc_call_center_id",

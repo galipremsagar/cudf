@@ -68,24 +68,38 @@ def query(run_config):
             quarter(source, value, quarter_number, name), on="ca_county"
         )
 
-    web_q1_q2 = (joined["ws2"] * 1.0000) / joined["ws1"]
-    store_q1_q2 = (joined["ss2"] * 1.0000) / joined["ss1"]
-    web_q2_q3 = (joined["ws3"] * 1.0000) / joined["ws2"]
-    store_q2_q3 = (joined["ss3"] * 1.0000) / joined["ss2"]
+    # The four ratios become columns of the joined frame itself, so that every
+    # later expression reads columns of one frame instead of being grafted onto
+    # a narrower one.
+    joined = joined.assign(
+        d_year=2000,
+        web_q1_q2_increase=(joined["ws2"] * 1.0000) / joined["ws1"],
+        store_q1_q2_increase=(joined["ss2"] * 1.0000) / joined["ss1"],
+        web_q2_q3_increase=(joined["ws3"] * 1.0000) / joined["ws2"],
+        store_q2_q3_increase=(joined["ss3"] * 1.0000) / joined["ss2"],
+    )
 
-    web_q1_q2_case = web_q1_q2.where(joined["ws1"] > 0)
-    store_q1_q2_case = store_q1_q2.where(joined["ss1"] > 0)
-    web_q2_q3_case = web_q2_q3.where(joined["ws2"] > 0)
-    store_q2_q3_case = store_q2_q3.where(joined["ss2"] > 0)
+    # ``CASE WHEN x > 0 THEN ratio ELSE NULL END`` on either side of a ``>``
+    # makes the comparison unknown when the denominator is not positive, which
+    # drops the row -- so the four positivity tests are the CASEs.
+    mask = (
+        (joined["ws1"] > 0)
+        & (joined["ss1"] > 0)
+        & (joined["ws2"] > 0)
+        & (joined["ss2"] > 0)
+        & (joined["web_q1_q2_increase"] > joined["store_q1_q2_increase"])
+        & (joined["web_q2_q3_increase"] > joined["store_q2_q3_increase"])
+    )
+    result = joined[mask]
 
-    mask = (web_q1_q2_case > store_q1_q2_case) & (web_q2_q3_case > store_q2_q3_case)
-
-    result = joined[["ca_county"]].copy()
-    result["d_year"] = 2000
-    result["web_q1_q2_increase"] = web_q1_q2
-    result["store_q1_q2_increase"] = store_q1_q2
-    result["web_q2_q3_increase"] = web_q2_q3
-    result["store_q2_q3_increase"] = store_q2_q3
-    result = result[mask]
-
+    result = result[
+        [
+            "ca_county",
+            "d_year",
+            "web_q1_q2_increase",
+            "store_q1_q2_increase",
+            "web_q2_q3_increase",
+            "store_q2_q3_increase",
+        ]
+    ]
     return result.sort_values("ca_county").reset_index(drop=True)

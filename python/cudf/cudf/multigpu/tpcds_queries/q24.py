@@ -97,22 +97,19 @@ def query(run_config):
     )
     df = df[different]
 
-    # netpaid stays decimal, as it is in SQL; the float twin is only there to
-    # average and compare without decimal arithmetic element by element.
-    df = df.assign(
-        netpaid=df["ss_net_paid"],
-        netpaid_value=df["ss_net_paid"].astype("float64"),
-    )
+    # netpaid is a DECIMAL in SQL, but no GPU groupby sums a decimal, so the
+    # money is carried as float64 throughout.
+    df = df.assign(netpaid=df["ss_net_paid"].astype("float64"))
     ssales = df.groupby(_SSALES_KEYS, as_index=False, dropna=False)[
-        ["netpaid", "netpaid_value"]
+        ["netpaid"]
     ].sum()
 
-    threshold = 0.05 * ssales["netpaid_value"].mean()
+    threshold = 0.05 * ssales["netpaid"].mean()
     peach = ssales[(ssales["i_color"] == "peach").fillna(False)]
     out = peach.groupby(
         ["c_last_name", "c_first_name", "s_store_name"], as_index=False, dropna=False
-    )[["netpaid", "netpaid_value"]].sum()
-    out = out[out["netpaid_value"] > threshold]
+    )[["netpaid"]].sum()
+    out = out[out["netpaid"] > threshold]
     out = out.sort_values(
         ["c_last_name", "c_first_name", "s_store_name"], na_position="last"
     )

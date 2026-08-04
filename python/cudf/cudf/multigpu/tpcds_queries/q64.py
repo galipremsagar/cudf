@@ -5,11 +5,7 @@ sold in two consecutive years, comparing the two years' totals."""
 
 from __future__ import annotations
 
-from decimal import Decimal
-
 import pandas as pd
-
-ZERO = Decimal("0.00")
 
 GROUP_KEYS = [
     "i_product_name",
@@ -53,30 +49,32 @@ def query(run_config):
         left_on=["cs_item_sk", "cs_order_number"],
         right_on=["cr_item_sk", "cr_order_number"],
     )
-    # cr_refunded_cash+cr_reversed_charge+cr_store_credit is NULL, and so is
-    # skipped by SUM, when any part of it is NULL.
-    refund_known = (
-        returned["cr_refunded_cash"].notna()
-        & returned["cr_reversed_charge"].notna()
-        & returned["cr_store_credit"].notna()
-    )
+    # The money columns move to float64 here: libcudf has no group-by sum for
+    # fixed-point columns, and TPC-DS amounts are far inside float64's exactly
+    # representable range.  cr_refunded_cash+cr_reversed_charge+cr_store_credit
+    # is NULL, and so is skipped by SUM, when any part of it is NULL -- which is
+    # exactly what NaN propagation through the addition gives.
     refund = (
-        returned["cr_refunded_cash"].fillna(ZERO)
-        + returned["cr_reversed_charge"].fillna(ZERO)
-        + returned["cr_store_credit"].fillna(ZERO)
-    ).where(refund_known, ZERO)
+        returned["cr_refunded_cash"].astype("float64")
+        + returned["cr_reversed_charge"].astype("float64")
+        + returned["cr_store_credit"].astype("float64")
+    )
     returned = returned.assign(
-        refund=refund, refund_known=refund_known.astype("int64")
+        _sale=returned["cs_ext_list_price"].astype("float64"),
+        _refund=refund,
+        _refund_known=refund.notna(),
     )
     cs_ui = (
         returned.groupby("cs_item_sk", dropna=False)
         .agg(
-            sale=("cs_ext_list_price", "sum"),
-            refund=("refund", "sum"),
-            known=("refund_known", "sum"),
+            sale=("_sale", "sum"),
+            refund=("_refund", "sum"),
+            known=("_refund_known", "sum"),
         )
         .reset_index()
     )
+    # A SUM over an all-NULL group is NULL, and the HAVING comparison against a
+    # NULL is unknown, so those items drop out.
     cs_ui = cs_ui[(cs_ui["known"] > 0) & (cs_ui["sale"] > 2 * cs_ui["refund"])][
         ["cs_item_sk"]
     ]
@@ -97,6 +95,13 @@ def query(run_config):
             "ss_list_price",
             "ss_coupon_amt",
         ],
+    )
+    # The three money columns are aggregated later; float64 is what libcudf can
+    # group-by-sum, and the cast is cheaper here than after the joins.
+    store_sales = store_sales.assign(
+        ss_wholesale_cost=store_sales["ss_wholesale_cost"].astype("float64"),
+        ss_list_price=store_sales["ss_list_price"].astype("float64"),
+        ss_coupon_amt=store_sales["ss_coupon_amt"].astype("float64"),
     )
     store_returns = pd.read_parquet(
         f"{path}/store_returns{suffix}",
@@ -146,14 +151,15 @@ def query(run_config):
         columns=["i_item_sk", "i_product_name", "i_color", "i_current_price"],
     )
 
+    # The two BETWEENs intersect to [65, 74]; the bounds are whole dollars, so
+    # comparing in float64 keeps the same rows a decimal comparison would.
+    price = item["i_current_price"].astype("float64")
     item = item[
         item["i_color"].isin(
             ["purple", "burlywood", "indian", "spring", "floral", "medium"]
         )
-        & (item["i_current_price"] >= 64)
-        & (item["i_current_price"] <= 74)
-        & (item["i_current_price"] >= 65)
-        & (item["i_current_price"] <= 79)
+        & (price >= 65)
+        & (price <= 74)
     ][["i_item_sk", "i_product_name"]]
 
     banded = household_demographics.merge(
@@ -276,12 +282,8 @@ def query(run_config):
     joined = left.merge(right, on=["i_item_sk", "s_store_name", "s_zip"])
     joined = joined[joined["cnt2"] <= joined["cnt"]]
 
-    joined = joined.assign(
-        _s1=joined["s1"].astype("float64"),
-        _s12=joined["s12"].astype("float64"),
-    )
     joined = joined.sort_values(
-        ["i_product_name", "s_store_name", "cnt2", "_s1", "_s12"],
+        ["i_product_name", "s_store_name", "cnt2", "s1", "s12"],
         na_position="last",
     )
 

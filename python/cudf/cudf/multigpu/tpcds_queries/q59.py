@@ -26,7 +26,7 @@ def _half(wss, store, date_dim, low, high, tag):
     ).merge(weeks, on="d_week_seq")
     columns = ["s_store_name", "d_week_seq", "s_store_id"] + [c for _, c in DAYS]
     joined = joined[columns]
-    return joined.set_axis([f"{c}{tag}" for c in columns], axis=1)
+    return joined.rename(columns={c: f"{c}{tag}" for c in columns})
 
 
 def query(run_config):
@@ -50,13 +50,27 @@ def query(run_config):
         left_on="ss_sold_date_sk",
         right_on="d_date_sk",
     )
+    # libcudf cannot group-by-sum a fixed-point column, so the price moves to
+    # float64 first; TPC-DS amounts are well inside float64's exact range.
     price = daily["ss_sales_price"].astype("float64")
+    per_day = {}
     for day, column in DAYS:
-        daily[column] = price.where(daily["d_day_name"] == day)
+        value = price.where(daily["d_day_name"] == day)
+        per_day[column] = value
+        # A SUM over an all-NULL group is NULL, not zero, and these sums land
+        # in a division, so the distinction has to survive the aggregation.
+        per_day[f"{column}_n"] = value.notna()
+    daily = daily.assign(**per_day)
 
     wss = daily.groupby(["d_week_seq", "ss_store_sk"], as_index=False)[
-        [c for _, c in DAYS]
+        list(per_day)
     ].sum()
+    wss = wss.assign(
+        **{
+            column: wss[column].where(wss[f"{column}_n"] > 0)
+            for _, column in DAYS
+        }
+    ).drop(columns=[f"{c}_n" for _, c in DAYS])
 
     this_year = _half(wss, store, date_dim, 1212, 1212 + 11, "1")
     last_year = _half(wss, store, date_dim, 1212 + 12, 1212 + 23, "2")
@@ -72,9 +86,16 @@ def query(run_config):
         ["s_store_name1", "s_store_id1", "d_week_seq1"], na_position="first"
     ).head(100)
 
-    out = result[["s_store_name1", "s_store_id1", "d_week_seq1"]].reset_index(drop=True)
+    ratios = {}
     for _, column in DAYS:
-        numerator = result[f"{column}1"].reset_index(drop=True)
-        denominator = result[f"{column}2"].reset_index(drop=True)
-        out[f"{column}_ratio"] = numerator / denominator.where(denominator != 0)
-    return out
+        denominator = result[f"{column}2"]
+        # SQL division by zero is NULL, not an infinity.
+        ratios[f"{column}_ratio"] = result[f"{column}1"] / denominator.where(
+            denominator != 0
+        )
+    result = result.assign(**ratios)
+
+    return result[
+        ["s_store_name1", "s_store_id1", "d_week_seq1"]
+        + [f"{c}_ratio" for _, c in DAYS]
+    ].reset_index(drop=True)

@@ -75,27 +75,37 @@ def query(run_config):
         .merge(store, left_on="ss_store_sk", right_on="s_store_sk")
     )
 
+    # libcudf has no group-by sum for fixed-point columns, so the price becomes
+    # float64 before the aggregation; TPC-DS money is inside float64's exact
+    # range and the answer is compared at a relative tolerance.
+    df = df.assign(_price=df["ss_sales_price"].astype("float64"))
+
     grouped = (
         df.groupby(["i_manager_id", "d_moy"], dropna=False)
-        .agg(sum_sales=("ss_sales_price", "sum"), n=("ss_sales_price", "count"))
+        .agg(sum_sales=("_price", "sum"), n=("_price", "count"))
         .reset_index()
     )
     # SUM over an all-NULL group is NULL: it takes no part in the average and
     # the CASE below is then NULL, which is not > 0.1.
     grouped = grouped[grouped["n"] > 0]
-    grouped["_sum_sales"] = grouped["sum_sales"].astype("float64")
-    grouped["avg_monthly_sales"] = grouped.groupby("i_manager_id", dropna=False)[
-        "_sum_sales"
-    ].transform("mean")
+
+    # avg(sum(...)) over (partition by i_manager_id), written as a group-by plus
+    # a merge -- the multi-GPU layer has no group-by ``transform``.
+    averages = (
+        grouped.groupby("i_manager_id", as_index=False, dropna=False)["sum_sales"]
+        .mean()
+        .rename(columns={"sum_sales": "avg_monthly_sales"})
+    )
+    grouped = grouped.merge(averages, on="i_manager_id")
 
     positive = grouped["avg_monthly_sales"] > 0
     deviation = (
-        grouped["_sum_sales"] - grouped["avg_monthly_sales"]
+        grouped["sum_sales"] - grouped["avg_monthly_sales"]
     ).abs() / grouped["avg_monthly_sales"]
     grouped = grouped[positive & (deviation > 0.1)]
 
     grouped = grouped.sort_values(
-        ["i_manager_id", "avg_monthly_sales", "_sum_sales"]
+        ["i_manager_id", "avg_monthly_sales", "sum_sales"]
     ).head(100)
     result = grouped[["i_manager_id", "sum_sales", "avg_monthly_sales"]]
     return result.reset_index(drop=True)

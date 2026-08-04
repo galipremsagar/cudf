@@ -31,7 +31,10 @@ def query(run_config):
     )
 
     december = date_dim[(date_dim["d_year"] == 1998) & (date_dim["d_moy"] == 12)]
-    month_seq = int(december["d_month_seq"].drop_duplicates().iloc[0])
+    # The scalar sub-query is "select distinct d_month_seq", which only has an
+    # answer because December 1998 sits in exactly one month sequence; a
+    # reduction picks that one value without materializing anything.
+    month_seq = int(december["d_month_seq"].min())
 
     cs = catalog_sales.rename(
         columns={
@@ -86,16 +89,21 @@ def query(run_config):
         window, left_on="ss_sold_date_sk", right_on="d_date_sk"
     )
 
-    revenue = located.merge(
-        recent, left_on="c_customer_sk", right_on="ss_customer_sk"
-    ).groupby("c_customer_sk", as_index=False)["ss_ext_sales_price"].sum()
+    sold = located.merge(recent, left_on="c_customer_sk", right_on="ss_customer_sk")
+    # libcudf cannot group-by-sum a fixed-point column, so the money moves to
+    # float64 before the aggregation rather than after it.
+    sold = sold.assign(_price=sold["ss_ext_sales_price"].astype("float64"))
+    revenue = sold.groupby("c_customer_sk", as_index=False)["_price"].sum()
 
-    amount = revenue["ss_ext_sales_price"].astype("float64")
-    segments = pd.DataFrame({"segment": (amount / 50 + 0.5).astype("int64")})
+    # cast(round(revenue/50) as int): revenue is non-negative here, so adding a
+    # half and truncating is the same rounding SQL does.
+    revenue = revenue.assign(
+        segment=(revenue["_price"] / 50 + 0.5).astype("int64")
+    )
 
-    counted = segments.groupby("segment", as_index=False).size()
+    counted = revenue.groupby("segment", as_index=False).size()
     counted = counted.rename(columns={"size": "num_customers"})
-    counted["segment_base"] = counted["segment"] * 50
+    counted = counted.assign(segment_base=counted["segment"] * 50)
 
     result = counted.sort_values(
         ["segment", "num_customers", "segment_base"], na_position="first"

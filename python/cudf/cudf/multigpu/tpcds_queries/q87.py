@@ -58,8 +58,11 @@ def query(run_config):
         (catalog_sales, "cs_sold_date_sk", "cs_bill_customer_sk"),
         (web_sales, "ws_sold_date_sk", "ws_bill_customer_sk"),
     ):
-        other = distinct(sales, date_key, customer_key)
-        merged = cool.merge(other, on=keys, how="left", indicator=True)
-        cool = merged[merged["_merge"] == "left_only"][keys]
+        # EXCEPT as a left join against a marker column: a row that found no
+        # partner keeps a null marker. ``indicator=True`` is the same idea but
+        # is not implemented distributed.
+        other = distinct(sales, date_key, customer_key).assign(_seen=1)
+        merged = cool.merge(other, on=keys, how="left")
+        cool = merged[merged["_seen"].isna()][keys]
 
     return pd.DataFrame({"count_star": [len(cool)]})

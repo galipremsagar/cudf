@@ -9,7 +9,7 @@ import pandas as pd
 
 def _sql_sum(frame, keys, value, name):
     """``sum(value)`` grouped by ``keys``, NULL when every input is NULL."""
-    frame = frame.assign(_nonnull=frame[value].notna())
+    frame = frame.assign(_nonnull=frame[value].notna().astype("int64"))
     grouped = frame.groupby(keys, as_index=False, dropna=False)[
         [value, "_nonnull"]
     ].sum()
@@ -43,13 +43,18 @@ def query(run_config):
         dates, left_on="ss_sold_date_sk", right_on="d_date_sk"
     ).merge(items, left_on="ss_item_sk", right_on="i_item_sk")
 
+    # libcudf has no group-by sum for fixed-point columns; a decimal(7,2) money
+    # value and a twelve-thousand-row sum of them are both exact in float64.
+    joined = joined.assign(
+        ss_ext_sales_price=joined["ss_ext_sales_price"].astype("float64")
+    )
+
     grouped = _sql_sum(
         joined, ["d_year", "i_brand", "i_brand_id"], "ss_ext_sales_price", "ext_price"
     )
     grouped = grouped.rename(columns={"i_brand_id": "brand_id", "i_brand": "brand"})
-    grouped["_order"] = grouped["ext_price"].astype("float64")
 
     result = grouped.sort_values(
-        ["d_year", "_order", "brand_id"], ascending=[True, False, True]
+        ["d_year", "ext_price", "brand_id"], ascending=[True, False, True]
     ).head(100)
     return result[["d_year", "brand_id", "brand", "ext_price"]].reset_index(drop=True)

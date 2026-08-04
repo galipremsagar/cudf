@@ -39,38 +39,51 @@ def query(run_config):
     d_date = pd.to_datetime(date_dim["d_date"])
     date_dim = date_dim[
         (d_date >= pd.Timestamp("1999-02-01")) & (d_date <= pd.Timestamp("1999-04-02"))
+    ][["d_date_sk"]]
+    customer_address = customer_address[customer_address["ca_state"] == "IL"][
+        ["ca_address_sk"]
     ]
-    customer_address = customer_address[customer_address["ca_state"] == "IL"]
-    web_site = web_site[web_site["web_company_name"] == "pri"]
+    web_site = web_site[web_site["web_company_name"] == "pri"][["web_site_sk"]]
 
     # EXISTS: another line of the same order shipped from a different warehouse.
-    warehouses = web_sales.groupby("ws_order_number", as_index=False)[
-        "ws_warehouse_sk"
-    ].nunique()
+    # ``<>`` is never true for a NULL warehouse on either side, so NULLs are
+    # dropped before counting the distinct warehouses of each order.
+    pairs = web_sales[["ws_order_number", "ws_warehouse_sk"]].dropna()
+    warehouses = (
+        pairs.drop_duplicates()
+        .groupby("ws_order_number", as_index=False)["ws_warehouse_sk"]
+        .count()
+    )
     warehouses.columns = ["ws_order_number", "n_warehouses"]
-    split_orders = warehouses[warehouses["n_warehouses"] > 1]["ws_order_number"]
+    split_orders = warehouses[warehouses["n_warehouses"] > 1][["ws_order_number"]]
 
-    df = web_sales.merge(
-        date_dim[["d_date_sk"]], left_on="ws_ship_date_sk", right_on="d_date_sk"
-    )
+    df = web_sales[web_sales["ws_warehouse_sk"].notna()]
+    df = df.merge(date_dim, left_on="ws_ship_date_sk", right_on="d_date_sk")
     df = df.merge(
-        customer_address[["ca_address_sk"]],
-        left_on="ws_ship_addr_sk",
-        right_on="ca_address_sk",
+        customer_address, left_on="ws_ship_addr_sk", right_on="ca_address_sk"
     )
-    df = df.merge(
-        web_site[["web_site_sk"]], left_on="ws_web_site_sk", right_on="web_site_sk"
-    )
-    df = df[
-        df["ws_order_number"].isin(split_orders) & df["ws_warehouse_sk"].notna()
-    ]
-    # NOT EXISTS: the order was never returned.
-    df = df[~df["ws_order_number"].isin(web_returns["wr_order_number"])]
+    df = df.merge(web_site, left_on="ws_web_site_sk", right_on="web_site_sk")
+    # The EXISTS semi-join, as an inner merge against the distinct qualifying
+    # order numbers.
+    df = df.merge(split_orders, on="ws_order_number")
 
+    # NOT EXISTS: the order was never returned -- a left merge against the
+    # distinct returned order numbers, keeping the rows that found no match.
+    returned = web_returns[["wr_order_number"]].drop_duplicates()
+    df = df.merge(
+        returned, left_on="ws_order_number", right_on="wr_order_number", how="left"
+    )
+    df = df[df["wr_order_number"].isna()]
+
+    # COUNT(DISTINCT ...) as a distributed de-duplication rather than
+    # Series.nunique(), which gathers every value onto one GPU.
+    order_count = len(df[["ws_order_number"]].drop_duplicates())
+    # libcudf has no decimal sum, and these money columns are well inside
+    # float64's exactly-representable range.
     return pd.DataFrame(
         {
-            "order count": [df["ws_order_number"].nunique()],
-            "total shipping cost": [df["ws_ext_ship_cost"].sum()],
-            "total net profit": [df["ws_net_profit"].sum()],
+            "order count": [order_count],
+            "total shipping cost": [df["ws_ext_ship_cost"].astype("float64").sum()],
+            "total net profit": [df["ws_net_profit"].astype("float64").sum()],
         }
     )

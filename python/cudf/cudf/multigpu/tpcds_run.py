@@ -117,12 +117,15 @@ def _compare(got, expected, rtol: float = 1e-6) -> tuple[bool, str]:
     import pandas as pd
 
     if expected is None:
-        return True, "no reference"
+        # Not a pass. Counting an unverifiable result as matching inflates the
+        # score exactly when the evidence is missing.
+        return None, "no reference"
     if len(got) != len(expected):
         return False, f"{len(got)} rows, expected {len(expected)}"
     if got.shape[1] != expected.shape[1]:
         return False, f"{got.shape[1]} columns, expected {expected.shape[1]}"
 
+    bad_columns: list[str] = []
     for i in range(expected.shape[1]):
         left = got.iloc[:, i].reset_index(drop=True)
         right = expected.iloc[:, i].reset_index(drop=True)
@@ -143,13 +146,17 @@ def _compare(got, expected, rtol: float = 1e-6) -> tuple[bool, str]:
             if not bool((same | both_null).all()):
                 bad = int((~(same | both_null)).sum())
                 kind = "exact" if whole else f"rtol={rtol:g}"
-                return False, f"column {i}: {bad} values differ ({kind})"
+                bad_columns.append(f"col {i}: {bad} differ ({kind})")
         else:
             ls = left.astype("string").str.strip()
             rs = right.astype("string").str.strip()
             if not bool(((ls == rs) | (ls.isna() & rs.isna())).all()):
                 bad = int((~((ls == rs) | (ls.isna() & rs.isna()))).sum())
-                return False, f"column {i}: {bad} values differ"
+                bad_columns.append(f"col {i}: {bad} differ")
+    # every differing column is reported. Stopping at the first understates the
+    # damage, which makes a broad failure look like a rounding difference.
+    if bad_columns:
+        return False, "; ".join(bad_columns)
     return True, ""
 
 
@@ -214,6 +221,7 @@ def main() -> None:
     print("-" * 82)
 
     timings, failures, host_growth, mismatches = {}, {}, {}, {}
+    unverified: dict = {}
     for number in numbers:
         query = tpcds_queries.get(number)
         if query is None:
@@ -244,7 +252,10 @@ def main() -> None:
                         None if expected is None else _to_host(expected))
                 except Exception as exc:
                     ok, why = False, f"comparison failed: {type(exc).__name__}: {exc}"
-                if not ok:
+                if ok is None:
+                    unverified[number] = why
+                    note = f"  <-- UNVERIFIED: {why}"
+                elif not ok:
                     mismatches[number] = why
                     note = f"  <-- MISMATCH: {why}"
             if grew > FALLBACK_RSS_GIB:
@@ -269,11 +280,14 @@ def main() -> None:
     correct = [n for n in timings if n not in mismatches]
     print(f"{len(timings)}/{len(numbers)} queries ran; "
           f"total {sum(timings.values()):.2f}s")
-    print(f"  on GPU: {len(timings) - len(on_cpu)}/{len(numbers)}"
-          + (f"   fell back to CPU: {sorted(on_cpu)}" if on_cpu
-             else "   (no query fell back to CPU)"))
+    if args.backend != "pandas":
+        print(f"  on GPU: {len(timings) - len(on_cpu)}/{len(numbers)}"
+              + (f"   fell back to CPU: {sorted(on_cpu)}" if on_cpu
+                 else "   (no query fell back to CPU)"))
     if args.validate:
-        print(f"  matched DuckDB: {len(correct)}/{len(timings)}")
+        print(f"  matched DuckDB: {len(correct) - len(unverified)}/{len(timings)}"
+              + (f"   unverified (no reference): {sorted(unverified)}"
+                 if unverified else ""))
     if mismatches:
         print("\nwrong answers:")
         for number, why in sorted(mismatches.items()):

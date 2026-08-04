@@ -48,8 +48,12 @@ def query(run_config):
     df = df.merge(warehouse, left_on="inv_warehouse_sk", right_on="w_warehouse_sk")
     df = df.merge(date_dim, left_on="inv_date_sk", right_on="d_date_sk")
 
-    is_before = df["d_date"] < pd.Timestamp("2000-03-11")
+    # The flag is materialized as a column of its own first: the two masked
+    # quantities are then built from columns of one and the same frame, which
+    # is what the chunked layer can line up chunk for chunk.
+    df = df.assign(is_before=df["d_date"] < pd.Timestamp("2000-03-11"))
     quantity = df["inv_quantity_on_hand"]
+    is_before = df["is_before"]
     df = df.assign(
         inv_before=quantity.where(is_before, 0),
         inv_after=quantity.where(~is_before, 0),
@@ -61,8 +65,13 @@ def query(run_config):
 
     before = grouped["inv_before"].astype("float64")
     after = grouped["inv_after"].astype("float64")
-    ratio = (after * 1.000) / before.where(before > 0)
-    grouped = grouped[(ratio >= 2.000 / 3.000) & (ratio <= 3.000 / 2.000)]
+    # Dividing by a zero ``inv_before`` gives an infinity that fails the upper
+    # bound anyway, and the explicit ``> 0`` is the CASE that makes the SQL
+    # ratio NULL there -- so no NULL has to be manufactured.
+    ratio = (after * 1.000) / before
+    grouped = grouped[
+        (before > 0) & (ratio >= 2.000 / 3.000) & (ratio <= 3.000 / 2.000)
+    ]
 
     result = grouped.sort_values(
         ["w_warehouse_name", "i_item_id"], na_position="first"

@@ -8,13 +8,19 @@ import pandas as pd
 
 
 def _sql_sum(frame, keys, value, name):
-    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL."""
-    frame = frame.assign(_nonnull=frame[value].notna())
+    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL.
+
+    The money column is cast to float64 first: libcudf has no group-by sum for
+    fixed-point columns, and TPC-DS amounts are far inside float64's exactly
+    representable range.
+    """
+    values = frame[value].astype("float64")
+    frame = frame.assign(_value=values, _nonnull=values.notna())
     grouped = frame.groupby(keys, as_index=False, dropna=False)[
-        [value, "_nonnull"]
+        ["_value", "_nonnull"]
     ].sum()
-    grouped[value] = grouped[value].where(grouped["_nonnull"] > 0)
-    return grouped.drop(columns=["_nonnull"]).rename(columns={value: name})
+    grouped[name] = grouped["_value"].where(grouped["_nonnull"] > 0)
+    return grouped.drop(columns=["_value", "_nonnull"])
 
 
 def _revenue(sales, item_sk_col, date_sk_col, price_col, items, dates, name):
@@ -33,10 +39,11 @@ def query(run_config):
         f"{base}/date_dim{suffix}", columns=["d_date_sk", "d_date", "d_week_seq"]
     )
     date_dim = date_dim.assign(d_date=pd.to_datetime(date_dim["d_date"]))
+    # d_date is unique in date_dim, so the one matching row's week is its min.
     week = int(
-        date_dim.loc[
-            date_dim["d_date"] == pd.Timestamp("2000-01-03"), "d_week_seq"
-        ].iloc[0]
+        date_dim[date_dim["d_date"] == pd.Timestamp("2000-01-03")][
+            "d_week_seq"
+        ].min()
     )
     # ``d_date`` is unique in date_dim, so "d_date in (the dates of that week)"
     # selects exactly the rows of that week.

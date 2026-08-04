@@ -53,22 +53,33 @@ def query(run_config):
     frame = frame.merge(dates, left_on="ss_sold_date_sk", right_on="d_date_sk")
     frame = frame.merge(store, left_on="ss_store_sk", right_on="s_store_sk")
 
-    grouped = frame.groupby(_GROUP, as_index=False, dropna=False)[
-        "ss_sales_price"
-    ].sum(min_count=1)
-    grouped = grouped.rename(columns={"ss_sales_price": "sum_sales"})
-    grouped["sales"] = grouped["sum_sales"].astype("float64")
-    grouped["avg_monthly_sales"] = grouped.groupby(_PARTITION, dropna=False)[
-        "sales"
-    ].transform("mean")
+    # libcudf has no group-by sum for decimals, so the price becomes float64.
+    frame = frame.assign(
+        ss_sales_price=frame["ss_sales_price"].astype("float64")
+    )
+    # The count rides along in place of ``sum(min_count=1)``: a month whose
+    # prices are all NULL sums to NULL, and AVG then skips it.
+    grouped = frame.groupby(_GROUP, as_index=False, dropna=False).agg(
+        sum_sales=("ss_sales_price", "sum"), _kept=("ss_sales_price", "count")
+    )
+    grouped["sum_sales"] = grouped["sum_sales"].where(grouped["_kept"] > 0)
 
-    deviation = (grouped["sales"] - grouped["avg_monthly_sales"]).abs() / grouped[
-        "avg_monthly_sales"
-    ]
+    # avg(sum_sales) over the brand/store partition: a group-by plus a merge,
+    # since groupby().transform() has no distributed implementation.
+    monthly = (
+        grouped.groupby(_PARTITION, as_index=False, dropna=False)["sum_sales"]
+        .mean()
+        .rename(columns={"sum_sales": "avg_monthly_sales"})
+    )
+    grouped = grouped.merge(monthly, on=_PARTITION)
+
+    deviation = (
+        grouped["sum_sales"] - grouped["avg_monthly_sales"]
+    ).abs() / grouped["avg_monthly_sales"]
     grouped = grouped[(grouped["avg_monthly_sales"] != 0) & (deviation > 0.1)]
 
     grouped = grouped.assign(
-        delta=grouped["sales"] - grouped["avg_monthly_sales"]
+        delta=grouped["sum_sales"] - grouped["avg_monthly_sales"]
     )
     grouped = grouped.sort_values(
         [
@@ -79,7 +90,7 @@ def query(run_config):
             "i_brand",
             "s_company_name",
             "d_moy",
-            "sales",
+            "sum_sales",
             "avg_monthly_sales",
         ],
         na_position="last",

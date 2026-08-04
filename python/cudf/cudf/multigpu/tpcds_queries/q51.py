@@ -6,42 +6,64 @@ from __future__ import annotations
 
 import pandas as pd
 
-MONEY = ["web_sales", "store_sales", "web_cumulative", "store_cumulative"]
+_RUNNING = ["web_cents", "web_seen", "store_cents", "store_seen"]
 
-# ``sum()``/``max()`` over a NULL-free window is exact in whole cents, and the
-# running sums here are wide enough that float64 would start to drift, so every
-# money value is carried as an int64 count of cents. -1 stands for SQL NULL,
-# which is unambiguous because sales prices are never negative.
-NULL = -1
+# ``sum()`` over a NULL-free window is exact in whole cents, and the running
+# sums here are wide enough that carrying dollars in float64 would start to
+# drift, so every money value is an int64 count of cents until the last step.
+CENTS = 100
 
 
-def _cumulative(sales, dates, item_col, date_col, price_col, name):
-    """``sum(sum(price)) OVER (PARTITION BY item ORDER BY d_date)``, in cents."""
-    joined = sales.merge(dates, left_on=date_col, right_on="d_date_sk")
-    cents = (joined[price_col].astype("float64") * 100).round()
+def _daily(sales, dates, item_col, date_col, price_col, prefix):
+    """One row per (item, day) with that day's sales, in cents.
+
+    ``_seen`` counts the non-NULL prices behind the sum, which is how SQL's
+    ``sum()`` decides between 0 and NULL for a group.
+    """
+    joined = sales[sales[item_col].notna()].merge(
+        dates, left_on=date_col, right_on="d_date_sk"
+    )
+    cents = (joined[price_col].astype("float64") * CENTS).round()
     joined = joined.assign(
-        _cents=cents.fillna(0), _nonnull=cents.notna().astype("int64")
+        _cents=cents.fillna(0).astype("int64"),
+        _seen=cents.notna().astype("int64"),
+    )
+    daily = joined.groupby([item_col, "d_date"], as_index=False)[
+        ["_cents", "_seen"]
+    ].sum()
+    return daily.rename(
+        columns={
+            item_col: "item_sk",
+            "_cents": f"{prefix}_cents",
+            "_seen": f"{prefix}_seen",
+        }
     )
 
-    daily = joined.groupby([item_col, "d_date"], as_index=False)[
-        ["_cents", "_nonnull"]
-    ].sum()
-    daily = daily.sort_values([item_col, "d_date"]).reset_index(drop=True)
 
-    by_item = daily.groupby(item_col)
-    running = by_item["_cents"].cumsum().astype("int64")
-    seen = by_item["_nonnull"].cumsum()
-    daily[name] = running.where(seen > 0, NULL)
+def _running_by_item(frame, columns):
+    """Per-item running totals of ``columns``, over the frame's current order.
 
-    daily = daily.rename(columns={item_col: "item_sk"})
-    return daily[["item_sk", "d_date", name]]
-
-
-def _money(cents):
-    """Render cents the way DuckDB renders the DECIMAL(38,2) it computes."""
-    whole = (cents // 100).astype("string")
-    fraction = (cents % 100).astype("string").str.zfill(2)
-    return (whole + "." + fraction).where(cents >= 0)
+    ``cumsum`` on the whole frame is a global scan; subtracting the total of
+    every earlier item -- which is what that scan stood at when the item's
+    first row was reached -- turns it into a per-item scan. That needs each
+    item's rows to be contiguous and the items to come in the same order as
+    their totals, which the caller's sort guarantees.
+    """
+    running = frame[columns].cumsum()
+    totals = frame.groupby("item_sk", as_index=False)[columns].sum()
+    totals = totals.sort_values("item_sk")
+    earlier = totals[columns].cumsum()
+    for column in columns:
+        totals[f"_before_{column}"] = earlier[column] - totals[column]
+        frame[f"_running_{column}"] = running[column]
+    frame = frame.merge(
+        totals[["item_sk"] + [f"_before_{c}" for c in columns]], on="item_sk"
+    )
+    for column in columns:
+        frame[f"_running_{column}"] = (
+            frame[f"_running_{column}"] - frame[f"_before_{column}"]
+        )
+    return frame
 
 
 def query(run_config):
@@ -65,39 +87,37 @@ def query(run_config):
         columns=["ss_item_sk", "ss_sold_date_sk", "ss_sales_price"],
     )
 
-    web = _cumulative(
-        web_sales[web_sales["ws_item_sk"].notna()],
-        dates,
-        "ws_item_sk",
-        "ws_sold_date_sk",
-        "ws_sales_price",
-        "web_sales",
+    web = _daily(
+        web_sales, dates, "ws_item_sk", "ws_sold_date_sk", "ws_sales_price", "web"
     )
-    # A NULL ss_item_sk can only ever produce a store-only row of the full outer
-    # join, whose web_cumulative is NULL and which the final predicate therefore
-    # drops, so leaving those groups out here changes nothing.
-    store = _cumulative(
-        store_sales,
-        dates,
-        "ss_item_sk",
-        "ss_sold_date_sk",
-        "ss_sales_price",
-        "store_sales",
+    store = _daily(
+        store_sales, dates, "ss_item_sk", "ss_sold_date_sk", "ss_sales_price", "store"
     )
 
     both = web.merge(store, on=["item_sk", "d_date"], how="outer")
-    both["web_sales"] = both["web_sales"].fillna(NULL).astype("int64")
-    both["store_sales"] = both["store_sales"].fillna(NULL).astype("int64")
-    both = both.sort_values(["item_sk", "d_date"]).reset_index(drop=True)
 
-    by_item = both.groupby("item_sk")
-    both["web_cumulative"] = by_item["web_sales"].cummax()
-    both["store_cumulative"] = by_item["store_sales"].cummax()
+    # Which side of the full outer join actually had a row for this day: a
+    # group that exists always has a non-NULL sum here, so a NULL marks a
+    # missing row rather than a NULL price.
+    both = both.assign(
+        _web_row=both["web_cents"].notna(), _store_row=both["store_cents"].notna()
+    )
+    for column in _RUNNING:
+        both[column] = both[column].fillna(0).astype("int64")
+
+    # The outer window is `max(cume_sales) over (... rows unbounded preceding)`
+    # and cume_sales is itself a running sum of non-negative prices, so it is
+    # non-decreasing and its running max is just the running sum carried across
+    # the days only the other table contributed to. Running the sum over the
+    # union of both tables' days therefore gives the same answer without a
+    # segmented max, with `_seen` marking where it is still NULL.
+    both = both.sort_values(["item_sk", "d_date"])
+    both = _running_by_item(both, _RUNNING)
 
     selected = both[
-        (both["web_cumulative"] >= 0)
-        & (both["store_cumulative"] >= 0)
-        & (both["web_cumulative"] > both["store_cumulative"])
+        (both["_running_web_seen"] > 0)
+        & (both["_running_store_seen"] > 0)
+        & (both["_running_web_cents"] > both["_running_store_cents"])
     ]
     selected = (
         selected.sort_values(["item_sk", "d_date"], na_position="first")
@@ -105,7 +125,13 @@ def query(run_config):
         .reset_index(drop=True)
     )
 
+    web_total = selected["_running_web_cents"] / CENTS
+    store_total = selected["_running_store_cents"] / CENTS
     result = selected[["item_sk", "d_date"]].copy()
-    for column in MONEY:
-        result[column] = _money(selected[column])
+    # web_sales is the joined-in cume_sales, so it is NULL on a day the item
+    # had no web sale at all; web_cumulative is the carried-forward one.
+    result["web_sales"] = web_total.where(selected["_web_row"])
+    result["store_sales"] = store_total.where(selected["_store_row"])
+    result["web_cumulative"] = web_total
+    result["store_cumulative"] = store_total
     return result

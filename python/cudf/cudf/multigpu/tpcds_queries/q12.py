@@ -44,6 +44,14 @@ def query(run_config):
         item, left_on="ws_item_sk", right_on="i_item_sk"
     ).merge(date_dim, left_on="ws_sold_date_sk", right_on="d_date_sk")
 
+    # i_current_price is a grouping key and ws_ext_sales_price is summed; both
+    # are DECIMAL in the schema, which libcudf can neither group nor sum on the
+    # GPU, so both become float64 first.
+    joined = joined.assign(
+        i_current_price=joined["i_current_price"].astype("float64"),
+        ws_ext_sales_price=joined["ws_ext_sales_price"].astype("float64"),
+    )
+
     keys = ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price"]
     grouped = (
         joined.groupby(keys, dropna=False)["ws_ext_sales_price"]
@@ -52,13 +60,25 @@ def query(run_config):
         .rename(columns={"ws_ext_sales_price": "itemrevenue"})
     )
 
-    revenue = grouped["itemrevenue"].astype("float64")
-    class_total = revenue.groupby(grouped["i_class"], dropna=False).transform("sum")
-    grouped["revenueratio"] = revenue * 100.0000 / class_total
+    # ``sum(sum(...)) OVER (PARTITION BY i_class)`` -- the per-class total of
+    # the already-grouped revenue, joined back rather than computed with a
+    # groupby transform.
+    class_total = (
+        grouped.groupby("i_class", dropna=False)["itemrevenue"]
+        .sum()
+        .reset_index()
+        .rename(columns={"itemrevenue": "_class_total"})
+    )
+    grouped = grouped.merge(class_total, on="i_class", how="left")
+    grouped = grouped.assign(
+        revenueratio=grouped["itemrevenue"] * 100.0000 / grouped["_class_total"]
+    )
 
     grouped = grouped.sort_values(
         ["i_category", "i_class", "i_item_id", "i_item_desc", "revenueratio"],
         na_position="last",
         kind="stable",
     )
-    return grouped.head(100).reset_index(drop=True)
+    return grouped[keys + ["itemrevenue", "revenueratio"]].head(100).reset_index(
+        drop=True
+    )

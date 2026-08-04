@@ -50,17 +50,24 @@ def query(run_config):
         how="inner",
     )
 
-    day_name = joined["d_day_name"]
-    price = joined["sales_price"]
-    per_day = {name: price.where(day_name == day) for day, name in _DAYS}
-    joined = joined.assign(**per_day)
-
-    columns = [name for _, name in _DAYS]
-    wswscs = (
-        joined.groupby("d_week_seq", dropna=False)[columns]
-        .sum(min_count=1)
+    # ``sum(CASE WHEN d_day_name = 'Sunday' THEN sales_price END)`` is the sum
+    # over one (week, day) cell, and NULL when the cell is empty.  Summing per
+    # (week, day) once and then spreading the days across columns with left
+    # merges gives exactly that -- a missing cell becomes a missing row and so
+    # a NaN -- without materialising seven masked copies of the fact table.
+    per_cell = (
+        joined.groupby(["d_week_seq", "d_day_name"], dropna=False)["sales_price"]
+        .sum()
         .reset_index()
     )
+
+    columns = [name for _, name in _DAYS]
+    wswscs = per_cell[["d_week_seq"]].drop_duplicates()
+    for day, name in _DAYS:
+        cell = per_cell[per_cell["d_day_name"] == day][
+            ["d_week_seq", "sales_price"]
+        ].rename(columns={"sales_price": name})
+        wswscs = wswscs.merge(cell, on="d_week_seq", how="left")
 
     first = date_dim[date_dim["d_year"] == 2001][["d_week_seq"]].merge(
         wswscs, on="d_week_seq", how="inner"
@@ -81,9 +88,11 @@ def query(run_config):
         second, left_on="d_week_seq1", right_on="join_key", how="inner"
     )
 
-    out = pd.DataFrame({"d_week_seq1": merged["d_week_seq1"]})
-    for index, (_, name) in enumerate(_DAYS, start=1):
-        out[f"r{index}"] = (merged[f"{name}1"] / merged[f"{name}2"]).round(2)
+    ratios = {
+        f"r{index}": (merged[f"{name}1"] / merged[f"{name}2"]).round(2)
+        for index, (_, name) in enumerate(_DAYS, start=1)
+    }
+    out = merged.assign(**ratios)[["d_week_seq1", *ratios]]
 
     out = out.sort_values("d_week_seq1", na_position="first", kind="stable")
     return out.reset_index(drop=True)

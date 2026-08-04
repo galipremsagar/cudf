@@ -12,19 +12,6 @@ def _cents(series):
     return (series.astype("float64") * 100).round()
 
 
-def _decimal_str(cents):
-    """Cents rendered the way DuckDB prints a DECIMAL(*,2)."""
-    missing = cents.isna()
-    filled = cents.fillna(0.0)
-    negative = filled < 0
-    magnitude = filled.abs()
-    whole = (magnitude // 100).astype("int64").astype("str")
-    frac = (magnitude % 100).astype("int64").astype("str").str.zfill(2)
-    text = whole + "." + frac
-    text = text.where(~negative, "-" + text)
-    return text.where(~missing)
-
-
 def query(run_config):
     path = run_config.dataset_path
     suffix = run_config.suffix
@@ -49,12 +36,16 @@ def query(run_config):
             columns=[price, date_sk, item_sk, time_sk],
         )
         sales = sales.merge(date_dim, left_on=date_sk, right_on="d_date_sk")
+        # Renaming a projection of the joined frame, rather than building a
+        # DataFrame from a dict of columns: the dict form has to align three
+        # separate indexes, which is a whole-frame index union.
+        sales = sales.assign(**{price: _cents(sales[price])})
         parts.append(
-            pd.DataFrame(
-                {
-                    "ext_price": _cents(sales[price]),
-                    "sold_item_sk": sales[item_sk],
-                    "time_sk": sales[time_sk],
+            sales[[price, item_sk, time_sk]].rename(
+                columns={
+                    price: "ext_price",
+                    item_sk: "sold_item_sk",
+                    time_sk: "time_sk",
                 }
             )
         )
@@ -94,10 +85,12 @@ def query(run_config):
         ascending=[False, True, True],
         na_position="first",
     )
-    result["ext_price_str"] = _decimal_str(result["ext_price"])
+    # Back to currency only after the ordering has been decided on the exact
+    # integer cents, so two equal DECIMAL sums cannot be split by rounding.
+    result["ext_price"] = result["ext_price"] / 100.0
     result = result.rename(
         columns={"i_brand_id": "brand_id", "i_brand": "brand"}
     )
     return result[
-        ["brand_id", "brand", "t_hour", "t_minute", "ext_price_str"]
+        ["brand_id", "brand", "t_hour", "t_minute", "ext_price"]
     ].reset_index(drop=True)

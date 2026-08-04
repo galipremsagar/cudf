@@ -27,13 +27,19 @@ BRANDS_B = [
 
 
 def _sql_sum(frame, keys, value, name):
-    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL."""
-    frame = frame.assign(_nonnull=frame[value].notna())
+    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL.
+
+    The money column is cast to float64 first: libcudf has no group-by sum for
+    fixed-point columns, and TPC-DS amounts are far inside float64's exactly
+    representable range.
+    """
+    values = frame[value].astype("float64")
+    frame = frame.assign(_value=values, _nonnull=values.notna())
     grouped = frame.groupby(keys, as_index=False, dropna=False)[
-        [value, "_nonnull"]
+        ["_value", "_nonnull"]
     ].sum()
-    grouped[value] = grouped[value].where(grouped["_nonnull"] > 0)
-    return grouped.drop(columns=["_nonnull"]).rename(columns={value: name})
+    grouped[name] = grouped["_value"].where(grouped["_nonnull"] > 0)
+    return grouped.drop(columns=["_value", "_nonnull"])
 
 
 def query(run_config):
@@ -75,17 +81,26 @@ def query(run_config):
     grouped = _sql_sum(
         joined, ["i_manufact_id", "d_qoy"], "ss_sales_price", "sum_sales"
     )
-    grouped["_sum"] = grouped["sum_sales"].astype("float64")
-    grouped["avg_quarterly_sales"] = grouped.groupby(
-        "i_manufact_id", dropna=False
-    )["_sum"].transform("mean")
+    # avg(sum(...)) over (partition by i_manufact_id), expressed as a group-by
+    # plus a merge -- the multi-GPU layer has no group-by ``transform``.
+    averages = (
+        grouped.groupby("i_manufact_id", as_index=False, dropna=False)["sum_sales"]
+        .mean()
+        .rename(columns={"sum_sales": "avg_quarterly_sales"})
+    )
+    # Projecting the joined frame down to the three columns the rest of the
+    # query needs also runs the join, so the columns below are plain series
+    # rather than expressions still pending against it.
+    grouped = grouped.merge(averages, on="i_manufact_id")[
+        ["i_manufact_id", "sum_sales", "avg_quarterly_sales"]
+    ]
 
     average = grouped["avg_quarterly_sales"]
-    deviation = (grouped["_sum"] - average).abs() / average
+    deviation = (grouped["sum_sales"] - average).abs() / average
     selected = grouped[(average > 0) & (deviation > 0.1)]
 
     result = selected.sort_values(
-        ["avg_quarterly_sales", "_sum", "i_manufact_id"]
+        ["avg_quarterly_sales", "sum_sales", "i_manufact_id"]
     ).head(100)
     return result[["i_manufact_id", "sum_sales", "avg_quarterly_sales"]].reset_index(
         drop=True

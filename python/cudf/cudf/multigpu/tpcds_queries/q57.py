@@ -10,11 +10,17 @@ KEYS = ["i_category", "i_brand", "cc_name"]
 
 
 def _sql_sum(frame, keys, value, name):
-    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL."""
-    frame = frame.assign(_nonnull=frame[value].notna())
-    grouped = frame.groupby(keys, as_index=False)[[value, "_nonnull"]].sum()
-    grouped[value] = grouped[value].where(grouped["_nonnull"] > 0)
-    return grouped.drop(columns=["_nonnull"]).rename(columns={value: name})
+    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL.
+
+    The money column is cast to float64 first: libcudf has no group-by sum for
+    fixed-point columns, and TPC-DS amounts are far inside float64's exactly
+    representable range.
+    """
+    values = frame[value].astype("float64")
+    frame = frame.assign(_value=values, _nonnull=values.notna())
+    grouped = frame.groupby(keys, as_index=False)[["_value", "_nonnull"]].sum()
+    grouped[name] = grouped["_value"].where(grouped["_nonnull"] > 0)
+    return grouped.drop(columns=["_value", "_nonnull"])
 
 
 def query(run_config):
@@ -57,26 +63,52 @@ def query(run_config):
     v1 = _sql_sum(
         joined, KEYS + ["d_year", "d_moy"], "cs_sales_price", "sum_sales"
     )
-    v1["_sum"] = v1["sum_sales"].astype("float64")
-    v1["avg_monthly_sales"] = v1.groupby(KEYS + ["d_year"])["_sum"].transform("mean")
+    # avg(sum(...)) over (partition by i_category, i_brand, cc_name, d_year),
+    # as a group-by plus a merge: the multi-GPU layer has no groupby.transform.
+    averages = (
+        v1.groupby(KEYS + ["d_year"], as_index=False)["sum_sales"]
+        .mean()
+        .rename(columns={"sum_sales": "avg_monthly_sales"})
+    )
+    v1 = v1.merge(averages, on=KEYS + ["d_year"])
 
-    v1 = v1.sort_values(KEYS + ["d_year", "d_moy"]).reset_index(drop=True)
-    v1["rn"] = v1.groupby(KEYS).cumcount() + 1
+    # rank() over (partition by KEYS order by d_year, d_moy).  (d_year, d_moy)
+    # is unique inside a partition, so the rank of a month is just how many
+    # months of that partition are at or before it -- a self-join and a count,
+    # which is what the multi-GPU layer supports.  Each partition holds at most
+    # the 14 months the date filter admits, so the self-join stays tiny.
+    v1 = v1.assign(_month=v1["d_year"] * 12 + v1["d_moy"])
+    months = v1[KEYS + ["_month"]]
+    pairs = months.merge(
+        months.rename(columns={"_month": "_earlier"}), on=KEYS
+    )
+    ranks = (
+        pairs[pairs["_earlier"] <= pairs["_month"]]
+        .groupby(KEYS + ["_month"], as_index=False)
+        .agg(rn=("_earlier", "size"))
+    )
+    v1 = v1.merge(ranks, on=KEYS + ["_month"])
 
     lag = v1[KEYS + ["rn", "sum_sales"]].rename(columns={"sum_sales": "psum"})
     lag = lag.assign(rn=lag["rn"] + 1)
     lead = v1[KEYS + ["rn", "sum_sales"]].rename(columns={"sum_sales": "nsum"})
     lead = lead.assign(rn=lead["rn"] - 1)
 
-    v2 = v1.merge(lag, on=KEYS + ["rn"]).merge(lead, on=KEYS + ["rn"])
+    # Projecting the joined frame down to the columns the rest of the query
+    # needs also runs the joins, so the columns below are plain series rather
+    # than expressions still pending against them.
+    v2 = v1.merge(lag, on=KEYS + ["rn"]).merge(lead, on=KEYS + ["rn"])[
+        KEYS
+        + ["d_year", "d_moy", "avg_monthly_sales", "sum_sales", "psum", "nsum"]
+    ]
 
     average = v2["avg_monthly_sales"]
-    deviation = (v2["_sum"] - average).abs() / average
-    selected = v2[(v2["d_year"] == 1999) & (average > 0) & (deviation > 0.1)].copy()
+    deviation = (v2["sum_sales"] - average).abs() / average
+    selected = v2[(v2["d_year"] == 1999) & (average > 0) & (deviation > 0.1)]
 
-    selected["_diff"] = selected["_sum"] - selected["avg_monthly_sales"]
-    selected["_psum"] = selected["psum"].astype("float64")
-    selected["_nsum"] = selected["nsum"].astype("float64")
+    selected = selected.assign(
+        _diff=selected["sum_sales"] - selected["avg_monthly_sales"]
+    )
 
     result = selected.sort_values(
         [
@@ -87,9 +119,9 @@ def query(run_config):
             "d_year",
             "d_moy",
             "avg_monthly_sales",
-            "_sum",
-            "_psum",
-            "_nsum",
+            "sum_sales",
+            "psum",
+            "nsum",
         ],
         na_position="first",
     ).head(100)

@@ -12,11 +12,14 @@ _DATES = ["2000-06-30", "2000-09-27", "2000-11-17"]
 def _returned_quantity(returns, item, date_sks, item_key, date_key, value, name):
     frame = returns.merge(date_sks, left_on=date_key, right_on="d_date_sk")
     frame = frame.merge(item, left_on=item_key, right_on="i_item_sk")
-    # min_count=1: an item whose returned quantities are all NULL sums to NULL
-    frame = frame.groupby("i_item_id", as_index=False, dropna=False)[value].sum(
-        min_count=1
+    frame = frame.assign(**{value: frame[value].astype("float64")})
+    # The count rides along instead of ``sum(min_count=1)``: an item whose
+    # returned quantities are all NULL sums to NULL in SQL, not to zero.
+    grouped = frame.groupby("i_item_id", as_index=False, dropna=False).agg(
+        **{name: (value, "sum"), "_kept": (value, "count")}
     )
-    return frame.rename(columns={"i_item_id": "item_id", value: name})
+    grouped[name] = grouped[name].where(grouped["_kept"] > 0)
+    return grouped[["i_item_id", name]].rename(columns={"i_item_id": "item_id"})
 
 
 def query(run_config):
@@ -75,14 +78,19 @@ def query(run_config):
         "wr_item_qty",
     )
 
+    # The three-way total lands in the frame before it is used, so every later
+    # expression is a column of one frame rather than a free-floating series
+    # that has to be re-aligned against a join that has not run yet.
     result = sr.merge(cr, on="item_id").merge(wr, on="item_id")
-    total = (
-        result["sr_item_qty"] + result["cr_item_qty"] + result["wr_item_qty"]
-    ).astype("float64")
-    result["sr_dev"] = result["sr_item_qty"] * 1.0 / total / 3.0 * 100
-    result["cr_dev"] = result["cr_item_qty"] * 1.0 / total / 3.0 * 100
-    result["wr_dev"] = result["wr_item_qty"] * 1.0 / total / 3.0 * 100
-    result["average"] = total / 3.0
+    result = result.assign(
+        total=result["sr_item_qty"] + result["cr_item_qty"] + result["wr_item_qty"]
+    )
+    result = result.assign(
+        sr_dev=result["sr_item_qty"] * 1.0 / result["total"] / 3.0 * 100,
+        cr_dev=result["cr_item_qty"] * 1.0 / result["total"] / 3.0 * 100,
+        wr_dev=result["wr_item_qty"] * 1.0 / result["total"] / 3.0 * 100,
+        average=result["total"] / 3.0,
+    )
 
     result = result[
         [

@@ -139,6 +139,6 @@ def query(run_config):
         avg1=("ss_quantity", "mean"),
         avg2=("ss_ext_sales_price_f", "mean"),
         avg3=("ss_ext_wholesale_cost_f", "mean"),
-        total=("ss_ext_wholesale_cost", "sum"),
+        total=("ss_ext_wholesale_cost_f", "sum"),
     )
     return result.reset_index(drop=True)

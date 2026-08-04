@@ -62,13 +62,22 @@ def query(run_config):
         .merge(store, left_on="ss_store_sk", right_on="s_store_sk")
     )
 
-    customer_zip = joined["ca_zip"].str.slice(0, 5)
-    store_zip = joined["s_zip"].str.slice(0, 5)
+    # Materialise the two ZIP prefixes as real columns of the joined frame:
+    # comparing two deferred expressions against each other otherwise has to be
+    # resolved against a single column rather than the join.
+    joined = joined.assign(
+        _customer_zip=joined["ca_zip"].str.slice(0, 5),
+        _store_zip=joined["s_zip"].str.slice(0, 5),
+        # ss_ext_sales_price is DECIMAL, which libcudf cannot group-sum.
+        ss_ext_sales_price=joined["ss_ext_sales_price"].astype("float64"),
+    )
+    customer_zip = joined["_customer_zip"]
+    store_zip = joined["_store_zip"]
     # A NULL on either side makes the SQL <> unknown, so the row is dropped.
     differs = (
         customer_zip.notna() & store_zip.notna() & (customer_zip != store_zip)
     )
-    joined = joined[differs.fillna(False)]
+    joined = joined[differs]
 
     grouped = (
         joined.groupby(
@@ -79,9 +88,8 @@ def query(run_config):
         .rename(columns={"ss_ext_sales_price": "ext_price"})
     )
 
-    grouped["_ext_price"] = grouped["ext_price"].astype("float64")
     grouped = grouped.sort_values(
-        ["_ext_price", "i_brand", "i_brand_id", "i_manufact_id", "i_manufact"],
+        ["ext_price", "i_brand", "i_brand_id", "i_manufact_id", "i_manufact"],
         ascending=[False, True, True, True, True],
         na_position="last",
         kind="stable",

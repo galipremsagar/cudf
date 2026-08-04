@@ -39,28 +39,44 @@ def query(run_config):
         .merge(store, left_on="ss_store_sk", right_on="s_store_sk")
     )
 
+    # libcudf has no group-by sum for fixed-point columns; and avg() over a
+    # decimal sum is a double in SQL, so the window average and every
+    # comparison against it are floating point regardless.
+    merged = merged.assign(
+        ss_sales_price=merged["ss_sales_price"].astype("float64")
+    )
+
+    # The self-joins below are equijoins, so a row with a NULL key matches
+    # nothing, and a NULL key also puts a row in a window partition of its own
+    # -- so the default dropna=True, which drops those groups here, cannot
+    # change any surviving row's average or rank.
     v1 = (
-        merged.groupby(_KEYS + ["d_year", "d_moy"], dropna=False)["ss_sales_price"]
+        merged.groupby(_KEYS + ["d_year", "d_moy"])["ss_sales_price"]
         .sum()
         .reset_index()
         .rename(columns={"ss_sales_price": "sum_sales"})
     )
 
-    # avg() over a decimal sum is a double in SQL, so the window average and
-    # every comparison against it are done in floating point; sum_sales itself
-    # stays exact.
-    v1["_sales"] = v1["sum_sales"].astype("float64")
-    v1["avg_monthly_sales"] = v1.groupby(_KEYS + ["d_year"], dropna=False)[
-        "_sales"
-    ].transform("mean")
+    average = (
+        v1.groupby(_KEYS + ["d_year"], as_index=False)["sum_sales"]
+        .mean()
+        .rename(columns={"sum_sales": "avg_monthly_sales"})
+    )
+    v1 = v1.merge(average, on=_KEYS + ["d_year"])
 
     # (d_year, d_moy) is unique inside a partition, so rank() over that order
-    # is a plain row number.
-    v1 = v1.sort_values(_KEYS + ["d_year", "d_moy"]).reset_index(drop=True)
-    v1["rn"] = v1.groupby(_KEYS, dropna=False).cumcount() + 1
-
-    # The self-joins are equijoins, so rows with a NULL key match nothing.
-    v1 = v1.dropna(subset=_KEYS)
+    # is a plain row number. It is read off a global running count: the sort
+    # makes each partition contiguous, so the count at a row minus the count at
+    # the partition's first row is the position within the partition.
+    v1 = v1.sort_values(_KEYS + ["d_year", "d_moy"]).assign(_one=1)
+    v1["_running"] = v1["_one"].cumsum()
+    starts = (
+        v1.groupby(_KEYS, as_index=False)["_running"]
+        .min()
+        .rename(columns={"_running": "_start"})
+    )
+    v1 = v1.merge(starts, on=_KEYS)
+    v1["rn"] = v1["_running"] - v1["_start"] + 1
 
     lag = v1[_KEYS + ["rn", "sum_sales"]].rename(columns={"sum_sales": "psum"})
     lag["rn"] = lag["rn"] + 1
@@ -69,7 +85,7 @@ def query(run_config):
 
     v2 = v1.merge(lag, on=_KEYS + ["rn"]).merge(lead, on=_KEYS + ["rn"])
 
-    v2 = v2.assign(_delta=v2["_sales"] - v2["avg_monthly_sales"])
+    v2 = v2.assign(_delta=v2["sum_sales"] - v2["avg_monthly_sales"])
     v2 = v2[
         (v2["d_year"] == 1999)
         & (v2["avg_monthly_sales"] > 0)

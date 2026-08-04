@@ -43,15 +43,20 @@ def query(run_config):
     ssci = ssci[ssci["customer_sk"].notna()]
     csci = csci[csci["customer_sk"].notna()]
 
-    merged = ssci.merge(
-        csci, on=["customer_sk", "item_sk"], how="outer", indicator=True
-    )
-    side = merged["_merge"]
+    # A full outer join with a side marker on each input stands in for
+    # merge(indicator=True): both inputs are already distinct on the join keys,
+    # so the join is one-to-one and a null marker means "no match".
+    ssci = ssci.assign(_in_store=1)
+    csci = csci.assign(_in_catalog=1)
+
+    merged = ssci.merge(csci, on=["customer_sk", "item_sk"], how="outer")
+    in_store = merged["_in_store"].notna()
+    in_catalog = merged["_in_catalog"].notna()
 
     return pd.DataFrame(
         {
-            "store_only": [int((side == "left_only").sum())],
-            "catalog_only": [int((side == "right_only").sum())],
-            "store_and_catalog": [int((side == "both").sum())],
+            "store_only": [int((in_store & ~in_catalog).sum())],
+            "catalog_only": [int((~in_store & in_catalog).sum())],
+            "store_and_catalog": [int((in_store & in_catalog).sum())],
         }
     )

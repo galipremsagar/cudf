@@ -42,14 +42,21 @@ def query(run_config):
     )
 
     keys = ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price"]
-    grouped = df.groupby(keys, dropna=False, as_index=False)["ss_ext_sales_price"].sum()
+    # libcudf has no groupby sum for decimals, and the money columns are well
+    # inside float64's exactly-representable range.
+    df = df.assign(_revenue=df["ss_ext_sales_price"].astype("float64"))
+    grouped = df.groupby(keys, dropna=False, as_index=False)["_revenue"].sum()
     grouped.columns = keys + ["itemrevenue"]
 
-    revenue = grouped["itemrevenue"].astype("float64")
-    grouped = grouped.assign(_revenue=revenue)
-    class_total = grouped.groupby("i_class", dropna=False)["_revenue"].transform("sum")
+    # sum(...) OVER (PARTITION BY i_class), as a merge against the class totals
+    # rather than a groupby transform.
+    class_total = grouped.groupby("i_class", dropna=False, as_index=False)[
+        "itemrevenue"
+    ].sum()
+    class_total.columns = ["i_class", "_class_total"]
+    grouped = grouped.merge(class_total, on="i_class", how="left")
     grouped = grouped.assign(
-        revenueratio=grouped["_revenue"] * 100.0000 / class_total
+        revenueratio=grouped["itemrevenue"] * 100.0000 / grouped["_class_total"]
     )
 
     grouped = grouped.sort_values(

@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
-
 import pandas as pd
 
 # Sums are taken in float64, not Decimal: libcudf has no groupby sum for
@@ -16,11 +14,6 @@ _ZERO = 0.0
 _START = "2000-08-23"
 _END = "2000-09-06"
 _MEASURES = ["sales", "returns_", "profit"]
-
-
-def _null_like(series):
-    """A column of the same dtype as ``series`` holding only nulls."""
-    return series.where(series.isna())
 
 
 def _channel_rows(sales, returns, dates, dimension, sales_key, dim_key, id_column):
@@ -200,16 +193,18 @@ def query(run_config):
     )
 
     # ---- union the three channels ---------------------------------------
+    # Built with ``assign`` and a projection rather than ``pd.DataFrame({...})``:
+    # handing pandas a dict of GPU-resident columns makes it inspect their
+    # dtypes on the host, which is a fallback.
     def to_channel(frame, channel, prefix, id_column):
-        return pd.DataFrame(
-            {
-                "channel": channel,
-                "id": prefix + frame[id_column],
-                "sales": frame["sales_price"],
-                "returns_": frame["return_amt"],
-                "profit": frame["profit"] - frame["net_loss"],
-            }
+        frame = frame.assign(
+            channel=channel,
+            id=prefix + frame[id_column],
+            sales=frame["sales_price"],
+            returns_=frame["return_amt"],
+            profit=frame["profit"] - frame["net_loss"],
         )
+        return frame[["channel", "id", *_MEASURES]]
 
     combined = pd.concat(
         [
@@ -220,21 +215,28 @@ def query(run_config):
         ignore_index=True,
     )
 
-    def rollup(frame):
-        return (
-            frame.groupby(["channel", "id"], dropna=False)[_MEASURES]
-            .sum()
-            .reset_index()
-        )
+    # ``GROUP BY ROLLUP (channel, id)`` is the three grouping sets computed
+    # separately; the columns a level does not group on come back all-NULL
+    # rather than being blanked out on the input, which would need a
+    # ``where`` over a string column.
+    def rollup(frame, keys):
+        if keys:
+            level = frame.groupby(keys, dropna=False)[_MEASURES].sum().reset_index()
+        else:
+            level = (
+                frame.assign(_all=0)
+                .groupby("_all")[_MEASURES]
+                .sum()
+                .reset_index()
+            )
+        missing = {key: None for key in ("channel", "id") if key not in keys}
+        if missing:
+            level = level.assign(**missing)
+        return level[["channel", "id", *_MEASURES]]
 
-    detail = rollup(combined)
-    per_channel = rollup(combined.assign(id=_null_like(combined["id"])))
-    grand = rollup(
-        combined.assign(
-            channel=_null_like(combined["channel"]),
-            id=_null_like(combined["id"]),
-        )
-    )
+    detail = rollup(combined, ["channel", "id"])
+    per_channel = rollup(combined, ["channel"])
+    grand = rollup(combined, [])
 
     result = pd.concat([detail, per_channel, grand], ignore_index=True)
     result = result.sort_values(

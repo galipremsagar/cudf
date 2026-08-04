@@ -51,6 +51,17 @@ def query(run_config):
         f"{path}/item{suffix}", columns=["i_item_sk", "i_item_id", "i_item_desc"]
     )
 
+    # The three money columns are DECIMALs and no GPU groupby sums a decimal.
+    store_sales = store_sales.assign(
+        ss_net_profit=store_sales["ss_net_profit"].astype("float64")
+    )
+    store_returns = store_returns.assign(
+        sr_net_loss=store_returns["sr_net_loss"].astype("float64")
+    )
+    catalog_sales = catalog_sales.assign(
+        cs_net_profit=catalog_sales["cs_net_profit"].astype("float64")
+    )
+
     d1 = date_dim[(date_dim["d_moy"] == 4) & (date_dim["d_year"] == 2001)][
         ["d_date_sk"]
     ]
@@ -83,7 +94,6 @@ def query(run_config):
     df = df.merge(item, left_on="ss_item_sk", right_on="i_item_sk")
     df = df.merge(store, left_on="ss_store_sk", right_on="s_store_sk")
 
-    # The three amounts stay decimal, as they are in SQL.
     df = df.rename(
         columns={
             "ss_net_profit": "store_sales_profit",

@@ -49,11 +49,17 @@ def query(run_config):
 
     date_dim = date_dim[(date_dim["d_qoy"] == 2) & (date_dim["d_year"] == 2001)]
 
+    # The IN-subquery is one arm of an OR, so it cannot be a semi-join on the
+    # joined rows; it is marked with a flag instead, attached to `item` by a
+    # left join against the distinct qualifying i_item_id values. (isin() with
+    # a column of a partitioned frame would only see the local partition.)
     target_item_ids = (
-        item.loc[item["i_item_sk"].isin(_ITEM_SKS), "i_item_id"]
+        item[item["i_item_sk"].isin(_ITEM_SKS)][["i_item_id"]]
         .dropna()
         .drop_duplicates()
+        .assign(_id_hit=1)
     )
+    item = item.merge(target_item_ids, on="i_item_id", how="left")
 
     merged = (
         web_sales.merge(
@@ -70,8 +76,13 @@ def query(run_config):
 
     merged = merged[
         merged["ca_zip"].str.slice(0, 5).isin(_ZIPS)
-        | merged["i_item_id"].isin(target_item_ids)
+        | merged["_id_hit"].notna()
     ]
+
+    # libcudf has no group-by sum for fixed-point columns.
+    merged = merged.assign(
+        ws_sales_price=merged["ws_sales_price"].astype("float64")
+    )
 
     grouped = (
         merged.groupby(["ca_zip", "ca_city"], dropna=False)["ws_sales_price"]

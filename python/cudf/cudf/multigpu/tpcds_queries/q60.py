@@ -8,13 +8,19 @@ import pandas as pd
 
 
 def _sql_sum(frame, keys, value, name):
-    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL."""
-    frame = frame.assign(_nonnull=frame[value].notna())
+    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL.
+
+    The money column is cast to float64 first: libcudf has no group-by sum for
+    fixed-point columns, and TPC-DS amounts are far inside float64's exactly
+    representable range.
+    """
+    values = frame[value].astype("float64")
+    frame = frame.assign(_value=values, _nonnull=values.notna())
     grouped = frame.groupby(keys, as_index=False, dropna=False)[
-        [value, "_nonnull"]
+        ["_value", "_nonnull"]
     ].sum()
-    grouped[value] = grouped[value].where(grouped["_nonnull"] > 0)
-    return grouped.drop(columns=["_nonnull"]).rename(columns={value: name})
+    grouped[name] = grouped["_value"].where(grouped["_nonnull"] > 0)
+    return grouped.drop(columns=["_value", "_nonnull"])
 
 
 def _channel(sales, item_sk_col, addr_sk_col, date_sk_col, price_col, items, dates, addrs):
@@ -109,7 +115,6 @@ def query(run_config):
 
     combined = pd.concat(parts, ignore_index=True)
     totals = _sql_sum(combined, ["i_item_id"], "total_sales", "total_sales")
-    totals["_order"] = totals["total_sales"].astype("float64")
 
-    result = totals.sort_values(["i_item_id", "_order"]).head(100)
+    result = totals.sort_values(["i_item_id", "total_sales"]).head(100)
     return result[["i_item_id", "total_sales"]].reset_index(drop=True)

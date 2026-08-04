@@ -71,10 +71,16 @@ def query(run_config):
             "p_channel_tv",
         ],
     )
+    # Each comparison is made null-free before the OR. cuDF's boolean OR does
+    # not implement SQL three-valued logic: NULL | True yields NULL, not True,
+    # so a row qualifying on one channel is dropped when another channel is
+    # NULL. pandas never reaches that case because NaN == "Y" is already False.
+    # cuDF differs from both, and this cost q61 3 promotion rows and 39,529 in
+    # revenue against DuckDB.
     promotion = promotion[
-        (promotion["p_channel_dmail"] == "Y")
-        | (promotion["p_channel_email"] == "Y")
-        | (promotion["p_channel_tv"] == "Y")
+        (promotion["p_channel_dmail"] == "Y").fillna(False)
+        | (promotion["p_channel_email"] == "Y").fillna(False)
+        | (promotion["p_channel_tv"] == "Y").fillna(False)
     ][["p_promo_sk"]]
 
     base = (

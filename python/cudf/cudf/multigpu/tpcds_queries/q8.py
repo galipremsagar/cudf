@@ -86,7 +86,11 @@ def query(run_config):
     popular = customer_address.merge(
         preferred, left_on="ca_address_sk", right_on="c_current_addr_sk", how="inner"
     )
-    popular = popular.groupby("zip5", dropna=False).size().reset_index(name="cnt")
+    popular = (
+        popular.groupby("zip5", dropna=False)
+        .agg(cnt=("ca_address_sk", "size"))
+        .reset_index()
+    )
     popular = popular[popular["cnt"] > 10][["zip5"]]
 
     selected = listed.merge(popular, on="zip5", how="inner")
@@ -111,11 +115,16 @@ def query(run_config):
         f"{path}/store_sales{suffix}",
         columns=["ss_store_sk", "ss_sold_date_sk", "ss_net_profit"],
     )
+    # libcudf has no groupby sum for DECIMAL, so the money column is summed in
+    # float64 -- TPC-DS amounts are far inside float64's exact range.
+    in_quarter = store_sales.merge(
+        dates, left_on="ss_sold_date_sk", right_on="d_date_sk", how="inner"
+    )
+    in_quarter = in_quarter.assign(
+        ss_net_profit=in_quarter["ss_net_profit"].astype("float64")
+    )
     per_store = (
-        store_sales.merge(
-            dates, left_on="ss_sold_date_sk", right_on="d_date_sk", how="inner"
-        )
-        .groupby("ss_store_sk", dropna=False)["ss_net_profit"]
+        in_quarter.groupby("ss_store_sk", dropna=False)["ss_net_profit"]
         .sum()
         .reset_index()
     )

@@ -8,13 +8,19 @@ import pandas as pd
 
 
 def _sql_sum(frame, keys, value, name):
-    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL."""
-    frame = frame.assign(_nonnull=frame[value].notna())
+    """``sum(value)`` grouped by ``keys``, NULL when every input is NULL.
+
+    The money column is cast to float64 first: libcudf has no group-by sum for
+    fixed-point columns, and TPC-DS amounts are far inside float64's exactly
+    representable range.
+    """
+    values = frame[value].astype("float64")
+    frame = frame.assign(_value=values, _nonnull=values.notna())
     grouped = frame.groupby(keys, as_index=False, dropna=False)[
-        [value, "_nonnull"]
+        ["_value", "_nonnull"]
     ].sum()
-    grouped[value] = grouped[value].where(grouped["_nonnull"] > 0)
-    return grouped.drop(columns=["_nonnull"]).rename(columns={value: name})
+    grouped[name] = grouped["_value"].where(grouped["_nonnull"] > 0)
+    return grouped.drop(columns=["_value", "_nonnull"])
 
 
 def query(run_config):
@@ -47,9 +53,8 @@ def query(run_config):
         joined, ["i_brand", "i_brand_id"], "ss_ext_sales_price", "ext_price"
     )
     grouped = grouped.rename(columns={"i_brand_id": "brand_id", "i_brand": "brand"})
-    grouped["_order"] = grouped["ext_price"].astype("float64")
 
     result = grouped.sort_values(
-        ["_order", "brand_id"], ascending=[False, True]
+        ["ext_price", "brand_id"], ascending=[False, True]
     ).head(100)
     return result[["brand_id", "brand", "ext_price"]].reset_index(drop=True)

@@ -28,6 +28,12 @@ def query(run_config):
         date_dim, left_on="ss_sold_date_sk", right_on="d_date_sk"
     ).merge(item, left_on="ss_item_sk", right_on="i_item_sk")
 
+    # libcudf has no group-by sum for fixed-point columns, and a decimal(7,2)
+    # money value is exact in float64 anyway.
+    merged = merged.assign(
+        ss_ext_sales_price=merged["ss_ext_sales_price"].astype("float64")
+    )
+
     grouped = (
         merged.groupby(["d_year", "i_category_id", "i_category"], dropna=False)[
             "ss_ext_sales_price"

@@ -26,6 +26,9 @@ def query(run_config):
     sold = store_sales.merge(
         date_dim, left_on="ss_sold_date_sk", right_on="d_date_sk"
     )
+    # libcudf has no group-by sum for decimals, so the price becomes float64
+    # first; TPC-DS money is far inside float64's exactly representable range.
+    sold = sold.assign(ss_sales_price=sold["ss_sales_price"].astype("float64"))
     by_item = (
         sold.groupby(["ss_store_sk", "ss_item_sk"], dropna=False)
         .agg(revenue=("ss_sales_price", "sum"), n=("ss_sales_price", "count"))
@@ -34,11 +37,15 @@ def query(run_config):
     # SUM over an all-NULL group is NULL, which neither reaches the average nor
     # satisfies the comparison below.
     by_item = by_item[by_item["n"] > 0]
-    by_item["_revenue"] = by_item["revenue"].astype("float64")
-    by_item["ave"] = by_item.groupby("ss_store_sk", dropna=False)[
-        "_revenue"
-    ].transform("mean")
-    by_item = by_item[by_item["_revenue"] <= 0.1 * by_item["ave"]]
+    # avg(revenue) per store: a group-by plus a merge, which is what the
+    # multi-GPU layer supports -- groupby().transform() is not distributed.
+    ave = (
+        by_item.groupby("ss_store_sk", dropna=False, as_index=False)["revenue"]
+        .mean()
+        .rename(columns={"revenue": "ave"})
+    )
+    by_item = by_item.merge(ave, on="ss_store_sk")
+    by_item = by_item[by_item["revenue"] <= 0.1 * by_item["ave"]]
 
     store = pd.read_parquet(
         f"{path}/store{suffix}", columns=["s_store_sk", "s_store_name"]

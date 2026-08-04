@@ -5,11 +5,7 @@ carriers during a morning time window in 2001."""
 
 from __future__ import annotations
 
-from decimal import Decimal
-
 import pandas as pd
-
-ZERO = Decimal("0.00")
 
 WAREHOUSE_COLUMNS = [
     "w_warehouse_sk",
@@ -48,10 +44,17 @@ MONTHS = [
 
 
 def _amount(frame, value_column, quantity_column):
-    """value * quantity, NULL (which SUM skips) rendered as a zero addend."""
+    """value * quantity, NULL (which SUM skips) rendered as a zero addend.
+
+    The money columns are DECIMAL in the parquet; libcudf has neither an
+    arithmetic-with-scalar nor a group-by sum for decimals, so everything here
+    is float64. TPC-DS amounts have at most a few significant digits beyond
+    the cent, well inside float64's exactly representable range.
+    """
     known = frame[value_column].notna() & frame[quantity_column].notna()
-    quantity = frame[quantity_column].fillna(0).astype("int64")
-    return (frame[value_column].fillna(ZERO) * quantity).where(known, ZERO)
+    value = frame[value_column].astype("float64").fillna(0.0)
+    quantity = frame[quantity_column].astype("float64").fillna(0.0)
+    return (value * quantity).where(known, 0.0)
 
 
 def _branch(sales, warehouse, date_dim, time_dim, ship_mode, columns):
@@ -67,8 +70,8 @@ def _branch(sales, warehouse, date_dim, time_dim, ship_mode, columns):
     monthly = {}
     for number, month in enumerate(MONTHS, start=1):
         in_month = frame["d_moy"] == number
-        monthly[f"{month}_sales"] = sales_amount.where(in_month, ZERO)
-        monthly[f"{month}_net"] = net_amount.where(in_month, ZERO)
+        monthly[f"{month}_sales"] = sales_amount.where(in_month, 0.0)
+        monthly[f"{month}_net"] = net_amount.where(in_month, 0.0)
     frame = frame.assign(**monthly)
     return (
         frame.groupby(GROUP_KEYS, dropna=False)[list(monthly)].sum().reset_index()

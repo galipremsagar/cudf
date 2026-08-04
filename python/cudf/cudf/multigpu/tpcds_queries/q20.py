@@ -39,6 +39,12 @@ def query(run_config):
     ][["d_date_sk"]]
 
     item = item[item["i_category"].isin(_CATEGORIES)]
+    # ``i_current_price`` is a DECIMAL, and a decimal cannot be a group key on
+    # the GPU; the money column cannot be summed as a decimal either.
+    item = item.assign(i_current_price=item["i_current_price"].astype("float64"))
+    catalog_sales = catalog_sales.assign(
+        cs_ext_sales_price=catalog_sales["cs_ext_sales_price"].astype("float64")
+    )
 
     joined = catalog_sales.merge(
         item, left_on="cs_item_sk", right_on="i_item_sk"
@@ -52,13 +58,22 @@ def query(run_config):
         .rename(columns={"cs_ext_sales_price": "itemrevenue"})
     )
 
-    revenue = grouped["itemrevenue"].astype("float64")
-    class_total = revenue.groupby(grouped["i_class"], dropna=False).transform("sum")
-    grouped["revenueratio"] = revenue * 100.0000 / class_total
+    # The window SUM(...) OVER (PARTITION BY i_class) written as a second
+    # aggregation joined back on, which is what the multi-GPU layer supports.
+    class_total = (
+        grouped.groupby("i_class", as_index=False, dropna=False)["itemrevenue"]
+        .sum()
+        .rename(columns={"itemrevenue": "class_total"})
+    )
+    grouped = grouped.merge(class_total, on="i_class", how="left")
+    grouped["revenueratio"] = (
+        grouped["itemrevenue"] * 100.0000 / grouped["class_total"]
+    )
 
     grouped = grouped.sort_values(
         ["i_category", "i_class", "i_item_id", "i_item_desc", "revenueratio"],
         na_position="first",
-        kind="stable",
     )
-    return grouped.head(100).reset_index(drop=True)
+    return grouped[keys + ["itemrevenue", "revenueratio"]].head(100).reset_index(
+        drop=True
+    )

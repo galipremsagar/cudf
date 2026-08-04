@@ -39,6 +39,11 @@ def query(run_config):
         date_dim, left_on="ss_sold_date_sk", right_on="d_date_sk"
     ).merge(store, left_on="ss_store_sk", right_on="s_store_sk")
 
+    # libcudf has no group-by sum for fixed-point columns.
+    merged = merged.assign(
+        ss_sales_price=merged["ss_sales_price"].astype("float64")
+    )
+
     keys = ["s_store_name", "s_store_id"]
     per_day = (
         merged.groupby(keys + ["d_day_name"], dropna=False)["ss_sales_price"]
@@ -49,11 +54,11 @@ def query(run_config):
     # One group per store, as GROUP BY gives, then a column per weekday. A
     # weekday a store never sold on stays NULL, which is what summing over an
     # empty CASE arm does.
-    grouped = merged.groupby(keys, dropna=False).size().reset_index()[keys]
+    grouped = merged[keys].drop_duplicates()
     value_columns = []
     for name, column in _DAYS:
-        day = per_day.loc[
-            per_day["d_day_name"] == name, keys + ["ss_sales_price"]
+        day = per_day[per_day["d_day_name"] == name][
+            keys + ["ss_sales_price"]
         ].rename(columns={"ss_sales_price": column})
         grouped = grouped.merge(day, on=keys, how="left")
         value_columns.append(column)

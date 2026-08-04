@@ -6,6 +6,32 @@ from __future__ import annotations
 
 import pandas as pd
 
+#: Stands in for a NULL partition key. A window puts every NULL in one
+#: partition, but a NULL join key matches nothing, so the self-join that
+#: computes the rank has to see a real value there.
+_NULL_KEY = "\x00mg_null"
+
+
+def _rank_min(frame, partition, value, out):
+    """``rank() OVER (PARTITION BY partition ORDER BY value)``, as a join.
+
+    A row's rank under ``method='min'`` is one more than the number of
+    strictly smaller values in its partition, and a self-join on the partition
+    key counts those directly -- no groupby ``.rank()`` needed.
+
+    ``out`` identifies a row uniquely, so aggregating the pairs back by it
+    rebuilds exactly the rows of ``frame``.
+    """
+    others = frame[partition + [value]].rename(columns={value: "__mg_other"})
+    pairs = frame.merge(others, on=partition)
+    pairs = pairs.assign(
+        __mg_less=(pairs["__mg_other"] < pairs[value]).astype("int64")
+    )
+    counted = pairs.groupby(out, as_index=False, dropna=False).agg(
+        **{value: (value, "max"), "__mg_less": ("__mg_less", "sum")}
+    )
+    return counted.assign(rank_within_parent=counted["__mg_less"] + 1)
+
 
 def query(run_config):
     path = run_config.dataset_path
@@ -33,9 +59,10 @@ def query(run_config):
             "ss_ext_sales_price",
         ],
     )
-    store_sales["ss_net_profit"] = store_sales["ss_net_profit"].astype("float64")
-    store_sales["ss_ext_sales_price"] = store_sales["ss_ext_sales_price"].astype(
-        "float64"
+    # Both money columns are DECIMALs, which no GPU groupby can sum.
+    store_sales = store_sales.assign(
+        ss_net_profit=store_sales["ss_net_profit"].astype("float64"),
+        ss_ext_sales_price=store_sales["ss_ext_sales_price"].astype("float64"),
     )
 
     joined = store_sales.merge(
@@ -52,44 +79,65 @@ def query(run_config):
         )
         .reset_index()
     )
-
-    level0 = results[["i_category", "i_class"]].copy()
-    level0["gross_margin"] = (results["ss_net_profit"] * 1.0000) / results[
-        "ss_ext_sales_price"
-    ]
-    level0["lochierarchy"] = 0
-    level0["rank_within_parent"] = level0.groupby("i_category", dropna=False)[
-        "gross_margin"
-    ].rank(method="min")
-
-    by_category = (
-        results.groupby("i_category", dropna=False)
-        .agg(
-            ss_net_profit=("ss_net_profit", "sum"),
-            ss_ext_sales_price=("ss_ext_sales_price", "sum"),
-        )
-        .reset_index()
-    )
-    level1 = by_category[["i_category"]].copy()
-    level1["gross_margin"] = (by_category["ss_net_profit"] * 1.0000) / by_category[
-        "ss_ext_sales_price"
-    ]
-    level1["lochierarchy"] = 1
-    level1["rank_within_parent"] = level1["gross_margin"].rank(method="min")
-
-    level2 = pd.DataFrame(
-        {
-            "gross_margin": [
-                (results["ss_net_profit"].sum() * 1.0000)
-                / results["ss_ext_sales_price"].sum()
-            ],
-            "lochierarchy": [2],
-            "rank_within_parent": [1],
-        }
+    results = results.assign(
+        gross_margin=(results["ss_net_profit"] * 1.0000)
+        / results["ss_ext_sales_price"],
+        cat_key=results["i_category"].fillna(_NULL_KEY),
+        one=1,
     )
 
-    rollup = pd.concat([level0, level1, level2], ignore_index=True)
-    rollup["sort_key"] = rollup["i_category"].where(rollup["lochierarchy"] == 0)
+    # lochierarchy 0: one row per class, ranked inside its own category.
+    level0 = _rank_min(
+        results[["cat_key", "i_category", "i_class", "gross_margin"]],
+        ["cat_key"],
+        "gross_margin",
+        ["i_category", "i_class"],
+    )
+    level0 = level0.assign(lochierarchy=0, sort_key=level0["i_category"])
+
+    # lochierarchy 1: one row per category. ``t_class`` is 1 there, so the CASE
+    # in the PARTITION BY is NULL on every row and they form one partition.
+    by_category = results.groupby("i_category", as_index=False, dropna=False).agg(
+        ss_net_profit=("ss_net_profit", "sum"),
+        ss_ext_sales_price=("ss_ext_sales_price", "sum"),
+    )
+    by_category = by_category.assign(
+        gross_margin=(by_category["ss_net_profit"] * 1.0000)
+        / by_category["ss_ext_sales_price"],
+        one=1,
+    )
+    level1 = _rank_min(
+        by_category[["one", "i_category", "gross_margin"]],
+        ["one"],
+        "gross_margin",
+        ["i_category"],
+    )
+    level1 = level1.assign(lochierarchy=1, sort_key="")
+
+    # lochierarchy 2: the grand total, alone in its partition and so rank 1.
+    total = results.groupby("one", as_index=False).agg(
+        ss_net_profit=("ss_net_profit", "sum"),
+        ss_ext_sales_price=("ss_ext_sales_price", "sum"),
+    )
+    level2 = total.assign(
+        gross_margin=(total["ss_net_profit"] * 1.0000) / total["ss_ext_sales_price"],
+        lochierarchy=2,
+        rank_within_parent=1,
+        sort_key="",
+    )
+
+    tail = ["gross_margin", "lochierarchy", "rank_within_parent", "sort_key"]
+    rollup = pd.concat(
+        [
+            level0[["i_category", "i_class"] + tail],
+            level1[["i_category"] + tail],
+            level2[tail],
+        ],
+        ignore_index=True,
+    )
+    # ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category
+    # END, rank_within_parent -- the CASE is ``sort_key``, held constant on the
+    # two rolled-up levels so that the rank alone orders them.
     rollup = rollup.sort_values(
         ["lochierarchy", "sort_key", "rank_within_parent"],
         ascending=[False, True, True],

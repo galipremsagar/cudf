@@ -55,16 +55,18 @@ def query(run_config):
     # items matching any profile above; "> 0" is therefore membership in the
     # set of manufacturers that have at least one such item. A NULL
     # i_manufact never satisfies the equality, so nulls are dropped.
-    manufacts = item.loc[matched, "i_manufact"].dropna().drop_duplicates()
+    #
+    # The membership test is spelled as an inner join against the distinct
+    # manufacturers rather than isin(): the right-hand side is a column of a
+    # partitioned frame, and only a join makes every partition see all of it.
+    manufacts = item[matched][["i_manufact"]].dropna().drop_duplicates()
 
     candidates = item[
-        (item["i_manufact_id"] >= 738)
-        & (item["i_manufact_id"] <= 738 + 40)
-        & item["i_manufact"].isin(manufacts)
-    ]
+        (item["i_manufact_id"] >= 738) & (item["i_manufact_id"] <= 738 + 40)
+    ][["i_manufact", "i_product_name"]]
 
     result = (
-        candidates[["i_product_name"]]
+        candidates.merge(manufacts, on="i_manufact")[["i_product_name"]]
         .drop_duplicates()
         .sort_values("i_product_name")
         .head(100)

@@ -30,10 +30,17 @@ def query(run_config):
             "ss_wholesale_cost",
         ],
     )
+    # The three money columns are DECIMALs; float64 is what the comparisons and
+    # the average need, and it is well inside the exact range for these values.
+    store_sales = store_sales.assign(
+        ss_list_price=store_sales["ss_list_price"].astype("float64"),
+        ss_coupon_amt=store_sales["ss_coupon_amt"].astype("float64"),
+        ss_wholesale_cost=store_sales["ss_wholesale_cost"].astype("float64"),
+    )
     quantity = store_sales["ss_quantity"]
-    list_price = store_sales["ss_list_price"].astype("float64")
-    coupon = store_sales["ss_coupon_amt"].astype("float64")
-    cost = store_sales["ss_wholesale_cost"].astype("float64")
+    list_price = store_sales["ss_list_price"]
+    coupon = store_sales["ss_coupon_amt"]
+    cost = store_sales["ss_wholesale_cost"]
 
     columns = {}
     for bucket, (q_lo, q_hi, lp_lo, coupon_lo, cost_lo) in enumerate(_BUCKETS, 1):
@@ -47,9 +54,14 @@ def query(run_config):
                 | ((cost >= cost_lo) & (cost <= cost_lo + 20)).fillna(False)
             )
         )
-        prices = list_price[selected]
+        rows = store_sales[selected][["ss_list_price"]]
+        prices = rows["ss_list_price"]
+        # COUNT(DISTINCT ...) as a de-duplicating shuffle followed by a count,
+        # which skips the one NULL the de-duplication keeps -- exactly what
+        # COUNT DISTINCT does with NULLs.
+        distinct = rows.drop_duplicates()["ss_list_price"]
         columns[f"B{bucket}_LP"] = [prices.mean()]
         columns[f"B{bucket}_CNT"] = [prices.count()]
-        columns[f"B{bucket}_CNTD"] = [prices.nunique()]
+        columns[f"B{bucket}_CNTD"] = [distinct.count()]
 
     return pd.DataFrame(columns)

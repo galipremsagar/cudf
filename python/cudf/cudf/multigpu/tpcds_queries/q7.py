@@ -47,8 +47,15 @@ def query(run_config):
         & (customer_demographics["cd_education_status"] == "College")
     ][["cd_demo_sk"]]
     dates = date_dim[date_dim["d_year"] == 2000][["d_date_sk"]]
+    # Each comparison is made null-free before the OR. cuDF's boolean OR does
+    # not implement SQL three-valued logic: NULL | True yields NULL, not True,
+    # so a row qualifying on one channel is dropped when another channel is
+    # NULL. pandas never reaches that case because NaN == "Y" is already False.
+    # cuDF differs from both, and this cost q61 3 promotion rows and 39,529 in
+    # revenue against DuckDB.
     promotions = promotion[
-        (promotion["p_channel_email"] == "N") | (promotion["p_channel_event"] == "N")
+        (promotion["p_channel_email"] == "N").fillna(False)
+        | (promotion["p_channel_event"] == "N").fillna(False)
     ][["p_promo_sk"]]
 
     for column in _MEASURES:
