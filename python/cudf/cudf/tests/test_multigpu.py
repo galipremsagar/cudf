@@ -1050,3 +1050,31 @@ def test_multi_column_sort_with_nulls_in_trailing_keys():
     pd.testing.assert_frame_equal(
         got.reset_index(drop=True), expected.reset_index(drop=True)
     )
+
+
+def test_decimal_sum_does_not_overflow_its_own_width():
+    """A decimal sum must not accumulate in the column's own narrow type.
+
+    libcudf sums a DECIMAL(7,2) column into decimal32, which tops out at
+    21,474,836.47. A partitioned frame is hit harder than a single one: every
+    chunk overflows independently, so the result is already wrong before the
+    partials are combined. TPC-DS q61 reported a total of -25,803,805 against a
+    true +317,793,578 this way.
+    """
+    import decimal
+
+    import cudf
+
+    import cudf.multigpu as mgpu
+
+    # 4,000 rows of 20,000.00 -> 80,000,000.00, well past decimal32's ceiling
+    values = [decimal.Decimal("20000.00")] * 4000
+    host = pd.DataFrame({"v": values})
+    chunked = mgpu.from_pandas(host)
+    chunked._chunks[0]  # force materialization
+
+    narrow = chunked.map_chunks(
+        lambda c: c.astype({"v": cudf.Decimal32Dtype(9, 2)})
+    )
+    assert float(narrow["v"].sum()) == pytest.approx(80_000_000.00)
+    assert float(narrow["v"].mean()) == pytest.approx(20_000.00)

@@ -784,20 +784,66 @@ _SIMPLE_REDUCTIONS = {
 }
 
 
+def _widen_decimals(chunk):
+    """Promote narrow decimal columns to decimal128 before summing.
+
+    libcudf accumulates a decimal sum in the column's *own* type. A
+    DECIMAL(7,2) column is decimal32, which tops out at 21,474,836.47, so
+    summing a partition of a large fact table silently wraps negative -- TPC-DS
+    q61 reported a total of -25,803,805 where the answer is +317,793,578.
+
+    It bites a partitioned frame harder than a single one: each chunk overflows
+    on its own, so the damage is done before anything is combined. Widening
+    first costs a cast and matches what SQL does, which accumulates into
+    DECIMAL(38,x).
+    """
+    import cudf
+
+    def widen(series):
+        dtype = series.dtype
+        if isinstance(dtype, (cudf.Decimal32Dtype, cudf.Decimal64Dtype)):
+            return series.astype(cudf.Decimal128Dtype(38, dtype.scale))
+        return series
+
+    if isinstance(chunk, cudf.Series):
+        return widen(chunk)
+    if isinstance(chunk, cudf.DataFrame):
+        narrow = [
+            c for c in chunk.columns
+            if isinstance(chunk[c].dtype,
+                          (cudf.Decimal32Dtype, cudf.Decimal64Dtype))
+        ]
+        if narrow:
+            chunk = chunk.copy(deep=False)
+            for c in narrow:
+                chunk[c] = widen(chunk[c])
+    return chunk
+
+
 class _ReductionMixin:
     """Map-reduce implementations of cuDF's reduction API."""
 
+    #: reductions that accumulate, and so can overflow a narrow decimal
+    _ACCUMULATING = frozenset({"sum", "prod", "product"})
+
     def _reduce(self, name: str, combiner: str, *args, **kwargs):
         skipna = kwargs.get("skipna", True)
-        parts = self._run_chunks(
-            lambda c: _to_host(getattr(c, name)(*args, **kwargs))
-        )
+        widen = name in self._ACCUMULATING
+
+        def per_chunk(c):
+            if widen:
+                c = _widen_decimals(c)
+            return _to_host(getattr(c, name)(*args, **kwargs))
+
+        parts = self._run_chunks(per_chunk)
         parts = [p for p in parts if p is not None]
         return _combine(parts, combiner, skipna=skipna)
 
     def mean(self, *args, **kwargs):
         counts = self._run_chunks(lambda c: _to_host(c.count(*args, **kwargs)))
-        sums = self._run_chunks(lambda c: _to_host(c.sum(*args, **kwargs)))
+        sums = self._run_chunks(
+            lambda c: _to_host(_widen_decimals(c).sum(*args, **kwargs))
+        )
         total = _combine(counts, "sum")
         return _combine(sums, "sum") / total
 

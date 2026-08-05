@@ -60,6 +60,12 @@ def build(path: Path, memory_limit: str = "64GB") -> dict:
             print(f"  q{number:<3} {rows:>8,} rows "
                   f"{time.perf_counter() - start:>7.2f}s", flush=True)
         except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+            # A failed COPY leaves a truncated file behind. Left in place it
+            # looks like a reference that exists, and every later comparison
+            # against it dies reading it -- which reads as the *query* being
+            # broken. q85 at SF300 did exactly this after DuckDB exhausted its
+            # spill space.
+            target.unlink(missing_ok=True)
             status[str(number)] = f"{type(exc).__name__}: {exc}"
             print(f"  q{number:<3} SKIPPED  {type(exc).__name__}: "
                   f"{str(exc)[:90]}", flush=True)
@@ -75,9 +81,14 @@ def load(path: Path, number: int):
     import pandas as pd
 
     target = Path(path) / "reference" / f"q{number}.parquet"
-    if not target.exists():
+    if not target.exists() or target.stat().st_size == 0:
         return None
-    return pd.read_parquet(target)
+    try:
+        return pd.read_parquet(target)
+    except Exception:
+        # An unreadable reference is a missing reference. Reporting it as a
+        # comparison failure blames the query for the harness's problem.
+        return None
 
 
 def main() -> None:
