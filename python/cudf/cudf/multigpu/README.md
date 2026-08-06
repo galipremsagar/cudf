@@ -129,6 +129,56 @@ CUDF_PANDAS_FAIL_ON_FALLBACK=1 python -m cudf.pandas._benchmarks.pdsh all \
     --executor in-memory --path /data/tpch/sf1c
 ```
 
+## TPC-DS
+
+TPC-DS has no pandas implementation anywhere -- every dataframe-API TPC
+benchmark in the wild is TPC-H -- so the 99 queries are translated in
+`tpcds_queries/` and checked against DuckDB's answer to the official SQL
+(`tpcds_reference`), not against a previous run of this code.
+
+Multi-GPU, all `--strict`, no timeouts:
+
+| scale | on disk | ran | on GPU | matched DuckDB | total |
+| --- | --- | --- | --- | --- | --- |
+| SF1    | 266 MB | 99/99 | 99/99 | 99/99 | 126 s |
+| SF10   | 2.6 GB | 99/99 | 99/99 | 99/99 | 147 s |
+| SF100  | 25 GB  | 99/99 | 99/99 | 99/99 | 173 s |
+| SF300  | 74 GB  | 99/99 | 99/99 | 98/99 + 1 unverified | 220 s |
+| SF500  | 116 GB | 98/99 | 98/99 | not validated | 233 s |
+| SF1000 | 243 GB | 99/99 | 98/99 | not validated | 377 s + 134 s |
+
+SF1000 is 2.88 billion store_sales rows. q59 and q67 exhaust the pool and
+need `--memory-resource managed`; the 134 s is that retry. Above SF300 there
+are no reference answers -- DuckDB cannot compute them on this machine, having
+already exhausted 1.7 TiB of spill space on one query at SF300 -- so those runs
+measure runtime and GPU residency, and correctness rests on SF1 through SF300.
+
+Against one GPU, TPC-DS is where the layer earns its keep:
+
+| scale | 1 GPU | 8 GPUs |
+| --- | --- | --- |
+| SF1   | 96/99 ran, 96 on GPU, 666 s | 99/99, all on GPU, 126 s |
+| SF10  | 96/99 ran, 50 on GPU, 6458 s | 99/99, all on GPU, 147 s |
+| SF100 | 97/99 ran, **32 on GPU**, **70,291 s (19.5 h)** | 99/99, all on GPU, 173 s |
+
+The single-GPU number that matters is not the time, it is 96 -> 50 -> 32: as
+data grows 1x -> 10x -> 100x, cudf.pandas silently moves more of the suite onto
+the CPU. At SF100 65 of 99 queries run in pandas, one of them for 77 minutes.
+
+Two failures are worth separating from "out of memory", because more memory
+does not fix either:
+
+* q23 at SF500 raises `The device_uvector size exceeds the column size limit`.
+  libcudf caps a column at 2^31-1 rows and q23's intermediate exceeds it. The
+  chunked layer would have to split that intermediate itself.
+* q2 at SF1000 falls back to the CPU without `--strict` noticing, because
+  CUDF_PANDAS_FAIL_ON_FALLBACK only guards the function-call path and this one
+  goes through attribute access.
+
+Three queries fail on a single GPU at every scale with stock cuDF errors --
+q10 (`TypeError: all inputs must be Index`), q19 and q35 (`RecursionError`) --
+and all three run correctly here.
+
 ## How it works
 
 | module | role |
