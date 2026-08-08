@@ -241,6 +241,9 @@ def main() -> None:
     parser.add_argument("--validate", action="store_true", default=True)
     parser.add_argument("--no-validate", dest="validate", action="store_false")
     parser.add_argument("--traceback", action="store_true")
+    parser.add_argument("--save-results", default=None,
+                        help="directory to write each query's answer to, so "
+                             "two configurations can be diffed directly")
     args = parser.parse_args()
 
     if args.strict:
@@ -326,6 +329,10 @@ def main() -> None:
                     note = f"  <-- MISMATCH: {why}"
             if grew > FALLBACK_RSS_GIB:
                 note += "  <-- ran on CPU"
+            if args.save_results:
+                target = Path(args.save_results)
+                target.mkdir(parents=True, exist_ok=True)
+                result.to_parquet(target / f"q{number}.parquet", index=False)
             print(f"{number:>6}  {'ok':<10}{elapsed:>9.3f}s{grew:>+9.1f}G  "
                   f"{len(result)} rows{note}")
         except Exception as exc:

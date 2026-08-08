@@ -110,7 +110,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", required=True)
     parser.add_argument("--backend", default="multigpu",
-                        choices=["multigpu", "cudf"],
+                        choices=["multigpu", "cudf", "pandas"],
                         help="'cudf' runs stock single-GPU cudf.pandas through "
                              "this same harness, for an apples-to-apples "
                              "comparison (set CUDA_VISIBLE_DEVICES to pick "
@@ -134,6 +134,9 @@ def main() -> None:
     parser.add_argument("--validate", action="store_true",
                         help="compare each result against single-GPU cudf.pandas")
     parser.add_argument("--traceback", action="store_true")
+    parser.add_argument("--save-results", default=None,
+                        help="directory to write each query's answer to, so "
+                             "two configurations can be diffed directly")
     parser.add_argument("--timeout", type=int, default=0,
                         help="per-query timeout in seconds (0 = none)")
     parser.add_argument("--print-results", action="store_true")
@@ -161,6 +164,10 @@ def main() -> None:
         runtime = mgpu.get_runtime()
         print(f"backend: multi-GPU, {runtime.n_devices} devices "
               f"{list(runtime.devices)}")
+    elif args.backend == "pandas":
+        # stock CPU pandas, for a reference answer at scales where no single
+        # GPU can hold the tables at all
+        print("backend: stock CPU pandas")
     else:
         import cudf.pandas
 
@@ -223,6 +230,11 @@ def main() -> None:
             grew = _host_rss_gib() - rss_before
             host_growth[number] = grew
             flag = "  <-- ran on CPU" if grew > FALLBACK_RSS_GIB else ""
+            if args.save_results:
+                import pathlib as _pl
+                _t = _pl.Path(args.save_results)
+                _t.mkdir(parents=True, exist_ok=True)
+                host.to_parquet(_t / f"q{number}.parquet", index=False)
             print(f"{number:>6}  {'ok':<10}{best:>9.3f}s{grew:>+9.1f}G  "
                   f"{len(host)} rows{flag}")
             if args.print_results:
