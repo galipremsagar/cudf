@@ -134,6 +134,15 @@ def install(
             kwargs["fast_to_slow"] = _to_slow
             kwargs["slow_to_fast"] = to_fast
             fast_type = replacements[fast_type]
+            # "GPU object" means a cuDF object in cuDF's own API -- it is what
+            # cudf.DataFrame(proxy) consumes. Handing back a chunked frame
+            # makes that constructor fail with "data must be list or
+            # dict-like", so this collapses onto one device. The result must
+            # therefore fit there, which is exactly what the caller asked for
+            # by requesting a single cuDF object.
+            extra = dict(kwargs.get("additional_attributes") or {})
+            extra.setdefault("as_gpu_object", _as_gpu_object)
+            kwargs["additional_attributes"] = extra
         return original_final(name, fast_type, slow_type, **kwargs)
 
     fsp.make_final_proxy_type = patched_final_proxy_type
@@ -156,8 +165,8 @@ def install(
     # `cudf` and shadow the module-level import used just above.
     from cudf import pandas as cudf_pandas
 
+    _patch_cudf_entrypoints(npartitions)
     cudf_pandas.install()
-    _install_io_overrides(npartitions)
     _installed = True
 
     warnings.warn(
@@ -169,6 +178,14 @@ def install(
         UserWarning,
         stacklevel=2,
     )
+
+
+def _as_gpu_object(self):
+    """The single-GPU cuDF object behind this proxy."""
+    from ._frame import ChunkedFrame
+
+    fast = self._fsproxy_slow_to_fast()
+    return fast.compute() if isinstance(fast, ChunkedFrame) else fast
 
 
 def _real_caller_module() -> str:
@@ -199,119 +216,74 @@ def wrap_fast(obj):
     return proxy_type._fsproxy_wrap(obj, None)
 
 
-def _install_io_overrides(npartitions: int | None) -> None:
-    """Point pandas' readers at the multi-GPU readers.
+def _patch_cudf_entrypoints(npartitions: int | None) -> None:
+    """Make the multi-GPU readers and concat the *fast* implementations.
 
-    Without this, ``pd.read_parquet`` resolves to ``cudf.read_parquet``, which
-    materializes the entire file on one device before anything can partition
-    it -- exactly the limit this package exists to remove. The multi-GPU reader
-    assigns row groups to devices first and each GPU reads only its share.
+    An earlier version replaced ``pd.read_parquet`` / ``pd.concat`` outright.
+    That works but breaks the proxy: ``xpd.concat`` is a function proxy whose
+    ``_fsproxy_fast`` is ``cudf.concat``, so overwriting the pandas name left a
+    bare function with no fast side and broke ``xpd.concat is
+    xpd.core.reshape.concat.concat``. Patching the cuDF side instead leaves the
+    proxy machinery intact and still routes the work through the GPUs.
+
+    Must run before ``cudf.pandas.install()``: the proxies capture these
+    functions by value.
     """
-    import pandas as pd
-
     from . import _io
+    from ._creation import concat as chunked_concat
+    from ._frame import ChunkedFrame
 
-    # The proxied readers, captured after cudf.pandas.install(). Anything the
-    # multi-GPU reader cannot do is delegated to these rather than raised:
-    # a reader that only accepts the arguments it likes is not a drop-in for
-    # pandas, and pandas code passes chunksize, file-like objects and globs
-    # routinely.
-    original_read_parquet = pd.read_parquet
-    original_read_csv = pd.read_csv
+    #: keywords the partitioned readers do not reproduce. chunksize/iterator
+    #: return an iterator rather than a frame; nrows and skipfooter are defined
+    #: against the whole file, which a byte-range split does not preserve.
+    csv_unsupported = frozenset({"chunksize", "iterator", "skipfooter", "nrows"})
 
-    #: keywords whose semantics the partitioned readers do not reproduce.
-    #: chunksize/iterator return an iterator over the file rather than a frame;
-    #: nrows and skipfooter are defined relative to the whole file, which a
-    #: byte-range split does not preserve.
-    _CSV_UNSUPPORTED = frozenset(
-        {"chunksize", "iterator", "skipfooter", "nrows"}
-    )
-
-    def _is_single_local_path(path) -> bool:
-        """Whether the multi-GPU readers can address this input at all."""
+    def _addressable(path) -> bool:
         if not isinstance(path, (str, os.PathLike)):
-            return False  # StringIO, buffers, file objects, lists of paths
+            return False  # StringIO, buffers, file objects
         text = os.fspath(path)
         return not any(ch in text for ch in "*?[") and os.path.exists(text)
 
+    original_read_parquet = cudf.read_parquet
+    original_read_csv = cudf.read_csv
+    original_concat = cudf.concat
+
     def read_parquet(path, columns=None, **kwargs):
         kwargs.pop("engine", None)
-        if not _is_single_local_path(path) and not isinstance(path, list):
+        if not (_addressable(path) or isinstance(path, list)):
             return original_read_parquet(path, columns=columns, **kwargs)
         try:
-            frame = _io.read_parquet(
+            return _io.read_parquet(
                 path, columns=columns, npartitions=npartitions, **kwargs
             )
         except (NotImplementedError, TypeError, ValueError):
             return original_read_parquet(path, columns=columns, **kwargs)
-        return wrap_fast(frame)
 
     def read_csv(path, **kwargs):
-        if not _is_single_local_path(path) or (
-            _CSV_UNSUPPORTED & kwargs.keys()
-        ):
+        if not _addressable(path) or (csv_unsupported & kwargs.keys()):
             return original_read_csv(path, **kwargs)
         try:
-            frame = _io.read_csv(path, npartitions=npartitions, **kwargs)
+            return _io.read_csv(path, npartitions=npartitions, **kwargs)
         except (NotImplementedError, TypeError, ValueError):
             return original_read_csv(path, **kwargs)
-        return wrap_fast(frame)
-
-    original_concat = pd.concat
 
     def concat(objs, *args, **kwargs):
         """Concatenate chunked frames without moving any chunk."""
-        from ._creation import concat as chunked_concat
-        from ._frame import ChunkedFrame
-
         items = list(objs)
-        if items and all(
-            isinstance(_unwrap(item), ChunkedFrame) for item in items
-        ):
+        if items and all(isinstance(o, ChunkedFrame) for o in items):
             axis = kwargs.get("axis", args[0] if args else 0)
             if axis in (0, "index"):
-                return wrap_fast(chunked_concat(items, **kwargs))
+                return chunked_concat(items, **kwargs)
         return original_concat(objs, *args, **kwargs)
 
-    original_to_datetime = pd.to_datetime
-
-    def to_datetime(arg, *args, **kwargs):
-        """Convert per chunk, instead of through pandas' scalar-cache path.
-
-        ``pd.to_datetime`` first calls ``should_cache``, which builds a set of
-        the values to decide whether caching pays -- so it hashes every element
-        of the frame. That is meaningless work for a column already on the GPUs,
-        and on a chunked frame it lands in pandas' own implementation and drags
-        the whole column to the host. The conversion itself is elementwise, so
-        chunks convert independently and nothing has to move.
-        """
-        from ._frame import ChunkedFrame
-
-        inner = _unwrap(arg)
-        if isinstance(inner, ChunkedFrame):
-            return wrap_fast(
-                inner.map_chunks(
-                    lambda c: cudf.to_datetime(c, *args, **kwargs)
-                )
-            )
-        return original_to_datetime(arg, *args, **kwargs)
-
-    read_parquet.__name__ = "read_parquet"
-    read_csv.__name__ = "read_csv"
-    concat.__name__ = "concat"
-    to_datetime.__name__ = "to_datetime"
-    try:
-        pd.read_parquet = read_parquet
-        pd.read_csv = read_csv
-        pd.concat = concat
-        pd.to_datetime = to_datetime
-    except Exception as exc:  # pragma: no cover - module proxy may be sealed
-        warnings.warn(
-            f"could not install multi-GPU pandas readers ({exc}); "
-            "pd.read_parquet will build each table on a single GPU",
-            UserWarning,
-            stacklevel=3,
-        )
+    for name, fn, original in (
+        ("read_parquet", read_parquet, original_read_parquet),
+        ("read_csv", read_csv, original_read_csv),
+        ("concat", concat, original_concat),
+    ):
+        fn.__name__ = name
+        fn.__doc__ = original.__doc__
+        setattr(cudf, name, fn)
 
 
 def _unwrap(obj):
@@ -335,7 +307,15 @@ def _intermediate_replacements() -> dict:
 
     groupby = cudf.core.groupby.groupby
     accessors = {}
+    # The .iloc/.loc indexers are intermediates too: without them the proxy
+    # returns a bare indexer, and df.iloc[:, :] hands back a raw
+    # ChunkedDataFrame where pandas code expects a DataFrame.
     for module, attr, chunked in (
+        ("cudf.core.dataframe", "_DataFrameIlocIndexer",
+         "_DataFrameILocIndexer"),
+        ("cudf.core.dataframe", "_DataFrameLocIndexer", "_DataFrameLocIndexer"),
+        ("cudf.core.series", "_SeriesIlocIndexer", "_SeriesILocIndexer"),
+        ("cudf.core.series", "_SeriesLocIndexer", "_SeriesLocIndexer"),
         ("cudf.core.series", "DatetimeProperties", "_DatetimeAccessor"),
         ("cudf.core.series", "TimedeltaProperties", "_TimedeltaAccessor"),
         ("cudf.core.accessors.string", "StringMethods", "_StringAccessor"),

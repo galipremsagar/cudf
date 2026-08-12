@@ -113,7 +113,11 @@ def _construct_distributed(cudf_type, data, kwargs, runtime):
     bounds = _even_bounds(nrows, npartitions)
     pieces = runtime.run(
         source,
-        lambda o, b: [o.iloc[b[i] : b[i + 1]] for i in range(len(b) - 1)],
+        # Index objects have no .iloc; slicing covers all three shapes
+        lambda o, b: [
+            (o.iloc[b[i] : b[i + 1]] if hasattr(o, "iloc") else o[b[i] : b[i + 1]])
+            for i in range(len(b) - 1)
+        ],
         built,
         bounds,
     )
@@ -149,6 +153,21 @@ def unwrap_proxy(obj):
     return fast if isinstance(fast, ChunkedFrame) else obj
 
 
+def _element_subtypes(cudf_type: type) -> tuple:
+    """cuDF subtypes a value of ``cudf_type`` may actually be.
+
+    Only Index needs this -- ``cudf.Index(...)`` returns a DatetimeIndex,
+    TimedeltaIndex or CategoricalIndex depending on dtype.
+    """
+    if cudf_type is not cudf.Index:
+        return ()
+    names = ("DatetimeIndex", "TimedeltaIndex", "CategoricalIndex",
+             "IntervalIndex", "RangeIndex")
+    return tuple(
+        t for t in (getattr(cudf, n, None) for n in names) if t is not None
+    )
+
+
 class _ChunkedMeta(type):
     """Resolves un-implemented cuDF names at the *class* level.
 
@@ -163,11 +182,27 @@ class _ChunkedMeta(type):
         if name.startswith("_"):
             raise AttributeError(name)
         cudf_type = getattr(cls, "_cudf_type", None)
-        if cudf_type is None or not hasattr(cudf_type, name):
+        if cudf_type is None:
             raise AttributeError(
                 f"type object {cls.__name__!r} has no attribute {name!r}"
             )
-        target = getattr(cudf_type, name)
+        target = getattr(cudf_type, name, None)
+        if target is None:
+            # cudf.Index is a factory: an index of datetimes is really a
+            # cudf.DatetimeIndex, and dtype-specific methods (tz_localize,
+            # normalize, month_name) live on the subtype. On one GPU the fast
+            # object simply *is* that subtype, so the names are present; here
+            # the class is always ChunkedIndex, so they have to be found among
+            # the subtypes or they resolve to _Unusable and every such call
+            # silently takes the pandas path.
+            for subtype in _element_subtypes(cudf_type):
+                target = getattr(subtype, name, None)
+                if target is not None:
+                    break
+        if target is None:
+            raise AttributeError(
+                f"type object {cls.__name__!r} has no attribute {name!r}"
+            )
         if isinstance(target, property) or not callable(target):
             descriptor = property(
                 lambda self, _name=name: self._single_gpu_fallback_property(_name)
@@ -495,6 +530,10 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
         parts = self._run_chunks(lambda c: c.to_pandas(**kwargs))
         if len(parts) == 1:
             return parts[0]
+        # pd.concat rejects Index objects ("only Series and DataFrame objs are
+        # valid"); Index carries its own append instead.
+        if isinstance(parts[0], pd.Index):
+            return parts[0].append(parts[1:])
         return pd.concat(parts, axis=0)
 
     def compute(self, device: int | None = None) -> Any:
@@ -1418,6 +1457,14 @@ class _ILocIndexer:
         return out
 
 
+class _DataFrameILocIndexer(_ILocIndexer):
+    pass
+
+
+class _SeriesILocIndexer(_ILocIndexer):
+    pass
+
+
 class _LocIndexer:
     """Label-based selection.
 
@@ -1474,7 +1521,7 @@ class ChunkedDataFrame(_ChunkedCommon):
 
     @property
     def loc(self):
-        return _LocIndexer(self)
+        return _DataFrameLocIndexer(self)
 
     # -- schema ------------------------------------------------------
     @property
@@ -1501,7 +1548,7 @@ class ChunkedDataFrame(_ChunkedCommon):
 
     @property
     def iloc(self):
-        return _ILocIndexer(self)
+        return _DataFrameILocIndexer(self)
 
     # -- selection ---------------------------------------------------
     def __getitem__(self, key):
@@ -1684,7 +1731,7 @@ class ChunkedSeries(_ChunkedCommon):
 
     @property
     def iloc(self):
-        return _ILocIndexer(self)
+        return _SeriesILocIndexer(self)
 
     def __getitem__(self, key):
         if isinstance(key, ChunkedSeries):
@@ -1940,6 +1987,294 @@ class ChunkedIndex(_ChunkedCommon):
     def dtype(self):
         return self._meta.dtype
 
+    @property
+    def shape(self) -> tuple[int]:
+        return (len(self),)
+
+    @property
+    def iloc(self):
+        return _SeriesILocIndexer(self)
+
+    def __getitem__(self, key):
+        if isinstance(key, ChunkedSeries):
+            return self._map_method("__getitem__", key)
+        if isinstance(key, slice):
+            start, stop, step = key.indices(len(self))
+            return self._global_iloc(start, stop, step)
+        return self._map_method("__getitem__", key)
+
+    # -- distinct ----------------------------------------------------
+    def unique(self):
+        """Exact distinct values, gathered onto one GPU."""
+        parts = self._run_chunks(lambda c: c.unique())
+        device = self._devices[0]
+        gathered = _transfer.gather_concat(
+            list(zip(parts, self._devices)), device, self._runtime, ignore_index=True
+        )
+        result = self._runtime.run(device, lambda s: s.unique(), gathered)
+        return _wrap_like([result], [device], self._runtime)
+
+    def _distinct_reduce(self, name: str, *args, **kwargs):
+        return int(len(self.unique()))
+
+    def nunique(self, *args, **kwargs) -> int:
+        return self._distinct_reduce("nunique", *args, **kwargs)
+
+    def factorize(self, sort: bool = False, **kwargs):
+        from ._reshape import factorize
+
+        return factorize(self, sort=sort, **kwargs)
+
+    def apply(self, func, *args, **kwargs):
+        """Elementwise UDF, compiled and run independently on each GPU.
+
+        String UDFs work too: cuDF's compiled-kernel cache is device-aware
+        (``cudf/utils/device.py``), so each GPU keeps its own PTX with its own
+        character-table pointers.
+        """
+        return self.map_chunks(lambda c: c.apply(func, *args, **kwargs))
+
+    def value_counts(self, **kwargs):
+        from ._ops import series_value_counts
+
+        return series_value_counts(self, **kwargs)
+
+    def drop_duplicates(self, **kwargs):
+        from ._ops import drop_duplicates
+
+        return drop_duplicates(self, **kwargs)
+
+    def sort_values(self, by=None, **kwargs):
+        from ._ops import sort_values
+
+        # `by` is accepted (and ignored when it names this series) so that code
+        # written against a DataFrame keeps working if a step yields a Series.
+        if by is not None and by not in (self.name, [self.name]):
+            raise KeyError(f"cannot sort a Series by {by!r}")
+        return sort_values(self, None, **kwargs)
+
+    def groupby(self, by, **kwargs):
+        from ._ops import ChunkedGroupBy
+
+        return ChunkedGroupBy(self, by, **kwargs)
+
+    def quantile(self, q=0.5, interpolation: str = "linear", **kwargs):
+        from ._ops import quantile
+
+        return quantile(self, q, interpolation=interpolation)
+
+    def idxmax(self, **kwargs):
+        return self._extreme_index("max", **kwargs)
+
+    def idxmin(self, **kwargs):
+        return self._extreme_index("min", **kwargs)
+
+    def _extreme_index(self, how: str, **kwargs):
+        """Index label of the first minimum/maximum.
+
+        cuDF has no ``idxmin``/``idxmax``, so each chunk reports its extreme
+        value and the label of its first occurrence; the winner is then chosen
+        on the host.  Ties resolve to the earliest chunk, matching pandas.
+        """
+
+        def per_chunk(chunk):
+            if len(chunk) == 0:
+                return None
+            value = getattr(chunk, how)(**kwargs)
+            if value is None or (isinstance(value, float) and np.isnan(value)):
+                return None
+            matches = chunk.index[chunk == value]
+            if len(matches) == 0:
+                return None
+            return (_to_host(value), _to_host(matches[:1])[0])
+
+        parts = [
+            (i, p)
+            for i, p in enumerate(self._run_chunks(per_chunk))
+            if p is not None
+        ]
+        if not parts:
+            return None
+        better = (lambda a, b: a > b) if how == "max" else (lambda a, b: a < b)
+        best_i, best = parts[0]
+        for i, part in parts[1:]:
+            if better(part[0], best[0]):
+                best_i, best = i, part
+        return best[1]
+
+    # -- accessors ---------------------------------------------------
+    @property
+    def str(self):
+        return _StringAccessor(self, "str")
+
+    @property
+    def dt(self):
+        return _DatetimeAccessor(self, "dt")
+
+    @property
+    def cat(self):
+        return _CategoricalAccessor(self, "cat")
+
+    @property
+    def list(self):
+        return _ListAccessor(self, "list")
+
+    @property
+    def struct(self):
+        return _StructAccessor(self, "struct")
+
+    def __repr__(self) -> str:
+        total = len(self)
+        if total <= 10:
+            body = repr(self.to_pandas())
+        else:
+            head = self.head(5).to_pandas()
+            tail = self.tail(5).to_pandas()
+            body = repr(pd.concat([head, tail]))
+            body += f"\n\n[{total} rows]"
+        return _banner("ChunkedSeries", self) + body
+
+
+class _Accessor:
+    """Forwards ``.str`` / ``.dt`` / ``.cat`` / ``.list`` methods per chunk.
+
+    Resolves eagerly. An earlier version returned a lazy object that only did
+    the work when something touched it, which deadlocked: cuDF's ``as_column``
+    calls ``getattr`` on assigned values, so ``df["y"] = df["x"].dt.year``
+    resolved the accessor *inside* a device worker thread, which then tried to
+    dispatch back to that same single-threaded worker.
+    """
+
+    def __init__(self, series: "ChunkedSeries", namespace: str) -> None:
+        self._series = series
+        self._namespace = namespace
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            # A *defined* dunder/private property that raises AttributeError
+            # internally also lands here, and answering "no such attribute"
+            # buries the real error -- ChunkedIndex._meta failed this way, and
+            # the traceback blamed the missing attribute rather than the
+            # RangeIndex.head call inside it.
+            for klass in type(self).__mro__:
+                if name in vars(klass):
+                    raise AttributeError(
+                        f"{type(self).__name__}.{name} exists but raised "
+                        "AttributeError while being evaluated; the original "
+                        "error was swallowed by attribute lookup. Re-run with "
+                        f"type(obj).{name}.fget(obj) to see it."
+                    )
+            raise AttributeError(name)
+        series = self._series
+        namespace = self._namespace
+
+        # Ask one chunk whether this name is a method or a value. Metadata
+        # only -- it never touches the data.
+        is_method = series._runtime.run(
+            series._devices[0],
+            lambda chunk: callable(getattr(getattr(chunk, namespace), name)),
+            series._chunks[0],
+        )
+
+        if not is_method:
+            return _wrap_like(
+                series._run_chunks(
+                    lambda c: getattr(getattr(c, namespace), name)
+                ),
+                series._devices,
+                series._runtime,
+            )
+
+        def method(*args, **kwargs):
+            return _wrap_like(
+                series._run_chunks(
+                    lambda c: getattr(getattr(c, namespace), name)(
+                        *args, **kwargs
+                    )
+                ),
+                series._devices,
+                series._runtime,
+            )
+
+        method.__name__ = name
+        return method
+
+
+#: cudf.pandas keys its proxy map on the *fast type*, so each accessor
+#: namespace needs a distinct class. Sharing one made ``.dt`` resolve to
+#: whichever namespace registered last -- ``s.dt.tz_localize`` came back as
+#: "CategoricalAccessor has no attribute tz_localize".
+class _StringAccessor(_Accessor):
+    pass
+
+
+class _DatetimeAccessor(_Accessor):
+    pass
+
+
+class _TimedeltaAccessor(_Accessor):
+    pass
+
+
+class _CategoricalAccessor(_Accessor):
+    pass
+
+
+class _ListAccessor(_Accessor):
+    pass
+
+
+class _StructAccessor(_Accessor):
+    pass
+
+
+class ChunkedIndex(_ChunkedCommon):
+    """A :class:`cudf.Index` partitioned across several GPUs."""
+
+    #: pandas identifies its own types structurally rather than by isinstance:
+    #: ``ABCSeries.__instancecheck__`` reads ``inst._typ`` and compares it to a
+    #: string. Without it, ``pd.to_datetime`` and friends raise AttributeError
+    #: on a chunked frame, which cudf.pandas turns into a silent CPU fallback --
+    #: so the query still answers correctly, just not on the GPU.
+    _typ = "index"
+
+
+    _cudf_type = cudf.Index
+
+    def __getattr__(self, name: str):
+        # cudf.Index is a factory: an index of datetimes is really a
+        # cudf.DatetimeIndex, and dtype-specific methods (tz_localize,
+        # normalize, the .str set) live on that subtype rather than on
+        # cudf.Index. The metaclass only synthesizes dispatchers for names it
+        # finds on ``_cudf_type``, so those were invisible here while on a
+        # single GPU they are simply present on the object.
+        #
+        # Only names absent from cudf.Index are forwarded, so nothing already
+        # handled changes, and they are mapped per chunk -- correct because
+        # every such method is elementwise.
+        if not name.startswith("_") and not hasattr(cudf.Index, name):
+            element_type = type(self._meta)
+            member = getattr(element_type, name, None)
+            if member is not None and callable(member):
+                def forward(*args, **kwargs):
+                    return self.map_chunks(
+                        lambda c: getattr(c, name)(*args, **kwargs)
+                    )
+
+                forward.__name__ = name
+                return forward
+            if member is not None:
+                return self.map_chunks(lambda c: getattr(c, name))
+        return super().__getattr__(name)
+
+    @property
+    def name(self):
+        return self._meta.name
+
+    @property
+    def dtype(self):
+        return self._meta.dtype
+
     def __repr__(self) -> str:
         return _banner("ChunkedIndex", self) + repr(self.head(5).to_pandas())
 
@@ -2003,3 +2338,11 @@ def _rebuild_chunked(kind, host):
     if kind is ChunkedIndex and hasattr(frame, "index"):
         return frame.index
     return frame
+
+
+class _DataFrameLocIndexer(_LocIndexer):
+    pass
+
+
+class _SeriesLocIndexer(_LocIndexer):
+    pass

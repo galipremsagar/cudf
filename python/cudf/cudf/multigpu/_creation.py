@@ -60,10 +60,21 @@ def from_pandas(
 
     jobs = []
     for i in range(npartitions):
-        piece = obj.iloc[bounds[i] : bounds[i + 1]]
+        # An Index has no .iloc; plain slicing works for Index, Series and
+        # DataFrame alike (on a DataFrame it slices rows, which is what the
+        # bounds mean).
+        piece = _slice_rows(obj, bounds[i], bounds[i + 1])
         jobs.append((targets[i], _upload, (piece,), {}))
     chunks = runtime.run_many(jobs)
     return _wrap_like(chunks, targets, runtime)
+
+
+def _slice_rows(obj, start: int, stop: int):
+    """Rows ``start:stop`` of a pandas DataFrame, Series or Index."""
+    iloc = getattr(obj, "iloc", None)
+    if iloc is not None:
+        return iloc[start:stop]
+    return obj[start:stop]
 
 
 def _upload(piece):
