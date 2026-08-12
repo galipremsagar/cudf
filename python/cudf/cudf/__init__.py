@@ -128,6 +128,11 @@ __all__ = [
     "io",
     "melt",
     "merge",
+    # experimental: one DataFrame partitioned across every GPU.
+    # Listed because importing cudf.multigpu binds it as an
+    # attribute of cudf, and test_api asserts dir(cudf) has
+    # nothing that __all__ omits.
+    "multigpu",
     "option_context",
     "options",  # TODO: Move options.py to core, not all objects should be public
     "pivot",

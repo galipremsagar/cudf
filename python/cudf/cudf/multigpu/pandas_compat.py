@@ -27,6 +27,7 @@ This is experimental.  Two properties of the proxy machinery matter:
 
 from __future__ import annotations
 
+import functools
 import importlib
 import os
 import warnings
@@ -100,6 +101,10 @@ def install(
     # cudf.pandas otherwise sizes an RMM pool for the *current* device only,
     # which is wrong when we intend to use all of them.  We install our own
     # per-device pools instead.
+    # Remember whether it was ours, so it can be taken back out below: this
+    # process' environment is inherited by every child it spawns, and there it
+    # would silently disable *their* RMM setup too.
+    _drop_no_initialize = "RAPIDS_NO_INITIALIZE" not in os.environ
     os.environ.setdefault("RAPIDS_NO_INITIALIZE", "1")
     if fail_on_fallback:
         os.environ["CUDF_PANDAS_FAIL_ON_FALLBACK"] = "1"
@@ -130,10 +135,11 @@ def install(
         # attributed to cudf.multigpu.pandas_compat, where pickle cannot find
         # it ("Can't pickle <class '...pandas_compat.ndarray'>").
         kwargs.setdefault("module", _real_caller_module())
+        single_gpu_type = None
         if fast_type in replacements:
             kwargs["fast_to_slow"] = _to_slow
             kwargs["slow_to_fast"] = to_fast
-            fast_type = replacements[fast_type]
+            single_gpu_type, fast_type = fast_type, replacements[fast_type]
             # "GPU object" means a cuDF object in cuDF's own API -- it is what
             # cudf.DataFrame(proxy) consumes. Handing back a chunked frame
             # makes that constructor fail with "data must be list or
@@ -141,9 +147,23 @@ def install(
             # therefore fit there, which is exactly what the caller asked for
             # by requesting a single cuDF object.
             extra = dict(kwargs.get("additional_attributes") or {})
-            extra.setdefault("as_gpu_object", _as_gpu_object)
+            extra.setdefault("as_gpu_object", as_gpu_object)
+            extra["_fsproxy_wrap"] = classmethod(
+                _make_adopting_wrap(single_gpu_type, fast_type)
+            )
             kwargs["additional_attributes"] = extra
-        return original_final(name, fast_type, slow_type, **kwargs)
+        cls = original_final(name, fast_type, slow_type, **kwargs)
+        if single_gpu_type is not None:
+            # Substituting the chunked type also *unregisters* the single-GPU
+            # one, and cudf.pandas decides whether to wrap a result with an
+            # exact-type lookup in this map. Every operation that still runs on
+            # one GPU -- each cuDF intermediate we do not replace (Rolling,
+            # ExponentialMovingWindow, Resampler, ...) -- hands back a plain
+            # cuDF frame, which would otherwise escape the proxy. It also makes
+            # as_proxy_object() recognise a plain cuDF object. Keep it
+            # registered; _fsproxy_wrap adopts the value back into a chunk.
+            fsp.get_final_type_map()[single_gpu_type] = cls
+        return cls
 
     fsp.make_final_proxy_type = patched_final_proxy_type
 
@@ -166,7 +186,12 @@ def install(
     from cudf import pandas as cudf_pandas
 
     _patch_cudf_entrypoints(npartitions)
-    cudf_pandas.install()
+    try:
+        cudf_pandas.install()  # the only reader of RAPIDS_NO_INITIALIZE here
+    finally:
+        if _drop_no_initialize:
+            os.environ.pop("RAPIDS_NO_INITIALIZE", None)
+    _patch_cudf_constructors()
     _installed = True
 
     warnings.warn(
@@ -180,8 +205,47 @@ def install(
     )
 
 
-def _as_gpu_object(self):
-    """The single-GPU cuDF object behind this proxy."""
+def _make_adopting_wrap(single_gpu_type, chunked_type):
+    """``_fsproxy_wrap`` that re-attaches a single-GPU result to the runtime.
+
+    The test is on the *exact* type: the subclass proxies (CategoricalIndex,
+    DatetimeIndex, ...) inherit this through ``bases=(Index,)`` but keep their
+    own single-GPU fast type, which must not be adopted into a plain
+    ChunkedIndex.
+    """
+    from cudf.pandas import fast_slow_proxy as fsp
+
+    base = fsp._FinalProxy._fsproxy_wrap.__func__
+
+    def _fsproxy_wrap(cls, value, func):
+        if type(value) is single_gpu_type:
+            value = _adopt_single_gpu(value, chunked_type)
+        return base(cls, value, func)
+
+    return _fsproxy_wrap
+
+
+def _adopt_single_gpu(obj, chunked_type):
+    """Adopt a one-GPU cuDF object as a one-chunk frame on the GPU it is on."""
+    from ._runtime import _current_device, get_runtime
+
+    runtime = get_runtime()
+    device = runtime.current_worker_device()
+    if device is None:
+        device = _current_device()
+        if device not in runtime.devices:
+            device = runtime.devices[0]
+    return chunked_type([obj], [device], runtime)
+
+
+def as_gpu_object(self):
+    """The single-GPU cuDF object behind this proxy.
+
+    Deliberately *named* ``as_gpu_object``: cudf.pandas' own attribute has
+    that name, and cProfile keys a call by the code object's name, so a
+    privately named override makes ``as_gpu_object`` vanish from the profile
+    of ``cudf.Series(proxy)``.
+    """
     from ._frame import ChunkedFrame
 
     fast = self._fsproxy_slow_to_fast()
@@ -286,6 +350,52 @@ def _patch_cudf_entrypoints(npartitions: int | None) -> None:
         setattr(cudf, name, fn)
 
 
+def _patch_cudf_constructors() -> None:
+    """Let cuDF's constructors accept containers holding proxy objects.
+
+    ``cudf.pandas`` converts a proxy passed directly to ``cudf.DataFrame`` /
+    ``Series`` / ``Index``, but it does not look inside a list or dict.  Stock
+    cudf.pandas gets away with that because a proxy over a single-GPU cuDF
+    object forwards ``__cuda_array_interface__``, which is what cuDF's
+    ``is_column_like`` tests for.  A chunked frame spans several devices and
+    has no single device pointer, so ``cudf.DataFrame([proxy, ...])`` fails
+    with "Cannot convert <class 'pandas.Series'> to a column".  Unwrap each
+    element first -- collapsing onto one device, which is what asking for a
+    cuDF object means.
+
+    Must run after ``cudf.pandas.install()``, which installs its own
+    ``__init__`` wrappers on these types.
+    """
+    from cudf.pandas.fast_slow_proxy import is_proxy_object
+
+    from ._frame import ChunkedFrame
+
+    def _for_cudf(obj):
+        if not is_proxy_object(obj):
+            return obj
+        inner = obj._fsproxy_wrapped
+        return inner.compute() if isinstance(inner, ChunkedFrame) else inner
+
+    def _unwrap_elements(data):
+        if isinstance(data, list):
+            return [_for_cudf(obj) for obj in data]
+        if isinstance(data, tuple):
+            return tuple(_for_cudf(obj) for obj in data)
+        if isinstance(data, dict):
+            return {key: _for_cudf(val) for key, val in data.items()}
+        return data
+
+    def _wrap(init):
+        @functools.wraps(init)
+        def wrapper(self, data=None, *args, **kwargs):
+            return init(self, _unwrap_elements(data), *args, **kwargs)
+
+        return wrapper
+
+    for cls in (cudf.DataFrame, cudf.Series, cudf.Index):
+        cls.__init__ = _wrap(cls.__init__)
+
+
 def _unwrap(obj):
     from ._frame import unwrap_proxy
 
@@ -316,6 +426,13 @@ def _intermediate_replacements() -> dict:
         ("cudf.core.dataframe", "_DataFrameLocIndexer", "_DataFrameLocIndexer"),
         ("cudf.core.series", "_SeriesIlocIndexer", "_SeriesILocIndexer"),
         ("cudf.core.series", "_SeriesLocIndexer", "_SeriesLocIndexer"),
+        # Only the DataFrame-side .at/.iat keys are replaced. The chunked
+        # scalar indexers serve Series as well, and the Series-side proxies
+        # name the same pandas slow types (pd.core.indexing._AtIndexer /
+        # _iAtIndexer), so one entry each is enough -- and registering both
+        # sides would just have them overwrite each other in the map.
+        ("cudf.core.dataframe", "_DataFrameAtIndexer", "_AtIndexer"),
+        ("cudf.core.dataframe", "_DataFrameiAtIndexer", "_iAtIndexer"),
         ("cudf.core.series", "DatetimeProperties", "_DatetimeAccessor"),
         ("cudf.core.series", "TimedeltaProperties", "_TimedeltaAccessor"),
         ("cudf.core.accessors.string", "StringMethods", "_StringAccessor"),

@@ -96,7 +96,9 @@ def from_cudf(
 
     pieces = runtime.run(
         source_device,
-        lambda o, b: [o.iloc[b[i] : b[i + 1]] for i in range(len(b) - 1)],
+        # cudf.Index has no .iloc, so slice through the same helper from_pandas
+        # uses rather than assuming a DataFrame/Series.
+        lambda o, b: [_slice_rows(o, b[i], b[i + 1]) for i in range(len(b) - 1)],
         obj,
         bounds,
     )

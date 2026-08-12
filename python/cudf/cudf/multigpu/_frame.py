@@ -550,11 +550,44 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
 
     to_cudf = compute
 
-    def to_arrow(self):
+    def _absorb(self, obj, device: int) -> None:
+        """Replace this frame's contents in place from a single-GPU object.
+
+        For operations that can only run gathered (``.at``/``.iat``). The
+        update has to land on *this* object rather than a replacement: the
+        caller -- and the cudf.pandas proxy fronting it -- holds this
+        instance, so a returned copy would lose the mutation. The frame is
+        re-spread over the devices it was already on.
+        """
+        targets = list(dict.fromkeys(self._devices))
+        replacement = type(self)([obj], [device], self._runtime)
+        if len(targets) > 1:
+            replacement = replacement.rechunk(devices=targets)
+        self._plan = None
+        self._chunks_ = replacement._chunks
+        self._devices_ = replacement._devices
+        self._lengths_cache = None
+        self._meta_cache = None
+
+    def to_arrow(self, type=None):
         import pyarrow as pa
 
         parts = self._run_chunks(lambda c: c.to_arrow())
-        return pa.concat_tables(parts) if len(parts) > 1 else parts[0]
+        if len(parts) == 1:
+            out = parts[0]
+        elif isinstance(parts[0], pa.Table):
+            out = pa.concat_tables(parts)
+        else:
+            # A chunked Series/Index gives one pa.Array per GPU, not a
+            # Table. Concatenate into one contiguous Array so callers see
+            # what single-GPU cuDF gives them.
+            out = pa.concat_arrays(parts)
+        # ``type`` is the __arrow_array__ protocol argument: pyarrow calls
+        # obj.__arrow_array__(type=type) and cudf.pandas forwards that to
+        # this method. Accepting it keeps pa.array(series) on the GPU path
+        # instead of falling back to a host frame whose arrow backing store
+        # is still split into one chunk per GPU.
+        return out.cast(type) if type is not None else out
 
     # ------------------------------------------------------------------
     # placement
@@ -811,7 +844,7 @@ _MAP_METHODS_COMMON = (
     "multiply", "ne", "notna", "notnull", "nans_to_nulls", "pow", "radd",
     "rdiv", "repeat", "rfloordiv", "rmod", "rmul", "round", "rpow", "rsub",
     "rtruediv", "sin", "sqrt", "sub", "subtract", "tan", "truediv", "where",
-    "mask", "replace", "rename", "pipe",
+    "mask", "replace", "rename",
 )
 
 _MAP_METHODS_DATAFRAME = (
@@ -968,6 +1001,19 @@ class _ReductionMixin:
         )
         return _stack(parts).sum()
 
+    def __sizeof__(self):
+        """Device bytes, mirroring ``cudf.core.frame.Frame.__sizeof__``.
+
+        ``sys.getsizeof`` -- and cudf.pandas' ``_FastSlowAttribute`` -- look
+        this up on the *class*, where ``object.__sizeof__`` always exists, so
+        without an override the answer is the size of the Python wrapper (16
+        bytes) rather than of the data, and no fallback ever happens.
+        """
+        if cudf.get_option("mode.pandas_compatible"):
+            usage = self.memory_usage(index=True, deep=True)
+            return int(usage.sum()) if hasattr(usage, "sum") else int(usage)
+        return object.__sizeof__(self)
+
     def ffill(self, **kwargs):
         from ._stats import fill_directional
 
@@ -1114,6 +1160,24 @@ def _make_reduction(name: str, combiner: str):
 class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
     """Behaviour shared by the DataFrame and Series wrappers."""
 
+    def pipe(self, func, *args, **kwargs):
+        """``df.pipe(f)`` is ``f(df)`` -- the whole frame, not one chunk.
+
+        Run per chunk, any callable whose result depends on the frame as a
+        whole (``len(df)``, an index-aligned join, a global rank) silently
+        returns a per-chunk-local answer.  Handing over the chunked frame
+        keeps the work distributed anyway: it implements the same API.
+        """
+        if isinstance(func, tuple):
+            func, target = func
+            if target in kwargs:
+                raise ValueError(
+                    f"{target} is both the pipe target and a keyword argument"
+                )
+            kwargs[target] = self
+            return func(*args, **kwargs)
+        return func(self, *args, **kwargs)
+
     def _map_method(self, name: str, *args, **kwargs):
         # Resolve deferred expressions here, on the calling thread. If one
         # reaches a chunk callback instead, cuDF will getattr() it, which
@@ -1146,6 +1210,14 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
                 )
             )
         results = self._runtime.run_many(jobs)
+        if any(r is NotImplemented for r in results):
+            # NotImplemented is a protocol sentinel, never a value: cuDF
+            # hands it back for operand types it cannot consume. Return it
+            # unchanged so Python's binop protocol tries the reflected
+            # operation and cudf.pandas falls back to pandas. Passing it to
+            # _wrap_like instead yields a plain list, which both layers read
+            # as a successful result.
+            return NotImplemented
         return _wrap_like(results, self._devices, self._runtime)
 
     # -- schema ------------------------------------------------------
@@ -1446,7 +1518,11 @@ class _ILocIndexer:
             start, stop, step = rows.indices(len(frame))
             out = frame._global_iloc(start, stop, step)
         elif isinstance(rows, int):
-            return frame._global_iloc(rows, rows + 1).compute().iloc[0]
+            # A single row leaves no chunked frame for the column selector to
+            # be applied to afterwards, so it has to be applied here. Dropping
+            # it made df.iloc[0, 0] mean df.iloc[0] -- the whole row.
+            row = frame._global_iloc(rows, rows + 1).compute()
+            return row.iloc[0] if cols is None else row.iloc[0, cols]
         else:
             raise NotImplementedError(
                 "iloc row selection supports slices and integers"
@@ -1506,6 +1582,73 @@ class _LocIndexer:
         self._frame[columns] = value
 
 
+def _indexer_get(obj, name: str, key):
+    return _to_host(getattr(obj, name)[key])
+
+
+def _indexer_set(obj, name: str, key, value):
+    getattr(obj, name)[key] = value
+    return obj
+
+
+class _ScalarIndexer:
+    """``.at`` / ``.iat``: one cell, addressed globally.
+
+    Both name a cell by a *global* row label or position, and both may
+    enlarge the frame (``df.at[0, "new"] = 2.0`` adds a column). Neither is a
+    per-chunk operation, so this gathers onto one device and delegates to
+    cuDF.
+
+    ``__setitem__`` is why this exists rather than the ``__getattr__``
+    fallback: ``compute()`` returns a fresh concatenated copy, so a cuDF
+    indexer bound to it mutates an object nothing else references -- reads
+    come out right and writes vanish. ``_absorb`` puts the mutated frame back
+    into the chunks.
+    """
+
+    #: the cuDF indexer this delegates to
+    _indexer_name = ""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    def __getitem__(self, key):
+        frame = self._frame
+        device = frame._devices[0]
+        return frame._runtime.run(
+            device,
+            _indexer_get,
+            frame.compute(device),
+            self._indexer_name,
+            key,
+        )
+
+    def __setitem__(self, key, value):
+        frame = self._frame
+        device = frame._devices[0]
+        updated = frame._runtime.run(
+            device,
+            _indexer_set,
+            frame.compute(device),
+            self._indexer_name,
+            key,
+            value,
+        )
+        frame._absorb(updated, device)
+
+
+#: two classes rather than one parameterised by name: cudf.pandas keys its
+#: intermediate-type map on the fast *type*, so a single class could only be
+#: paired with one pandas slow type -- and ``.at`` would then inherit
+#: ``_iAtIndexer``'s positional semantics whenever it fell back.
+class _AtIndexer(_ScalarIndexer):
+    _indexer_name = "at"
+
+
+class _iAtIndexer(_ScalarIndexer):
+    _indexer_name = "iat"
+
+
 class ChunkedDataFrame(_ChunkedCommon):
     """A :class:`cudf.DataFrame` partitioned by rows across several GPUs."""
 
@@ -1549,6 +1692,14 @@ class ChunkedDataFrame(_ChunkedCommon):
     @property
     def iloc(self):
         return _DataFrameILocIndexer(self)
+
+    @property
+    def at(self):
+        return _AtIndexer(self)
+
+    @property
+    def iat(self):
+        return _iAtIndexer(self)
 
     # -- selection ---------------------------------------------------
     def __getitem__(self, key):
@@ -1733,267 +1884,13 @@ class ChunkedSeries(_ChunkedCommon):
     def iloc(self):
         return _SeriesILocIndexer(self)
 
-    def __getitem__(self, key):
-        if isinstance(key, ChunkedSeries):
-            return self._map_method("__getitem__", key)
-        if isinstance(key, slice):
-            start, stop, step = key.indices(len(self))
-            return self._global_iloc(start, stop, step)
-        return self._map_method("__getitem__", key)
-
-    # -- distinct ----------------------------------------------------
-    def unique(self):
-        """Exact distinct values, gathered onto one GPU."""
-        parts = self._run_chunks(lambda c: c.unique())
-        device = self._devices[0]
-        gathered = _transfer.gather_concat(
-            list(zip(parts, self._devices)), device, self._runtime, ignore_index=True
-        )
-        result = self._runtime.run(device, lambda s: s.unique(), gathered)
-        return _wrap_like([result], [device], self._runtime)
-
-    def _distinct_reduce(self, name: str, *args, **kwargs):
-        return int(len(self.unique()))
-
-    def nunique(self, *args, **kwargs) -> int:
-        return self._distinct_reduce("nunique", *args, **kwargs)
-
-    def factorize(self, sort: bool = False, **kwargs):
-        from ._reshape import factorize
-
-        return factorize(self, sort=sort, **kwargs)
-
-    def apply(self, func, *args, **kwargs):
-        """Elementwise UDF, compiled and run independently on each GPU.
-
-        String UDFs work too: cuDF's compiled-kernel cache is device-aware
-        (``cudf/utils/device.py``), so each GPU keeps its own PTX with its own
-        character-table pointers.
-        """
-        return self.map_chunks(lambda c: c.apply(func, *args, **kwargs))
-
-    def value_counts(self, **kwargs):
-        from ._ops import series_value_counts
-
-        return series_value_counts(self, **kwargs)
-
-    def drop_duplicates(self, **kwargs):
-        from ._ops import drop_duplicates
-
-        return drop_duplicates(self, **kwargs)
-
-    def sort_values(self, by=None, **kwargs):
-        from ._ops import sort_values
-
-        # `by` is accepted (and ignored when it names this series) so that code
-        # written against a DataFrame keeps working if a step yields a Series.
-        if by is not None and by not in (self.name, [self.name]):
-            raise KeyError(f"cannot sort a Series by {by!r}")
-        return sort_values(self, None, **kwargs)
-
-    def groupby(self, by, **kwargs):
-        from ._ops import ChunkedGroupBy
-
-        return ChunkedGroupBy(self, by, **kwargs)
-
-    def quantile(self, q=0.5, interpolation: str = "linear", **kwargs):
-        from ._ops import quantile
-
-        return quantile(self, q, interpolation=interpolation)
-
-    def idxmax(self, **kwargs):
-        return self._extreme_index("max", **kwargs)
-
-    def idxmin(self, **kwargs):
-        return self._extreme_index("min", **kwargs)
-
-    def _extreme_index(self, how: str, **kwargs):
-        """Index label of the first minimum/maximum.
-
-        cuDF has no ``idxmin``/``idxmax``, so each chunk reports its extreme
-        value and the label of its first occurrence; the winner is then chosen
-        on the host.  Ties resolve to the earliest chunk, matching pandas.
-        """
-
-        def per_chunk(chunk):
-            if len(chunk) == 0:
-                return None
-            value = getattr(chunk, how)(**kwargs)
-            if value is None or (isinstance(value, float) and np.isnan(value)):
-                return None
-            matches = chunk.index[chunk == value]
-            if len(matches) == 0:
-                return None
-            return (_to_host(value), _to_host(matches[:1])[0])
-
-        parts = [
-            (i, p)
-            for i, p in enumerate(self._run_chunks(per_chunk))
-            if p is not None
-        ]
-        if not parts:
-            return None
-        better = (lambda a, b: a > b) if how == "max" else (lambda a, b: a < b)
-        best_i, best = parts[0]
-        for i, part in parts[1:]:
-            if better(part[0], best[0]):
-                best_i, best = i, part
-        return best[1]
-
-    # -- accessors ---------------------------------------------------
     @property
-    def str(self):
-        return _StringAccessor(self, "str")
+    def at(self):
+        return _AtIndexer(self)
 
     @property
-    def dt(self):
-        return _DatetimeAccessor(self, "dt")
-
-    @property
-    def cat(self):
-        return _CategoricalAccessor(self, "cat")
-
-    @property
-    def list(self):
-        return _ListAccessor(self, "list")
-
-    @property
-    def struct(self):
-        return _StructAccessor(self, "struct")
-
-    def __repr__(self) -> str:
-        total = len(self)
-        if total <= 10:
-            body = repr(self.to_pandas())
-        else:
-            head = self.head(5).to_pandas()
-            tail = self.tail(5).to_pandas()
-            body = repr(pd.concat([head, tail]))
-            body += f"\n\n[{total} rows]"
-        return _banner("ChunkedSeries", self) + body
-
-
-class _Accessor:
-    """Forwards ``.str`` / ``.dt`` / ``.cat`` / ``.list`` methods per chunk.
-
-    Resolves eagerly. An earlier version returned a lazy object that only did
-    the work when something touched it, which deadlocked: cuDF's ``as_column``
-    calls ``getattr`` on assigned values, so ``df["y"] = df["x"].dt.year``
-    resolved the accessor *inside* a device worker thread, which then tried to
-    dispatch back to that same single-threaded worker.
-    """
-
-    def __init__(self, series: "ChunkedSeries", namespace: str) -> None:
-        self._series = series
-        self._namespace = namespace
-
-    def __getattr__(self, name: str):
-        if name.startswith("_"):
-            # A *defined* dunder/private property that raises AttributeError
-            # internally also lands here, and answering "no such attribute"
-            # buries the real error -- ChunkedIndex._meta failed this way, and
-            # the traceback blamed the missing attribute rather than the
-            # RangeIndex.head call inside it.
-            for klass in type(self).__mro__:
-                if name in vars(klass):
-                    raise AttributeError(
-                        f"{type(self).__name__}.{name} exists but raised "
-                        "AttributeError while being evaluated; the original "
-                        "error was swallowed by attribute lookup. Re-run with "
-                        f"type(obj).{name}.fget(obj) to see it."
-                    )
-            raise AttributeError(name)
-        series = self._series
-        namespace = self._namespace
-
-        # Ask one chunk whether this name is a method or a value. Metadata
-        # only -- it never touches the data.
-        is_method = series._runtime.run(
-            series._devices[0],
-            lambda chunk: callable(getattr(getattr(chunk, namespace), name)),
-            series._chunks[0],
-        )
-
-        if not is_method:
-            return _wrap_like(
-                series._run_chunks(
-                    lambda c: getattr(getattr(c, namespace), name)
-                ),
-                series._devices,
-                series._runtime,
-            )
-
-        def method(*args, **kwargs):
-            return _wrap_like(
-                series._run_chunks(
-                    lambda c: getattr(getattr(c, namespace), name)(
-                        *args, **kwargs
-                    )
-                ),
-                series._devices,
-                series._runtime,
-            )
-
-        method.__name__ = name
-        return method
-
-
-#: cudf.pandas keys its proxy map on the *fast type*, so each accessor
-#: namespace needs a distinct class. Sharing one made ``.dt`` resolve to
-#: whichever namespace registered last -- ``s.dt.tz_localize`` came back as
-#: "CategoricalAccessor has no attribute tz_localize".
-class _StringAccessor(_Accessor):
-    pass
-
-
-class _DatetimeAccessor(_Accessor):
-    pass
-
-
-class _TimedeltaAccessor(_Accessor):
-    pass
-
-
-class _CategoricalAccessor(_Accessor):
-    pass
-
-
-class _ListAccessor(_Accessor):
-    pass
-
-
-class _StructAccessor(_Accessor):
-    pass
-
-
-class ChunkedIndex(_ChunkedCommon):
-    """A :class:`cudf.Index` partitioned across several GPUs."""
-
-    #: pandas identifies its own types structurally rather than by isinstance:
-    #: ``ABCSeries.__instancecheck__`` reads ``inst._typ`` and compares it to a
-    #: string. Without it, ``pd.to_datetime`` and friends raise AttributeError
-    #: on a chunked frame, which cudf.pandas turns into a silent CPU fallback --
-    #: so the query still answers correctly, just not on the GPU.
-    _typ = "index"
-
-
-    _cudf_type = cudf.Index
-
-    @property
-    def name(self):
-        return self._meta.name
-
-    @property
-    def dtype(self):
-        return self._meta.dtype
-
-    @property
-    def shape(self) -> tuple[int]:
-        return (len(self),)
-
-    @property
-    def iloc(self):
-        return _SeriesILocIndexer(self)
+    def iat(self):
+        return _iAtIndexer(self)
 
     def __getitem__(self, key):
         if isinstance(key, ChunkedSeries):
