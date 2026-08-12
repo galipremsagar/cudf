@@ -341,7 +341,9 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
         if self._meta_cache is None:
             self._meta_cache = self._runtime.run(
                 self._devices[0],
-                lambda c: c.head(0).to_pandas(),
+                # slicing rather than head(0): an Index chunk has no .head,
+                # and cudf.RangeIndex in particular does not
+                lambda c: c[:0].to_pandas(),
                 self._chunks[0],
             )
         return self._meta_cache
@@ -375,6 +377,18 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
             return _to_host(fn(chunk, *rest))
 
         return self._run_chunks(_shim, *others)
+
+    def __reduce__(self):
+        """Pickle through host memory.
+
+        A chunked frame holds device buffers and a runtime full of pinned
+        worker threads, neither of which can be pickled -- the attempt fails
+        with "no default __reduce__ due to non-trivial __cinit__". The frame's
+        *value* is what a caller means to pickle, so it round-trips as host
+        pandas and is re-partitioned on load. That also makes a pickle portable
+        to a machine with a different number of GPUs.
+        """
+        return (_rebuild_chunked, (type(self), self.to_pandas()))
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """Apply a numpy ufunc chunk-wise.
@@ -969,6 +983,19 @@ class _FallbackMixin:
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
+            # A *defined* dunder/private property that raises AttributeError
+            # internally also lands here, and answering "no such attribute"
+            # buries the real error -- ChunkedIndex._meta failed this way, and
+            # the traceback blamed the missing attribute rather than the
+            # RangeIndex.head call inside it.
+            for klass in type(self).__mro__:
+                if name in vars(klass):
+                    raise AttributeError(
+                        f"{type(self).__name__}.{name} exists but raised "
+                        "AttributeError while being evaluated; the original "
+                        "error was swallowed by attribute lookup. Re-run with "
+                        f"type(obj).{name}.fget(obj) to see it."
+                    )
             raise AttributeError(name)
         # Attribute-style column access (``df.price``). pandas code uses this
         # constantly, and under the accelerated-pandas backend the proxy
@@ -1769,23 +1796,23 @@ class ChunkedSeries(_ChunkedCommon):
     # -- accessors ---------------------------------------------------
     @property
     def str(self):
-        return _Accessor(self, "str")
+        return _StringAccessor(self, "str")
 
     @property
     def dt(self):
-        return _Accessor(self, "dt")
+        return _DatetimeAccessor(self, "dt")
 
     @property
     def cat(self):
-        return _Accessor(self, "cat")
+        return _CategoricalAccessor(self, "cat")
 
     @property
     def list(self):
-        return _Accessor(self, "list")
+        return _ListAccessor(self, "list")
 
     @property
     def struct(self):
-        return _Accessor(self, "struct")
+        return _StructAccessor(self, "struct")
 
     def __repr__(self) -> str:
         total = len(self)
@@ -1815,6 +1842,19 @@ class _Accessor:
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
+            # A *defined* dunder/private property that raises AttributeError
+            # internally also lands here, and answering "no such attribute"
+            # buries the real error -- ChunkedIndex._meta failed this way, and
+            # the traceback blamed the missing attribute rather than the
+            # RangeIndex.head call inside it.
+            for klass in type(self).__mro__:
+                if name in vars(klass):
+                    raise AttributeError(
+                        f"{type(self).__name__}.{name} exists but raised "
+                        "AttributeError while being evaluated; the original "
+                        "error was swallowed by attribute lookup. Re-run with "
+                        f"type(obj).{name}.fget(obj) to see it."
+                    )
             raise AttributeError(name)
         series = self._series
         namespace = self._namespace
@@ -1849,6 +1889,34 @@ class _Accessor:
 
         method.__name__ = name
         return method
+
+
+#: cudf.pandas keys its proxy map on the *fast type*, so each accessor
+#: namespace needs a distinct class. Sharing one made ``.dt`` resolve to
+#: whichever namespace registered last -- ``s.dt.tz_localize`` came back as
+#: "CategoricalAccessor has no attribute tz_localize".
+class _StringAccessor(_Accessor):
+    pass
+
+
+class _DatetimeAccessor(_Accessor):
+    pass
+
+
+class _TimedeltaAccessor(_Accessor):
+    pass
+
+
+class _CategoricalAccessor(_Accessor):
+    pass
+
+
+class _ListAccessor(_Accessor):
+    pass
+
+
+class _StructAccessor(_Accessor):
+    pass
 
 
 class ChunkedIndex(_ChunkedCommon):
@@ -1921,3 +1989,17 @@ for _dunder in ("__neg__", "__abs__", "__invert__", "__pos__"):
             setattr(_cls, _dunder, _make_map_method(_dunder))
 
 del _name, _cls, _op, _prefix, _dunder, _combiner
+
+
+def _rebuild_chunked(kind, host):
+    """Reconstruct a chunked frame unpickled via :meth:`ChunkedFrame.__reduce__`."""
+    from ._creation import from_pandas
+
+    frame = from_pandas(host)
+    if isinstance(frame, kind):
+        return frame
+    # A Series/Index pickled from a one-column frame comes back as the other
+    # kind; convert rather than hand back the wrong type.
+    if kind is ChunkedIndex and hasattr(frame, "index"):
+        return frame.index
+    return frame

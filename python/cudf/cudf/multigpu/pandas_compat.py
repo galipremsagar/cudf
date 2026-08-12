@@ -27,6 +27,7 @@ This is experimental.  Two properties of the proxy machinery matter:
 
 from __future__ import annotations
 
+import importlib
 import os
 import warnings
 from typing import Any, Sequence
@@ -124,6 +125,11 @@ def install(
     }
 
     def patched_final_proxy_type(name, fast_type, slow_type, **kwargs):
+        # cudf.pandas names the proxy's module by walking the stack, and this
+        # wrapper adds a frame -- so without this every proxy type would be
+        # attributed to cudf.multigpu.pandas_compat, where pickle cannot find
+        # it ("Can't pickle <class '...pandas_compat.ndarray'>").
+        kwargs.setdefault("module", _real_caller_module())
         if fast_type in replacements:
             kwargs["fast_to_slow"] = _to_slow
             kwargs["slow_to_fast"] = to_fast
@@ -140,6 +146,7 @@ def install(
     intermediate_replacements = _intermediate_replacements()
 
     def patched_intermediate_proxy_type(name, fast_type, slow_type, **kwargs):
+        kwargs.setdefault("module", _real_caller_module())
         fast_type = intermediate_replacements.get(fast_type, fast_type)
         return original_intermediate(name, fast_type, slow_type, **kwargs)
 
@@ -164,6 +171,24 @@ def install(
     )
 
 
+def _real_caller_module() -> str:
+    """The module that asked for a proxy type, skipping this module's frames.
+
+    ``cudf.pandas`` derives a proxy type's ``__module__`` from the call stack.
+    Wrapping its factories shifts that stack, so the real caller has to be
+    found explicitly.
+    """
+    import inspect
+
+    frame = inspect.currentframe()
+    while frame is not None:
+        name = frame.f_globals.get("__name__", "")
+        if name != __name__:
+            return name
+        frame = frame.f_back
+    return __name__
+
+
 def wrap_fast(obj):
     """Wrap a chunked frame in the pandas proxy that fronts it."""
     from cudf.pandas import fast_slow_proxy as fsp
@@ -186,15 +211,50 @@ def _install_io_overrides(npartitions: int | None) -> None:
 
     from . import _io
 
+    # The proxied readers, captured after cudf.pandas.install(). Anything the
+    # multi-GPU reader cannot do is delegated to these rather than raised:
+    # a reader that only accepts the arguments it likes is not a drop-in for
+    # pandas, and pandas code passes chunksize, file-like objects and globs
+    # routinely.
+    original_read_parquet = pd.read_parquet
+    original_read_csv = pd.read_csv
+
+    #: keywords whose semantics the partitioned readers do not reproduce.
+    #: chunksize/iterator return an iterator over the file rather than a frame;
+    #: nrows and skipfooter are defined relative to the whole file, which a
+    #: byte-range split does not preserve.
+    _CSV_UNSUPPORTED = frozenset(
+        {"chunksize", "iterator", "skipfooter", "nrows"}
+    )
+
+    def _is_single_local_path(path) -> bool:
+        """Whether the multi-GPU readers can address this input at all."""
+        if not isinstance(path, (str, os.PathLike)):
+            return False  # StringIO, buffers, file objects, lists of paths
+        text = os.fspath(path)
+        return not any(ch in text for ch in "*?[") and os.path.exists(text)
+
     def read_parquet(path, columns=None, **kwargs):
         kwargs.pop("engine", None)
-        frame = _io.read_parquet(
-            path, columns=columns, npartitions=npartitions, **kwargs
-        )
+        if not _is_single_local_path(path) and not isinstance(path, list):
+            return original_read_parquet(path, columns=columns, **kwargs)
+        try:
+            frame = _io.read_parquet(
+                path, columns=columns, npartitions=npartitions, **kwargs
+            )
+        except (NotImplementedError, TypeError, ValueError):
+            return original_read_parquet(path, columns=columns, **kwargs)
         return wrap_fast(frame)
 
     def read_csv(path, **kwargs):
-        frame = _io.read_csv(path, npartitions=npartitions, **kwargs)
+        if not _is_single_local_path(path) or (
+            _CSV_UNSUPPORTED & kwargs.keys()
+        ):
+            return original_read_csv(path, **kwargs)
+        try:
+            frame = _io.read_csv(path, npartitions=npartitions, **kwargs)
+        except (NotImplementedError, TypeError, ValueError):
+            return original_read_csv(path, **kwargs)
         return wrap_fast(frame)
 
     original_concat = pd.concat
@@ -261,11 +321,38 @@ def _unwrap(obj):
 
 
 def _intermediate_replacements() -> dict:
-    """Map cuDF intermediate types onto their chunked equivalents."""
+    """Map cuDF intermediate types onto their chunked equivalents.
+
+    The ``.str`` / ``.dt`` / ``.cat`` accessors belong here as much as group-by
+    does. Without them the proxy resolves ``s.dt`` on the fast object, gets a
+    bare ``_Accessor`` it does not recognise, and hands back whatever the
+    accessor returns unwrapped -- so ``s.dt.tz_localize(...)`` yields a raw
+    ChunkedSeries where pandas code expects a Series, and every subsequent
+    operation escapes the proxy.
+    """
+    from . import _frame
     from ._ops import ChunkedGroupBy
 
     groupby = cudf.core.groupby.groupby
+    accessors = {}
+    for module, attr, chunked in (
+        ("cudf.core.series", "DatetimeProperties", "_DatetimeAccessor"),
+        ("cudf.core.series", "TimedeltaProperties", "_TimedeltaAccessor"),
+        ("cudf.core.accessors.string", "StringMethods", "_StringAccessor"),
+        ("cudf.core.accessors.categorical", "CategoricalAccessor",
+         "_CategoricalAccessor"),
+        ("cudf.core.accessors.lists", "ListMethods", "_ListAccessor"),
+        ("cudf.core.accessors.struct", "StructMethods", "_StructAccessor"),
+    ):
+        try:
+            mod = importlib.import_module(module)
+        except ImportError:
+            continue
+        cls = getattr(mod, attr, None)
+        if cls is not None:
+            accessors[cls] = getattr(_frame, chunked)
     return {
+        **accessors,
         groupby.DataFrameGroupBy: ChunkedGroupBy,
         groupby.SeriesGroupBy: ChunkedGroupBy,
     }

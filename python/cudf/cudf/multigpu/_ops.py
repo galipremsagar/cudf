@@ -154,13 +154,26 @@ class ChunkedGroupBy:
         frame: ChunkedFrame,
         by,
         as_index: bool = True,
-        sort: bool = False,
+        sort: bool = True,
         dropna: bool = True,
         split_out: int | None = None,
         **kwargs,
     ) -> None:
         self._frame = frame
         self._by = [by] if isinstance(by, (str, int)) or not isinstance(by, (list, tuple)) else list(by)
+        # Grouping by an *external* Series/array rather than by column labels
+        # is not implemented. Treating one as a label sends the aggregation
+        # back through the per-device workers from inside a worker, and the
+        # single-threaded executors deadlock -- a hang, not an error. Declining
+        # it lets cudf.pandas fall back to pandas, which answers correctly.
+        for key in self._by:
+            if not isinstance(key, (str, int, bytes, tuple)) or isinstance(
+                key, ChunkedFrame
+            ):
+                raise NotImplementedError(
+                    "multi-GPU groupby requires column labels; grouping by an "
+                    f"external {type(key).__name__} is not supported"
+                )
         self._as_index = as_index
         self._sort = sort
         self._dropna = dropna
@@ -209,7 +222,7 @@ class ChunkedGroupBy:
             result = self._shuffle_agg(spec, **kwargs)
         else:
             result = self._shuffle_agg_plan(plan)
-        return self._maybe_squeeze(result, spec)
+        return self._maybe_squeeze(self._sorted_by_keys(result), spec)
 
     def _shuffle_agg_plan(self, plan):
         """Shuffle-then-aggregate for a named-aggregation plan."""
@@ -223,6 +236,29 @@ class ChunkedGroupBy:
             sort=self._sort,
             dropna=self._dropna,
         )
+
+    def _sorted_by_keys(self, result):
+        """Order the aggregate by group key, as pandas' ``sort=True`` does.
+
+        The per-chunk ``sort=`` passed to cuDF only orders rows *within* a
+        chunk, and the shuffle has already scattered keys across chunks, so the
+        concatenation is unordered. pandas defaults to sort=True, so without
+        this ``df.groupby("a").sum()`` came back with its index in an arbitrary
+        order and every comparison against pandas failed on the index.
+        """
+        if not self._sort or result is None:
+            return result
+        columns = tuple(getattr(result, "columns", ()) or ())
+        keys = [k for k in self._keys if k in columns]
+        if keys:
+            return result.sort_values(keys, ignore_index=True)
+        # with as_index=True the keys live in the index instead
+        try:
+            return result.sort_index()
+        except Exception:
+            # sort_index has no distributed implementation for every shape;
+            # an unsorted-but-correct answer beats raising here
+            return result
 
     def _maybe_squeeze(self, result, spec):
         """``gb["v"].sum()`` is a Series -- but only when ``as_index=True``.
@@ -342,7 +378,9 @@ class ChunkedGroupBy:
             as_index=self._as_index,
             sort=self._sort,
         )
-        return drop_empty_chunks(applied)
+        # Same reason as the aggregate path: the shuffle scatters keys across
+        # chunks, so per-chunk sorting leaves the concatenation unordered.
+        return self._sorted_by_keys(drop_empty_chunks(applied))
 
     def __repr__(self) -> str:
         return f"<ChunkedGroupBy by={self._by} over {self._frame.nchunks} chunks>"

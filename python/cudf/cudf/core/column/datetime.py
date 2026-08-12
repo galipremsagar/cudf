@@ -45,6 +45,7 @@ from cudf.utils.dtypes import (
     dtype_to_pylibcudf_type,
     get_dtype_of_same_kind,
 )
+from cudf.utils.device import cache_device_key, register_device_cache
 from cudf.utils.scalar import pa_scalar_to_plc_scalar
 from cudf.utils.temporal import (
     _unit_to_name,
@@ -87,8 +88,25 @@ def _resolve_binop_resolution(
     return units[max(left_idx, right_idx)]
 
 
+# The transition tables are ``ColumnBase`` -- device memory -- so a cache keyed
+# only on the zone name hands a table built on GPU 0 to a kernel launched on
+# GPU 3, which faults. Same hazard as the converted-scalar cache; the device is
+# only consulted once more than one device is in use.
 @functools.lru_cache(maxsize=20)
+def _get_tz_data_cached(
+    zone_name: str, device: int
+) -> tuple[ColumnBase, ColumnBase]:
+    return _build_tz_data(zone_name)
+
+
 def _get_tz_data(zone_name: str) -> tuple[ColumnBase, ColumnBase]:
+    return _get_tz_data_cached(zone_name, cache_device_key())
+
+
+register_device_cache(_get_tz_data_cached.cache_clear)
+
+
+def _build_tz_data(zone_name: str) -> tuple[ColumnBase, ColumnBase]:
     """
     Return timezone data (transition times and UTC offsets) for the
     given IANA time zone.

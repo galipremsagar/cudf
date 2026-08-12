@@ -81,12 +81,17 @@ def nrt_enabled():
 
     with _nrt_lock:
         if _nrt_depth == 0:
+            # Discovery happens before anything global is touched. It can
+            # raise, and an exception here escapes before the ``try`` below,
+            # so the ``finally`` that restores the config never runs -- any
+            # mutation made first would leak NRT on permanently.
+            include_dir = _get_libcudf_rapids_include_dir()
             _nrt_saved = (
                 getattr(numba_config, "CUDA_ENABLE_NRT", False),
                 getattr(numba_config, "CUDA_NVRTC_EXTRA_SEARCH_PATHS", ""),
             )
             numba_config.CUDA_ENABLE_NRT = True
-            if (include_dir := _get_libcudf_rapids_include_dir()) is not None:
+            if include_dir is not None:
                 numba_config.CUDA_NVRTC_EXTRA_SEARCH_PATHS = (
                     _append_search_path(_nrt_saved[1] or "", include_dir)
                 )
