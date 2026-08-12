@@ -248,7 +248,10 @@ class ChunkedGroupBy:
         """
         if not self._sort or result is None:
             return result
-        columns = tuple(getattr(result, "columns", ()) or ())
+        # `or ()` would call bool() on a pandas Index, which raises
+        # "truth value of a Index is ambiguous" -- test it against None.
+        labels = getattr(result, "columns", None)
+        columns = tuple(labels) if labels is not None else ()
         keys = [k for k in self._keys if k in columns]
         if keys:
             return result.sort_values(keys, ignore_index=True)
