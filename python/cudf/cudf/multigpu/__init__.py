@@ -7,10 +7,14 @@ DataFrame by rows across devices.  Each chunk is an ordinary
 :class:`cudf.DataFrame` living on one GPU; the wrapper dispatches work to the
 right device and moves data between devices when an operation needs it.
 
-    >>> import cudf.multigpu as mgpu
-    >>> mgpu.init()                              # one worker thread per GPU
-    >>> df = mgpu.read_parquet("data/*.parquet") # chunks land on all GPUs
-    >>> df.groupby("key").agg({"value": "sum"})  # shuffle + local aggregate
+Typical use -- shown as a literal block rather than a doctest, because it
+needs several GPUs and a dataset on disk::
+
+    import cudf.multigpu as mgpu
+
+    mgpu.init()                              # one worker thread per GPU
+    df = mgpu.read_parquet("data/*.parquet")  # chunks land on all GPUs
+    df.groupby("key").agg({"value": "sum"})   # shuffle + local aggregate
 
 No changes to libcudf are required: everything is built from public
 pylibcudf/cuDF primitives plus peer-to-peer copies.
