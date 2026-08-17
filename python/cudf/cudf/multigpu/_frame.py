@@ -550,6 +550,20 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
 
     to_cudf = compute
 
+    def _adopt(self, other: "ChunkedFrame") -> None:
+        """Take over ``other``'s chunks, in place.
+
+        ``inplace=True`` has to change the object the caller is holding. Every
+        distributed operation here builds a *new* frame, so without this the
+        new frame is discarded and the write is silently lost -- which is what
+        sort_values(inplace=True) did: it returned None and changed nothing.
+        """
+        self._plan = None
+        self._chunks_ = other._chunks
+        self._devices_ = other._devices
+        self._lengths_cache = getattr(other, "_lengths_cache", None)
+        self._meta_cache = None
+
     def _absorb(self, obj, device: int) -> None:
         """Replace this frame's contents in place from a single-GPU object.
 
@@ -1141,6 +1155,48 @@ def _maybe_rechunk(result, device: int, runtime, devices: Sequence[int]):
     return out
 
 
+#: methods whose pandas signature accepts ``inplace``. Each returns a new
+#: frame here, so ``inplace=True`` means "adopt that result and return None".
+_INPLACE_CAPABLE = frozenset({
+    "fillna", "dropna", "drop", "rename", "reset_index", "set_index",
+    "sort_values", "sort_index", "replace", "drop_duplicates", "clip",
+    "ffill", "bfill", "pad", "backfill", "rename_axis", "query", "eval",
+    "mask", "where", "interpolate", "set_axis",
+})
+
+
+def _honour_inplace(func):
+    """Make ``inplace=True`` mutate the receiver and return None, as pandas does."""
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        inplace = kwargs.pop("inplace", False)
+        result = func(self, *args, **kwargs)
+        if not inplace:
+            return result
+        if isinstance(result, ChunkedFrame) and type(result) is type(self):
+            self._adopt(result)
+            return None
+        # a shape the receiver cannot adopt (e.g. drop(columns=...) on a
+        # Series): fall back to returning it rather than silently doing nothing
+        return result
+
+    return wrapper
+
+
+def _install_inplace_support(*classes) -> None:
+    for klass in classes:
+        for name in _INPLACE_CAPABLE:
+            member = vars(klass).get(name)
+            if member is None or getattr(member, "_mgpu_inplace", False):
+                continue
+            if not callable(member):
+                continue
+            wrapped = _honour_inplace(member)
+            wrapped._mgpu_inplace = True
+            setattr(klass, name, wrapped)
+
+
 def _make_map_method(name: str):
     def method(self, *args, **kwargs):
         return self._map_method(name, *args, **kwargs)
@@ -1577,9 +1633,22 @@ class _LocIndexer:
 
     def __setitem__(self, key, value):
         rows, columns = (key if isinstance(key, tuple) else (key, None))
-        if not (isinstance(rows, slice) and rows.start is None and rows.stop is None):
-            raise NotImplementedError("loc assignment supports ':' rows only")
-        self._frame[columns] = value
+        if isinstance(rows, slice) and rows.start is None and rows.stop is None:
+            # whole-column assignment: stays per-chunk, no gather needed
+            self._frame[columns] = value
+            return
+        # A label names a row somewhere in the frame, and label lookup needs a
+        # global index -- so gather, let cuDF do it, and put the result back.
+        # Raising here instead is worse than it sounds: cudf.pandas answers a
+        # NotImplementedError by falling back, and the fallback mutates a
+        # temporary host copy that is then discarded, so ``s.loc[1] = 88``
+        # silently did nothing at all.
+        frame = self._frame
+        device = frame._devices[0]
+        updated = frame._runtime.run(
+            device, _indexer_set, frame.compute(device), "loc", key, value
+        )
+        frame._absorb(updated, device)
 
 
 def _indexer_get(obj, name: str, key):
@@ -1727,10 +1796,45 @@ class ChunkedDataFrame(_ChunkedCommon):
         if isinstance(value, Expr):
             # evaluate against *this* frame so the partitioning lines up
             value = value.evaluate(self)
+        value = self._align_assigned_value(value)
         if isinstance(value, ChunkedFrame) and not self._aligned_with(value):
             value = value.repartition_like(self)
         self._run_chunks(_setitem, value if isinstance(value, ChunkedFrame) else _Const(value), key)
         self._meta_cache = None
+
+    def _align_assigned_value(self, value):
+        """Turn a full-length host sequence into a frame partitioned like this one.
+
+        A non-chunked value is otherwise handed to *every* chunk whole, so
+        whether it works at all depends on what cuDF happens to accept for the
+        chunk's own length: a list and an ndarray were fine, a tuple or a range
+        raised "Length of values (4) does not match length of index (1)".
+        Aligning first makes every sequence type take the same path.
+
+        Scalars, strings and mappings are left alone -- broadcasting is what
+        they mean.
+        """
+        from ._creation import from_pandas as _from_pandas
+        from ._lazy import Expr
+
+        if isinstance(value, (ChunkedFrame, Expr, _Const)):
+            return value
+        if value is None or isinstance(value, (str, bytes, dict)):
+            return value
+        if not hasattr(value, "__len__"):
+            if hasattr(value, "__iter__"):
+                value = list(value)  # range, generator, other iterables
+            else:
+                return value
+        try:
+            if len(value) != len(self):
+                return value  # let cuDF raise, as pandas would
+        except TypeError:
+            return value
+        aligned = _from_pandas(
+            pd.Series(list(value)), npartitions=self.nchunks
+        )
+        return aligned.repartition_like(self)
 
     def __delitem__(self, key):
         self._run_chunks(lambda c: c.__delitem__(key))
@@ -1879,6 +1983,13 @@ class ChunkedSeries(_ChunkedCommon):
     @property
     def shape(self) -> tuple[int]:
         return (len(self),)
+
+    @property
+    def loc(self):
+        # Without this, .loc fell through to the gathered single-GPU
+        # fallback, which binds a cuDF indexer to a fresh concatenated
+        # copy -- so s.loc[1] = 88 read back fine and wrote nothing.
+        return _SeriesLocIndexer(self)
 
     @property
     def iloc(self):
@@ -2221,6 +2332,10 @@ for _dunder in ("__neg__", "__abs__", "__invert__", "__pos__"):
             setattr(_cls, _dunder, _make_map_method(_dunder))
 
 del _name, _cls, _op, _prefix, _dunder, _combiner
+
+
+# after every method above is installed, so the wrapper sees the final ones
+_install_inplace_support(ChunkedDataFrame, ChunkedSeries, ChunkedIndex)
 
 
 def _rebuild_chunked(kind, host):
