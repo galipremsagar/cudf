@@ -1077,7 +1077,15 @@ class _FallbackMixin:
         )
         device = self._devices[0]
         gathered = self.compute(device)
+        # ``inplace=True`` mutates the *gathered* copy, which nothing else
+        # references, so the write is lost and the call returns None -- that is
+        # how sort_index, set_index, drop_duplicates and Series.drop silently
+        # did nothing. Run it, then put the mutated object back.
+        inplace = bool(kwargs.get("inplace"))
         result = self._runtime.run(device, _call, gathered, name, args, kwargs)
+        if inplace:
+            self._absorb(gathered, device)
+            return None
         return _maybe_rechunk(result, device, self._runtime, self.devices)
 
     def __getattr__(self, name: str):
@@ -1797,10 +1805,50 @@ class ChunkedDataFrame(_ChunkedCommon):
             # evaluate against *this* frame so the partitioning lines up
             value = value.evaluate(self)
         value = self._align_assigned_value(value)
-        if isinstance(value, ChunkedFrame) and not self._aligned_with(value):
-            value = value.repartition_like(self)
+        if isinstance(value, ChunkedFrame):
+            self._check_index_alignable(value)
+            if not self._aligned_with(value):
+                value = value.repartition_like(self)
         self._run_chunks(_setitem, value if isinstance(value, ChunkedFrame) else _Const(value), key)
         self._meta_cache = None
+
+    def _check_index_alignable(self, value) -> None:
+        """Refuse an assignment that would need a *label* alignment.
+
+        pandas aligns ``df[col] = series`` on the index. Here the value is
+        repartitioned by row *position*, so if the two indexes are not in the
+        same order the values land on the wrong rows -- and because the
+        mismatched labels simply do not meet inside any chunk, the column comes
+        back all-NaN rather than wrong-looking. A distributed reindex is a
+        shuffle this layer does not do yet, so this raises instead of quietly
+        corrupting the column.
+        """
+        try:
+            mine = self.index
+            theirs = value.index
+        except Exception:
+            return
+        if mine is theirs:
+            return
+        try:
+            same = bool(
+                self._runtime.run(
+                    self._devices[0],
+                    _indexes_equal,
+                    mine.compute(self._devices[0]),
+                    theirs.compute(self._devices[0]),
+                )
+            )
+        except Exception:
+            return  # cannot tell cheaply; positional is the existing behaviour
+        if not same:
+            raise NotImplementedError(
+                "assigning a Series whose index differs from the frame's "
+                "requires a distributed reindex, which cudf.multigpu does not "
+                "implement yet. Align first, e.g. "
+                "df[col] = other.reindex(df.index).to_numpy(), or reset both "
+                "indexes."
+            )
 
     def _align_assigned_value(self, value):
         """Turn a full-length host sequence into a frame partitioned like this one.
@@ -1827,10 +1875,17 @@ class ChunkedDataFrame(_ChunkedCommon):
             else:
                 return value
         try:
-            if len(value) != len(self):
-                return value  # let cuDF raise, as pandas would
+            length = len(value)
         except TypeError:
             return value
+        if length != len(self):
+            # Not a case cuDF catches: the value is handed to every chunk, so a
+            # 512-long array against a 4096-row frame silently became 0..511
+            # repeated eight times. pandas raises, and so must this.
+            raise ValueError(
+                f"Length of values ({length}) does not match length of index "
+                f"({len(self)})"
+            )
         aligned = _from_pandas(
             pd.Series(list(value)), npartitions=self.nchunks
         )
@@ -1947,6 +2002,10 @@ class _Const:
 
     def __init__(self, value):
         self.value = value
+
+
+def _indexes_equal(a, b) -> bool:
+    return len(a) == len(b) and bool((a == b).all())
 
 
 def _set_columns(chunk, names):
