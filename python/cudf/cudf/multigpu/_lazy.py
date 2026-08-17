@@ -234,8 +234,14 @@ class JoinPlan:
     __slots__ = ("left", "right", "kwargs", "runtime")
 
     def __init__(self, left, right, kwargs: dict) -> None:
-        self.left = unwrap_proxy(left)
-        self.right = unwrap_proxy(right)
+        # Snapshot the inputs. pandas' merge is eager, so its result cannot
+        # change when an input is written to afterwards; holding the caller's
+        # frame objects made `out = a.merge(b); a["x"] = -1; out` join the
+        # *mutated* a. _shallow_copy moves no device data, and because chunk
+        # mutation is copy-on-write (see ChunkedDataFrame.__setitem__), a
+        # later write to `a` rebinds a's chunk list and leaves this one alone.
+        self.left = unwrap_proxy(left)._shallow_copy()
+        self.right = unwrap_proxy(right)._shallow_copy()
         self.kwargs = kwargs
         self.runtime = self.left.runtime
 

@@ -815,29 +815,39 @@ def _local_sort(chunk, by, ascending, na_position, is_series):
 # ----------------------------------------------------------------------
 # distinct / index
 # ----------------------------------------------------------------------
-def drop_duplicates(frame, subset=None, keep="first", nparts=None, **kwargs):
-    """Shuffle on the identifying columns, then de-duplicate locally."""
-    runtime = frame.runtime
-    nparts = nparts or max(frame.nchunks, runtime.n_devices)
-    is_series = isinstance(frame, ChunkedSeries)
-    as_frame = frame.to_frame(name="__mg_value") if is_series else frame
-    keys = list(as_frame.columns) if subset is None else _as_list(subset)
-    shuffled = hash_shuffle(as_frame, keys, nparts=nparts)
-    out = shuffled.map_chunks(
-        lambda c: c.drop_duplicates(subset=keys, keep=keep, **kwargs)
-    )
-    if is_series:
-        return out["__mg_value"].rename(frame.name)
-    return out
+def drop_duplicates(
+    frame, subset=None, keep="first", nparts=None, ignore_index=False, **kwargs
+):
+    """Keep the globally first (or last) row of each key, in source order.
+
+    Shuffling is the right way to make the comparison global, but the
+    shuffled frame is in *hash* order: ``keep='first'`` then kept whichever
+    copy landed first inside a chunk, and the survivors came back permuted.
+    ``duplicated`` already tags every row with its global position, resolves
+    ``keep`` against that, and restores the source's order and partitioning --
+    so select with it rather than de-duplicating the shuffled frame.
+    ``nparts`` is accepted and ignored; ``duplicated`` chooses its own shuffle
+    width.
+    """
+    from ._reshape import duplicated
+
+    keys = None if subset is None else _as_list(subset)
+    out = frame[~duplicated(frame, subset=keys, keep=keep)]
+    return out.reset_index(drop=True) if ignore_index else out
 
 
 def set_index(frame: ChunkedDataFrame, keys, nparts: int | None = None, **kwargs):
-    """Repartition by the new index so each key value lives on one GPU."""
-    runtime = frame.runtime
-    nparts = nparts or max(frame.nchunks, runtime.n_devices)
-    key_list = _as_list(keys)
-    shuffled = hash_shuffle(frame, key_list, nparts=nparts)
-    return shuffled.map_chunks(lambda c: c.set_index(keys, **kwargs))
+    """Move ``keys`` into the index, leaving every row where it is.
+
+    Hash-shuffling on the new key co-locates equal keys, which is a useful
+    *placement*, but it is not what ``set_index`` means: pandas keeps the
+    row order, and the shuffled frame came back in hash order, so
+    ``df.set_index('a')`` silently permuted the whole frame.  ``nparts`` is
+    accepted and ignored for call compatibility; ask for co-location
+    explicitly with ``hash_shuffle``/``rechunk`` when a later index-aligned
+    operation needs it.
+    """
+    return frame.map_chunks(lambda c: c.set_index(keys, **kwargs))
 
 
 def quantile(series: ChunkedSeries, q, interpolation: str = "linear"):

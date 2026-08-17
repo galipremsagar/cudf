@@ -293,13 +293,17 @@ def test_dataframe_rename_index_inplace_mutates_and_returns_none():
     check_frame(got, expected, before)
 
 
-def test_series_rename_inplace_mutates_and_returns_none():
+def test_series_rename_inplace_mutates_and_returns_what_pandas_returns():
     got = frame()["b"]
     expected, before = oracle(got)
     assert before.name == "b"
 
-    assert got.rename("renamed", inplace=True) is None
-    expected.rename("renamed", inplace=True)
+    # pandas 3 renames a Series with a scalar through ``Series._set_name``,
+    # which returns the receiver rather than None (the mapper form still
+    # returns None). Ask the oracle rather than hardcoding either answer.
+    got_ret = got.rename("renamed", inplace=True)
+    expected_ret = expected.rename("renamed", inplace=True)
+    assert (got_ret is None) == (expected_ret is None)
 
     # ``Series.equals`` ignores the name, so the explicit check is the one
     # that makes this test non-vacuous; assert_series_equal compares names.
@@ -711,10 +715,20 @@ def test_dataframe_rename_axis_without_inplace_leaves_receiver_alone():
 # ffill / bfill
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("how", ["ffill", "bfill"])
-def test_dataframe_fill_direction_inplace_returns_none(how):
+def test_dataframe_fill_direction_inplace_returns_the_receiver(how):
+    """pandas 3 returns the receiver here, not None.
+
+    ``NDFrame._pad_or_backfill`` ends in ``self._update_inplace(result);
+    return self``, so ``is None`` is the pandas-2 contract. Identity is not
+    assertable through cudf.pandas -- every returned frame is re-wrapped in
+    a fresh proxy -- so compare values instead.
+    """
     got = nan_frame()
 
-    assert getattr(got, how)(inplace=True) is None
+    out = getattr(got, how)(inplace=True)
+
+    assert out is not None
+    pd.testing.assert_frame_equal(out._fsproxy_slow, got._fsproxy_slow)
 
 
 @pytest.mark.parametrize("how", ["ffill", "bfill"])
@@ -729,10 +743,13 @@ def test_dataframe_fill_direction_inplace_mutates(how):
 
 
 @pytest.mark.parametrize("how", ["ffill", "bfill"])
-def test_series_fill_direction_inplace_returns_none(how):
+def test_series_fill_direction_inplace_returns_the_receiver(how):
     got = nan_frame()["b"]
 
-    assert getattr(got, how)(inplace=True) is None
+    out = getattr(got, how)(inplace=True)
+
+    assert out is not None
+    pd.testing.assert_series_equal(out._fsproxy_slow, got._fsproxy_slow)
 
 
 @pytest.mark.parametrize("how", ["ffill", "bfill"])
@@ -760,10 +777,14 @@ def test_dataframe_fill_direction_without_inplace_leaves_receiver_alone(how):
 # ----------------------------------------------------------------------
 # interpolate -- same "adopt the result" contract as ffill/bfill
 # ----------------------------------------------------------------------
-def test_dataframe_interpolate_inplace_returns_none():
+def test_dataframe_interpolate_inplace_returns_the_receiver():
+    """pandas 3's ``interpolate(inplace=True)`` also returns the receiver."""
     got = nan_frame()
 
-    assert got.interpolate(inplace=True) is None
+    out = got.interpolate(inplace=True)
+
+    assert out is not None
+    pd.testing.assert_frame_equal(out._fsproxy_slow, got._fsproxy_slow)
 
 
 def test_dataframe_interpolate_inplace_mutates():

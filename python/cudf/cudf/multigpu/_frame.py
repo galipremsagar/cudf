@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import itertools
+import sys
 import warnings
 from typing import Any, Callable, Hashable, Iterable, Sequence
 
@@ -232,6 +233,17 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
     #: fallback detection with it.
     _plan = None
 
+    #: the schema as of when ``_meta_cache`` was built, plus a re-entrancy
+    #: guard for the reconciliation in ``_sync_columns``
+    _columns_signature = None
+    _syncing_columns = False
+
+    def _note_schema(self) -> None:
+        """Remember the schema just cached. Only frames with columns care."""
+
+    def _sync_columns(self) -> None:
+        """Push an in-place edit of ``.columns`` down to the chunks."""
+
     def __init__(
         self,
         chunks: Sequence[Any] = None,
@@ -284,6 +296,10 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
     def _chunks(self):
         if self._plan is not None:
             self._materialize()
+        # every path to the chunks comes through here, which makes it the one
+        # place that can reconcile an in-place edit of the schema object handed
+        # out by ``.columns`` before any chunk is read
+        self._sync_columns()
         return self._chunks_
 
     @_chunks.setter
@@ -381,6 +397,7 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
                 lambda c: c[:0].to_pandas(),
                 self._chunks[0],
             )
+            self._note_schema()
         return self._meta_cache
 
     # ------------------------------------------------------------------
@@ -549,6 +566,20 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
         )
 
     to_cudf = compute
+
+    def _shallow_copy(self) -> "ChunkedFrame":
+        """A distinct frame over the same chunks.
+
+        Safe now that chunk mutation is copy-on-write: the two frames stop
+        sharing the instant either one is written to, which is exactly
+        pandas' copy-on-write contract for a derived object.
+        """
+        return type(self)(
+            list(self._chunks),
+            list(self._devices),
+            self._runtime,
+            lengths=self._lengths_cache,
+        )
 
     def _adopt(self, other: "ChunkedFrame") -> None:
         """Take over ``other``'s chunks, in place.
@@ -862,7 +893,11 @@ _MAP_METHODS_COMMON = (
 )
 
 _MAP_METHODS_DATAFRAME = (
-    "assign", "drop", "eval", "query", "select_dtypes", "insert", "pop",
+    # insert/pop are deliberately NOT here: they mutate the chunk in place, so
+    # the generated wrapper would return the list of per-chunk return values
+    # and would leave _meta_cache describing the pre-mutation schema. They are
+    # defined explicitly on ChunkedDataFrame instead.
+    "assign", "drop", "eval", "query", "select_dtypes",
     "rename_axis", "add_prefix", "add_suffix", "applymap",
     "hash_values", "interleave_columns",
 )
@@ -1172,37 +1207,128 @@ _INPLACE_CAPABLE = frozenset({
     "mask", "where", "interpolate", "set_axis",
 })
 
+#: ``inplace=True`` returns None across most of pandas, but pandas 3's
+#: ``NDFrame._pad_or_backfill`` and ``NDFrame.interpolate`` both end with
+#: ``self._update_inplace(result); return self``. Returning None for these
+#: would be a silent divergence from the oracle.
+_INPLACE_RETURNS_SELF = frozenset({
+    "ffill", "bfill", "pad", "backfill", "interpolate",
+})
 
-def _honour_inplace(func):
-    """Make ``inplace=True`` mutate the receiver and return None, as pandas does."""
+
+#: pandas' own wording, so the text a user sees is the one they can search for
+_CHAINED_ASSIGNMENT_MSG = (
+    "A value is trying to be set on a copy of a DataFrame or Series through "
+    "chained assignment.\nWhen using the Copy-on-Write mode, such chained "
+    "assignment never works to update the original DataFrame or Series, "
+    "because the intermediate object on which we are setting values always "
+    "behaves as a copy.\n\nTry using '.loc[row_indexer, col_indexer] = value' "
+    "instead, to perform the assignment in a single step.\n"
+)
+
+
+def _names_object(value, obj, nested: bool = True) -> bool:
+    if value is obj:
+        return True
+    try:
+        if value.__dict__.get("_fsproxy_wrapped") is obj:
+            return True
+    except Exception:
+        pass
+    if nested:
+        # a column parked in a dict/list is still a live reference, which is
+        # what pandas' refcount half of the test would have caught
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(_names_object(v, obj, False) for v in value)
+        if isinstance(value, dict):
+            return any(_names_object(v, obj, False) for v in value.values())
+    return False
+
+
+def _warn_if_chained(obj) -> None:
+    """``df["a"][0] = 5`` writes to a copy; say so, as pandas does.
+
+    pandas decides with ``sys.getrefcount(self) <= REF_COUNT and not
+    is_local_in_caller_frame(self)``. The refcount half is useless behind the
+    cudf.pandas proxy: the proxy holds the only reference to this object
+    whether or not the user named the *proxy*. So use the second half alone,
+    walked out to the first frame that is not cudf/pandas machinery -- if
+    nothing there refers to this object, directly or through the proxy that
+    fronts it, the receiver is an unnamed temporary and the write is landing
+    on a copy that is about to be discarded.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if not (module.startswith("cudf") or module.startswith("pandas")):
+            break
+        frame = frame.f_back
+    if frame is None:
+        return
+    if any(_names_object(v, obj) for v in frame.f_locals.values()):
+        return
+    warnings.warn(
+        _CHAINED_ASSIGNMENT_MSG,
+        pd.errors.ChainedAssignmentError,
+        stacklevel=3,
+    )
+
+
+def _plain_setitem(obj, key, value):
+    obj[key] = value
+    return obj
+
+
+def _honour_inplace(func, name: str):
+    """Make ``inplace=True`` mutate the receiver, as pandas does."""
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         inplace = kwargs.pop("inplace", False)
+        if inplace:
+            # df["a"].fillna(0, inplace=True) mutates a temporary column
+            _warn_if_chained(self)
         result = func(self, *args, **kwargs)
         if not inplace:
             return result
         if isinstance(result, ChunkedFrame) and type(result) is type(self):
             self._adopt(result)
-            return None
-        # a shape the receiver cannot adopt (e.g. drop(columns=...) on a
-        # Series): fall back to returning it rather than silently doing nothing
+            return self if name in _INPLACE_RETURNS_SELF else None
+        if isinstance(result, ChunkedFrame):
+            # A shape the receiver cannot adopt: ``Series.reset_index()``
+            # without ``drop=`` builds a DataFrame. pandas raises here, and
+            # handing the new object back instead would make the write look
+            # like it landed when nothing changed.
+            raise TypeError(
+                f"cannot {name} inplace on a {type(self).__name__} to "
+                f"create a {type(result).__name__}"
+            )
         return result
 
+    wrapper._mgpu_inplace = True
     return wrapper
 
 
 def _install_inplace_support(*classes) -> None:
     for klass in classes:
         for name in _INPLACE_CAPABLE:
-            member = vars(klass).get(name)
+            # Search the MRO, not just ``vars(klass)``: ffill/bfill/pad/
+            # backfill live on _ReductionMixin and reset_index/interpolate
+            # on _ChunkedCommon, so an own-dict-only scan skipped all six.
+            # The unwrapped method then took ``inplace=True`` in **kwargs
+            # and forwarded it into the per-chunk cuDF call, which mutates
+            # the chunk and returns None -- breaking the distributed
+            # implementation and leaving cudf.pandas to fall back to host
+            # pandas on chunks that had already been mutated.
+            member = next(
+                (vars(k)[name] for k in klass.__mro__ if name in vars(k)),
+                None,
+            )
             if member is None or getattr(member, "_mgpu_inplace", False):
                 continue
             if not callable(member):
                 continue
-            wrapped = _honour_inplace(member)
-            wrapped._mgpu_inplace = True
-            setattr(klass, name, wrapped)
+            setattr(klass, name, _honour_inplace(member, name))
 
 
 def _make_map_method(name: str):
@@ -1295,12 +1421,17 @@ class _ChunkedCommon(ChunkedFrame, _ReductionMixin, _FallbackMixin):
 
     @property
     def index(self):
-        return ChunkedIndex(
+        index = ChunkedIndex(
             self._run_chunks(lambda c: c.index),
             self._devices,
             self._runtime,
             lengths=self._lengths_cache,
         )
+        # The chunks above are the frames' own cuDF index objects, so renaming
+        # them renames this frame's index too -- but this frame's cached schema
+        # would not know. Hand the index a way back to say so.
+        index._owner = self
+        return index
 
     @property
     def values_host(self):
@@ -1596,6 +1727,21 @@ class _ILocIndexer:
                 cols, int) else out[list(out.columns)[cols]]
         return out
 
+    def __setitem__(self, key, value):
+        # Positions are global, so this cannot run per chunk: gather, let cuDF
+        # do it, and put the result back -- compute() returns a fresh copy, so
+        # without _absorb the write is dropped. Previously undefined, which
+        # sent the whole call to pandas and lost the write with no warning.
+        frame = self._frame
+        _warn_if_chained(frame)
+        device = frame._devices[0]
+        frame._absorb(
+            frame._runtime.run(
+                device, _indexer_set, frame.compute(device), "iloc", key, value
+            ),
+            device,
+        )
+
 
 class _DataFrameILocIndexer(_ILocIndexer):
     pass
@@ -1626,7 +1772,9 @@ class _LocIndexer:
                     "loc row slicing by label is not supported on a "
                     "row-partitioned frame; use .iloc with positions"
                 )
-            result = frame
+            # pandas' df.loc[:] is a *new* object; returning the receiver made
+            # `view = df.loc[:]; view["a"] = -1` write straight into df.
+            result = frame._shallow_copy()
         elif isinstance(rows, ChunkedSeries):
             result = frame._map_method("__getitem__", rows)
         else:
@@ -1758,9 +1906,67 @@ class ChunkedDataFrame(_ChunkedCommon):
 
     @columns.setter
     def columns(self, value) -> None:
-        names = list(value)
-        self._run_chunks(_set_columns, _Const(names))
+        # ``list(value)`` kept the labels and dropped everything else an Index
+        # carries -- so ``df.columns = pd.Index([...], name="cols")`` renamed
+        # the columns and silently lost the name. cuDF takes the Index itself
+        # and keeps it, so only shapes that are not already sized (generators)
+        # need flattening, and a chunked value has to come to the host first.
+        if isinstance(value, ChunkedFrame):
+            value = value.to_pandas()
+        elif not hasattr(value, "__len__"):
+            value = list(value)
+        self._chunks = self._run_chunks(_set_columns, _Const(value))
         self._meta_cache = None
+
+    def _note_schema(self) -> None:
+        self._columns_signature = _schema_signature(self._meta_cache.columns)
+
+    def _sync_columns(self) -> None:
+        """Push an in-place edit of the Index ``.columns`` handed out.
+
+        ``.columns`` returns the meta frame's own Index, exactly as pandas
+        returns the Index it stores, so ``df.columns.name = "cols"`` and
+        ``df.columns.values[0] = "renamed"`` are ordinary pandas idioms that
+        mutate that object. They used to reach the cached schema only: the
+        chunks kept the old names and the next to_pandas() undid the edit.
+        """
+        signature = self._columns_signature
+        if (
+            signature is None
+            or self._syncing_columns
+            or self._meta_cache is None
+        ):
+            return
+        columns = self._meta_cache.columns
+        current = _schema_signature(columns)
+        if current == signature:
+            return
+        self._columns_signature = current
+        self._syncing_columns = True
+        try:
+            # assign back: _set_columns is copy-on-write, so the renamed chunks
+            # are new objects. Write to ``_chunks_`` rather than ``_chunks``:
+            # this runs *inside* the ``_chunks`` getter.
+            self._chunks_ = self._run_chunks(_set_columns, _Const(columns))
+        finally:
+            self._syncing_columns = False
+
+    def astype(self, dtype, *args, **kwargs):
+        if _is_bare_categorical(dtype):
+            dtype = {
+                col: _global_categorical_dtype(self[col])
+                for col in self.columns
+            }
+        elif isinstance(dtype, dict):
+            dtype = {
+                col: (
+                    _global_categorical_dtype(self[col])
+                    if _is_bare_categorical(want)
+                    else want
+                )
+                for col, want in dtype.items()
+            }
+        return self._map_method("astype", dtype, *args, **kwargs)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -1809,7 +2015,11 @@ class ChunkedDataFrame(_ChunkedCommon):
             self._check_index_alignable(value)
             if not self._aligned_with(value):
                 value = value.repartition_like(self)
-        self._run_chunks(_setitem, value if isinstance(value, ChunkedFrame) else _Const(value), key)
+        self._chunks = self._run_chunks(
+            _setitem,
+            value if isinstance(value, ChunkedFrame) else _Const(value),
+            key,
+        )
         self._meta_cache = None
 
     def _check_index_alignable(self, value) -> None:
@@ -1886,14 +2096,83 @@ class ChunkedDataFrame(_ChunkedCommon):
                 f"Length of values ({length}) does not match length of index "
                 f"({len(self)})"
             )
-        aligned = _from_pandas(
-            pd.Series(list(value)), npartitions=self.nchunks
-        )
+        # ``list(value)`` reduced the value to Python objects and threw its
+        # dtype away: a pandas nullable Int64 array came back as plain int64
+        # and a Categorical as strings. cuDF stores both dtypes natively, so
+        # hand pandas the array itself. ``.array`` on a Series/Index drops its
+        # labels, keeping the positional alignment this function has always
+        # used.
+        if isinstance(value, (pd.Series, pd.Index)):
+            value = value.array
+        if not isinstance(value, np.ndarray) and hasattr(
+            value, "__cuda_array_interface__"
+        ):
+            # A device array (cupy, numba): iterating it yields 0-d *device*
+            # scalars, which pandas boxes as object and cuDF then rejects with
+            # MixedTypeError. Copy the buffer to host with its dtype and shape
+            # intact instead. (It is re-uploaded per chunk below; the chunks
+            # live on eight devices, so some transfer is unavoidable here.)
+            try:
+                import cupy
+
+                value = cupy.asnumpy(value)
+            except ImportError:
+                value = np.asarray(value)
+        if getattr(value, "ndim", 1) > 1:
+            # df[["c", "d"]] = <n x 2 array> means one value per *cell*, not
+            # one array per row. Going through list() builds an object Series
+            # of rows, which gives both keys object dtype and hides a width
+            # mismatch that pandas (and cuDF, per chunk) raise on.
+            host = pd.DataFrame(np.asarray(value))
+        elif hasattr(value, "dtype"):
+            # ndarray / ExtensionArray: keep the declared dtype rather than
+            # reboxing element by element and re-inferring it.
+            host = pd.Series(value)
+        else:
+            host = pd.Series(list(value))
+        aligned = _from_pandas(host, npartitions=self.nchunks)
         return aligned.repartition_like(self)
 
     def __delitem__(self, key):
-        self._run_chunks(lambda c: c.__delitem__(key))
+        self._chunks = self._run_chunks(_delitem, _Const(key))
         self._meta_cache = None
+
+    def insert(self, loc, column, value, allow_duplicates=False):
+        """Insert a column in place and return None, exactly as pandas does.
+
+        Run through ``_make_map_method`` this returned the list of per-chunk
+        return values (``[None] * nchunks``) and left ``_meta_cache`` holding
+        the pre-insert schema, so ``df.columns``/``.shape`` did not see the new
+        column. The value also has to be partitioned like the frame first, or
+        every 512-row chunk is handed the whole 4096-element column and cuDF
+        rejects it with "All columns must be of equal length".
+        """
+        if self._plan is not None:
+            self._materialize()
+        value = self._align_assigned_value(value)
+        if isinstance(value, ChunkedFrame):
+            self._check_index_alignable(value)
+            if not self._aligned_with(value):
+                value = value.repartition_like(self)
+        self._chunks = self._run_chunks(
+            _insert,
+            value if isinstance(value, ChunkedFrame) else _Const(value),
+            _Const((loc, column, allow_duplicates)),
+        )
+        self._meta_cache = None
+        return None
+
+    def pop(self, item):
+        """Remove a column from every chunk and return it.
+
+        cuDF's ``pop`` mutates the chunk in place, so routing it through
+        ``_map_method`` both bypassed copy-on-write and left the frame's cached
+        schema describing the popped column. Read then delete instead --
+        ``__delitem__`` is already copy-on-write and drops the cache.
+        """
+        taken = self._map_method("__getitem__", item)
+        del self[item]
+        return taken
 
     def __contains__(self, key) -> bool:
         return key in self._meta.columns
@@ -2008,13 +2287,78 @@ def _indexes_equal(a, b) -> bool:
     return len(a) == len(b) and bool((a == b).all())
 
 
+def _detached(chunk):
+    """A chunk that can be mutated without touching frames that share it.
+
+    cuDF builds a derived frame's ColumnAccessor over the *same* backing dict
+    as its source's (``reset_index(drop=True)`` is the case that bites here),
+    and ``concat``/``loc[:]`` hand back the very same chunk objects, so
+    replacing a column in one replaces it in the other. ``copy(deep=False)``
+    gives a fresh DataFrame and a fresh accessor over the same device
+    buffers: no data is copied.
+    """
+    return chunk.copy(deep=False)
+
+
+def _is_bare_categorical(dtype) -> bool:
+    """``"category"`` with no categories spelled out."""
+    if isinstance(dtype, str):
+        return dtype == "category"
+    if isinstance(dtype, (pd.CategoricalDtype, cudf.CategoricalDtype)):
+        return dtype.categories is None
+    return False
+
+
+def _global_categorical_dtype(series, ordered: bool = False):
+    """The dtype ``astype("category")`` means for a *whole* chunked column.
+
+    Cast chunk by chunk and each GPU builds its categories out of the values it
+    happens to hold, so the chunks end up with as many different dtypes as
+    there are GPUs and putting them back together drops the categorical
+    entirely. The categories belong to the column, so compute them once over
+    every chunk. As with ``.unique()``, the distinct values must fit on one GPU.
+    """
+    categories = pd.Series(series.unique().to_pandas()).dropna().sort_values()
+    return pd.CategoricalDtype(pd.Index(categories), ordered=ordered)
+
+
+def _schema_signature(columns):
+    """What ``.columns`` looked like when the schema was cached."""
+    return (tuple(columns), columns.name, tuple(columns.names))
+
+
+def _set_index_name(chunk, name):
+    chunk.name = name.value if isinstance(name, _Const) else name
+    return chunk
+
+
 def _set_columns(chunk, names):
+    chunk = _detached(chunk)
     chunk.columns = names.value if isinstance(names, _Const) else names
     return chunk
 
 
 def _setitem(chunk, value, key):
+    chunk = _detached(chunk)
     chunk[key] = value.value if isinstance(value, _Const) else value
+    return chunk
+
+
+def _delitem(chunk, key):
+    chunk = _detached(chunk)
+    del chunk[key.value if isinstance(key, _Const) else key]
+    return chunk
+
+
+def _insert(chunk, value, spec):
+    loc, column, allow_duplicates = spec.value
+    chunk = _detached(chunk)
+    chunk.insert(
+        loc,
+        column,
+        value.value if isinstance(value, _Const) else value,
+        allow_duplicates=allow_duplicates,
+    )
     return chunk
 
 
@@ -2034,6 +2378,31 @@ class ChunkedSeries(_ChunkedCommon):
     @property
     def name(self):
         return self._meta.name
+
+    def astype(self, dtype, *args, **kwargs):
+        if _is_bare_categorical(dtype):
+            dtype = _global_categorical_dtype(
+                self, ordered=bool(getattr(dtype, "ordered", False))
+            )
+        return self._map_method("astype", dtype, *args, **kwargs)
+
+    def rename(self, index=None, *args, inplace=False, **kwargs):
+        """pandas returns *the series* from ``rename(scalar, inplace=True)``.
+
+        Renaming a Series with a scalar is ``Series._set_name``, which hands
+        the object back even when inplace -- unlike DataFrame.rename and the
+        mapper form, which return None. The generic ``_honour_inplace``
+        wrapper answers None for everything, so this one needs its own answer.
+        """
+        renamed = self._map_method("rename", index, *args, **kwargs)
+        if not inplace:
+            return renamed
+        self._adopt(renamed)
+        if callable(index) or pd.api.types.is_dict_like(index):
+            return None
+        return self
+
+    rename._mgpu_inplace = True
 
     @property
     def dtype(self):
@@ -2069,6 +2438,22 @@ class ChunkedSeries(_ChunkedCommon):
             start, stop, step = key.indices(len(self))
             return self._global_iloc(start, stop, step)
         return self._map_method("__getitem__", key)
+
+    def __setitem__(self, key, value):
+        """Label/position write, addressed globally.
+
+        Undefined here, cudf.pandas had no fast ``__setitem__`` to call and
+        fell back to pandas, so the write landed on a host copy that was then
+        discarded -- and a chained write did so without pandas' warning.
+        """
+        _warn_if_chained(self)
+        device = self._devices[0]
+        self._absorb(
+            self._runtime.run(
+                device, _plain_setitem, self.compute(device), key, value
+            ),
+            device,
+        )
 
     # -- distinct ----------------------------------------------------
     def unique(self):
@@ -2337,6 +2722,52 @@ class ChunkedIndex(_ChunkedCommon):
     @property
     def name(self):
         return self._meta.name
+
+    @name.setter
+    def name(self, value) -> None:
+        self._set_names_inplace([value])
+
+    @property
+    def names(self):
+        return self._meta.names
+
+    @names.setter
+    def names(self, value) -> None:
+        self._set_names_inplace(value)
+
+    def _set_names_inplace(self, names) -> None:
+        """Rename this index on every chunk, in place.
+
+        ``frame.index`` hands back the chunks' own cuDF index objects, and a
+        cuDF index -- like a pandas one -- is the object its frame holds, so
+        setting the name on it renames the frame's index too. Without a setter
+        here ``df.index.name = "ix"`` raised (cudf.pandas assigns onto the fast
+        object) and ``df.index.names = [...]`` silently landed in this object's
+        __dict__.
+        """
+        names = list(names)
+        if len(names) != 1:
+            raise ValueError(f"Length of new names must be 1, got {len(names)}")
+        self._run_chunks(_set_index_name, _Const(names[0]))
+        self._meta_cache = None
+        owner = self.__dict__.get("_owner")
+        if owner is not None:
+            owner._meta_cache = None
+
+    def rename(self, name, inplace=False):
+        """``inplace=True`` has to reach the frame this index came from.
+
+        The generic fallback gathered the index onto one GPU, renamed the copy
+        and re-absorbed it, which swapped *this* object's chunks for new ones;
+        the frame that handed the index out kept the old name.
+        """
+        if inplace:
+            self._set_names_inplace([name])
+            return None
+        return self.map_chunks(lambda c: c.rename(name))
+
+    # keeps _honour_inplace from re-wrapping this and swallowing `inplace`
+    rename._mgpu_inplace = True
 
     @property
     def dtype(self):

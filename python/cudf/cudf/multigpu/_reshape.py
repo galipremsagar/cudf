@@ -251,6 +251,7 @@ def interpolate(frame: ChunkedFrame, method: str = "linear", **kwargs):
         previous_pos,
         next_value,
         next_pos,
+        frame,
         name=frame.name,
     )
 
@@ -261,7 +262,7 @@ def _mark_valid(chunk):
     return out
 
 
-def _interpolate_between(chunk, prev_v, prev_p, next_v, next_p, name):
+def _interpolate_between(chunk, prev_v, prev_p, next_v, next_p, original, name):
     position = chunk[_POSITION].astype("float64")
     prev_p = prev_p.astype("float64")
     next_p = next_p.astype("float64")
@@ -272,7 +273,12 @@ def _interpolate_between(chunk, prev_v, prev_p, next_v, next_p, name):
     # trailing nulls take the last valid value.
     interpolated = interpolated.fillna(prev_v)
     result = chunk["__mg_value"].fillna(interpolated)
-    result.index = chunk.index
+    # ``chunk`` came out of _with_positions, which reset each chunk's index
+    # to 0..n-1; stamping that on the answer numbers every chunk from zero.
+    # The DataFrame branch then assigns this Series back into the frame and
+    # cuDF aligns on the index, so every chunk but the first becomes null.
+    # Carry the source's index instead.
+    result.index = original.index
     return result.rename(name)
 
 
