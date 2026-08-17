@@ -99,19 +99,151 @@ roughly 3× (TPC-H SF500: 108 s → 320 s), so it is the fallback, not the defau
 
 ### 3.3 Moving data between devices
 
-`_transfer.py` uses cuDF's own `device_serialize` protocol, which yields a host
-header plus a flat list of device buffers covering data, null masks and nested
-children. That gives exact round-trip fidelity for every dtype — strings,
-categoricals, decimals, lists, structs — without reimplementing any of it.
+This is the part of the system that does not exist in single-GPU cuDF, so it is
+worth describing exactly.
 
-Buffers are packed into **one** destination allocation, so a transfer costs one
-allocation plus a batch of async copies rather than one allocation per buffer.
+#### What a transfer copies
 
-> **Peer access is deliberately never enabled.** On this machine
-> `cudaDeviceEnablePeerAccess` is advertised and silently returns **zeros**.
-> The driver's staged path is correct and reaches full PCIe bandwidth.
-> `validate_peer_copies()` checks this at startup. Managed allocations are
-> staged through host memory for the same reason.
+Nothing walks the column structure by hand. A move uses cuDF's own
+`device_serialize` protocol, which returns a **host-side header** plus a flat
+list of frames — some device buffers, some host bytes:
+
+```
+  cudf.DataFrame                 header  {"is-cuda": [1,1,0,1,…], dtypes, …}
+    ├── column "a" data     ──►  frame 0  device buffer   3,145,728 B
+    ├── column "a" mask     ──►  frame 1  device buffer     393,216 B
+    ├── column "b" offsets  ──►  frame 2  device buffer   3,145,732 B
+    ├── column "b" chars    ──►  frame 3  device buffer  18,204,113 B
+    └── index               ──►  frame 4  device buffer   3,145,728 B
+```
+
+The header is ordinary Python objects; the frames are opaque byte ranges. That
+means strings, categoricals, decimals, datetimes, lists and structs all move
+with exact fidelity, because cuDF describes its own layout and this code never
+has to know what a frame means — only how many bytes it is. Nested and
+dictionary children appear in the same flat list.
+
+#### The three phases
+
+A move is not "copy the bytes". It is three pieces of work on **two different
+device threads**:
+
+```
+   source thread (GPU 2)                    destination thread (GPU 5)
+   ─────────────────────                    ──────────────────────────
+   1. _extract
+      device_serialize(obj)   ──► header + [(ptr, nbytes), …]
+      cudaDeviceSynchronize()      ← producing kernels may still be in flight
+                                   │
+                                   ▼
+                                        2. _receive
+                                           one DeviceBuffer for the whole payload
+                                           copy each frame into its slot
+                                           cudaStreamSynchronize(0)
+                                           device_deserialize(header, views)
+                                   │
+   3. _release  ◄──────────────────┘
+      drop the serialization view
+      on the device that owns it
+```
+
+Three details each fix a real failure:
+
+- **The source synchronizes before the copy.** The work that produced the frame
+  may still be queued on that device's stream; copying from it early reads
+  memory that is not written yet.
+- **The release runs on the source device**, not wherever the Python happens to
+  be. Freeing a buffer from the wrong device returns it to the wrong pool.
+- **The destination allocates once.** All device frames are packed back-to-back
+  into a single `DeviceBuffer`, 256-byte aligned:
+
+  ```
+  base ┌──────────┬─┬──────────┬────────────────────┬──────────┐
+       │ frame 0  │▓│ frame 2  │      frame 3       │ frame 4  │
+       └──────────┴─┴──────────┴────────────────────┴──────────┘
+         ▓ = alignment padding
+  ```
+
+  So a transfer costs **one allocation and a batch of copies**, not one
+  allocation per buffer. Each frame is then handed back to
+  `device_deserialize` as a `_BufferView` — a window onto the base allocation
+  exposed through `__cuda_array_interface__`, holding a reference so the base
+  outlives it.
+
+  Two edge cases live here. A zero-length frame must present a **null** pointer,
+  because cuDF emits such frames for the data buffer of compound (list/struct)
+  parent columns and libcudf rejects a compound column whose data pointer is
+  non-null. And the keepalive attribute is deliberately *not* called `owner`:
+  cuDF's `get_buffer_owner` walks an `owner` chain, and this must look like
+  fresh device memory rather than a view into someone else's buffer.
+
+#### The copy itself
+
+```python
+if neither pointer is managed:
+    cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, 0)
+else:
+    cudaMemcpy(host_staging, src, n, DeviceToHost)
+    cudaMemcpy(dst, host_staging, n, HostToDevice)
+```
+
+`cudaMemcpyDefault` lets the driver work out the direction from the pointers,
+which is what makes a device-to-device copy across GPUs a single call.
+
+**Managed allocations are staged through host memory.** A direct
+managed-to-managed copy is silently wrong on hardware where P2P is advertised
+but not functional — it yields zeros — and a managed pointer is not owned by
+any device, so the peer-copy API cannot express the intent either.
+
+> **Peer access is never enabled.** `cudaDeviceEnablePeerAccess` succeeds on
+> this machine and then silently returns **zeros** for cross-device reads. The
+> driver's staged path is correct and reaches full PCIe bandwidth, so there is
+> nothing to gain by risking it. `validate_peer_copies()` writes a known
+> pattern, reads it back from another device and refuses to start if it does
+> not match — a corruption this quiet is worth paying a startup check to catch.
+
+#### Batching: why an all-to-all is not N² separate moves
+
+`move_batch` takes a whole list of `(obj, src, dst)` and runs each phase
+**concurrently across devices**: every source serializes at once, then every
+destination receives at once, then every source releases at once. Same-device
+moves are recognised and skipped entirely rather than copied.
+
+This is what makes a shuffle a parallel exchange rather than a sequence of
+pairwise transfers — during phase 2 all eight PCIe links are busy.
+
+Two specialisations sit on top:
+
+- **`broadcast`** serializes the source **once** and hands the same header and
+  pointers to every destination, so replicating to seven GPUs costs one
+  serialization and seven receives. This is what a broadcast join uses.
+- **`gather_concat`** moves every chunk to one device and concatenates — the
+  "collapse to a single GPU" path used by `.compute()` and the fallback. The
+  result must of course fit there.
+
+#### Streaming the exchange
+
+A shuffle does not move everything at once. Moving all partitions
+simultaneously means the hash partitions, the serialization views of them, the
+destination buffers **and** the concatenated result are all live at the same
+time — roughly **four times the frame**, which is precisely what made the widest
+joins fail at SF300.
+
+So the exchange runs a group of destinations at a time, as wide as the number of
+distinct destination devices — normally all of them:
+
+```
+  group 1 → GPUs 0..7   move ──► concat ──► release sources
+  group 2 → GPUs 0..7   move ──► concat ──► release sources
+  group 3 → …
+```
+
+Every GPU stays busy within a group, but only one group's worth is in flight,
+and each group's source partitions are freed — on their own device — before the
+next group allocates. Empty partitions are skipped without a transfer at all.
+
+Whether to split beyond one partition per device is the memory-pressure
+decision in §4.5.
 
 ---
 
