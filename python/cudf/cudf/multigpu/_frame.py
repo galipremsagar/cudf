@@ -430,6 +430,30 @@ class ChunkedFrame(metaclass=_ChunkedMeta):
 
         return self._run_chunks(_shim, *others)
 
+    def to_numpy(self, *args, **kwargs):
+        """Host copy of the values, read-only as pandas returns it.
+
+        The array cannot be a view: the data lives in device memory on several
+        GPUs, so a write into it could never reach the frame. pandas marks such
+        an export non-writeable precisely so that write fails loudly instead of
+        being silently discarded, and this does the same.
+
+        Goes through the host rather than gathering onto one GPU first, so it
+        does not require the frame to fit on a single device.
+        """
+        import numpy as _np
+
+        host = self.to_pandas()
+        array = _np.asarray(host.to_numpy(*args, **kwargs))
+        if array.base is not None or not array.flags.owndata:
+            array = array.copy()
+        array.flags.writeable = False
+        return array
+
+    @property
+    def values(self):
+        return self.to_numpy()
+
     def __reduce__(self):
         """Pickle through host memory.
 

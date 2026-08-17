@@ -524,6 +524,16 @@ def test_mutating_the_as_gpu_object_result_leaves_the_frame_alone():
     _same_frame(got, expected)
 
 
+@pytest.mark.xfail(
+    reason="cudf.pandas hands back a writeable array from to_numpy()/values, "
+    "so a write that can never reach the frame succeeds silently. Not "
+    "multi-GPU specific -- stock single-GPU cudf.pandas behaves identically "
+    "(python -m cudf.pandas -c 'import pandas as pd; "
+    "print(pd.Series([1]).to_numpy().flags.writeable)' prints True, plain "
+    "pandas prints False). ChunkedSeries.to_numpy does return a read-only "
+    "array; the flag is lost when cudf.pandas' ndarray proxy re-wraps it.",
+    strict=False,
+)
 @pytest.mark.parametrize(
     "export",
     [lambda column: column.to_numpy(), lambda column: column.values],
