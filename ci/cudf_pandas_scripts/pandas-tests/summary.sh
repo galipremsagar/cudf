@@ -32,8 +32,8 @@ if ! rapids-pip-retry install pandas tabulate; then
     exit 0
 fi
 
-# Download each shard's partial results from the current run. A shard that
-# crashed before uploading is tolerated (its results are simply omitted).
+# Download each shard's partial results from the current run. Every shard
+# must be present for the merged total to mean anything; see the check below.
 for ((shard = 0; shard < NUM_SHARDS; shard++)); do
     if ! gh run download "${GITHUB_RUN_ID}" \
         --repo "${GITHUB_REPOSITORY}" \
@@ -45,8 +45,12 @@ done
 
 shopt -s nullglob
 SHARD_RESULTS=(shard-*/pr-results.json)
-if [[ ${#SHARD_RESULTS[@]} -eq 0 ]]; then
-    rapids-logger "No shard results were downloaded; nothing to summarize."
+if [[ ${#SHARD_RESULTS[@]} -ne ${NUM_SHARDS} ]]; then
+    # A shard that fails never reaches its upload step, so its results are
+    # simply absent. Summarizing anyway would diff part of this PR's suite
+    # against the whole nightly baseline and report every test in the missing
+    # shard as removed, which is worse than printing nothing at all.
+    rapids-logger "Only ${#SHARD_RESULTS[@]} of ${NUM_SHARDS} shard results are available; skipping the summary rather than reporting a partial diff."
     exit 0
 fi
 
@@ -62,7 +66,7 @@ MAIN_RUN_ID=$(
     gh run list                       \
         -w "Pandas Test Job"          \
         -b "$(<./RAPIDS_BRANCH)"      \
-        --repo 'rapidsai/cudf'        \
+        --repo 'NVIDIA/cudf'        \
         --status success              \
         --limit 7                     \
         --json 'createdAt,databaseId' \
@@ -76,7 +80,7 @@ fi
 
 rapids-logger "Fetching latest available results from nightly: ${MAIN_RUN_ID}"
 if ! gh run download                  \
-    --repo 'rapidsai/cudf'        \
+    --repo 'NVIDIA/cudf'        \
     --name main-results.json \
     "${MAIN_RUN_ID}"; then
     rapids-logger "Could not download nightly results; skipping diff."

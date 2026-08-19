@@ -5548,17 +5548,28 @@ def pytest_configure(config):
         "comparison for tests with small GPU-vs-CPU floating-point drift.",
     )
 
+    # Validate the sharding options before collection rather than during it.
+    # A misconfigured CI matrix should fail in seconds instead of after
+    # collecting the whole pandas suite, and raising here gives a clean usage
+    # error rather than a pytest INTERNALERROR.
+    num_shards = config.getoption("num_shards")
+    shard_id = config.getoption("shard_id")
+    if num_shards < 1:
+        raise pytest.UsageError(
+            f"--num-shards ({num_shards}) must be at least 1"
+        )
+    if not 0 <= shard_id < num_shards:
+        raise pytest.UsageError(
+            f"--shard-id ({shard_id}) must be in "
+            f"[0, --num-shards ({num_shards}))"
+        )
+
 
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(session, config, items):
     num_shards = config.getoption("num_shards")
     if num_shards > 1:
         shard_id = config.getoption("shard_id")
-        if shard_id >= num_shards:
-            raise ValueError(
-                f"--shard-id ({shard_id}) must be less than "
-                f"--num-shards ({num_shards})"
-            )
         # Keep only this shard's items before applying skip/xfail markers so
         # the markers are only attached to the tests this shard will run.
         items[:] = filter_items_by_shard(items, shard_id, num_shards)
