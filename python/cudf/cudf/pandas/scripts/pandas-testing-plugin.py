@@ -56,9 +56,11 @@ def partition_items_by_shard(items, shard_id, num_shards):
     """
     selected, deselected = [], []
     for item in items:
-        target = selected if (
-            _sha256_hash(item.nodeid) % num_shards == shard_id
-        ) else deselected
+        target = (
+            selected
+            if (_sha256_hash(item.nodeid) % num_shards == shard_id)
+            else deselected
+        )
         target.append(item)
     return selected, deselected
 
@@ -5605,9 +5607,11 @@ def pytest_collection_modifyitems(session, config, items):
             item.add_marker(pytest.mark.tolerant_index_compare)
         if (reason := NODEIDS_TO_SKIP.get(item.nodeid, None)) is not None:
             item.add_marker(pytest.mark.skip(reason=reason))
-        elif sharded and (
-            reason := NODEIDS_TO_SKIP_WHEN_SHARDED.get(item.nodeid, None)
-        ) is not None:
+        elif (
+            sharded
+            and (reason := NODEIDS_TO_SKIP_WHEN_SHARDED.get(item.nodeid, None))
+            is not None
+        ):
             item.add_marker(pytest.mark.skip(reason=reason))
         elif (
             reason := next(
