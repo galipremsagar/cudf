@@ -47,18 +47,20 @@ def _sha256_hash(value: str) -> int:
     return int.from_bytes(hashlib.sha256(value.encode()).digest(), "little")
 
 
-def filter_items_by_shard(items, shard_id, num_shards):
-    """Return the subset of ``items`` assigned to ``shard_id``.
+def partition_items_by_shard(items, shard_id, num_shards):
+    """Split ``items`` into those assigned to ``shard_id`` and the rest.
 
     Assignment is by a stable hash of each item's node id, so every pytest
     worker (and every shard) partitions the suite identically and the shards
     are disjoint and collectively exhaustive.
     """
-    return [
-        item
-        for item in items
-        if _sha256_hash(item.nodeid) % num_shards == shard_id
-    ]
+    selected, deselected = [], []
+    for item in items:
+        target = selected if (
+            _sha256_hash(item.nodeid) % num_shards == shard_id
+        ) else deselected
+        target.append(item)
+    return selected, deselected
 
 
 def pytest_report_collectionfinish(config, items):
@@ -4177,33 +4179,6 @@ NODEIDS_TO_SKIP: dict[str, str] = {
     "tests/extension/test_string.py::TestStringArray::test_memory_usage[string=string[pyarrow]-False]": "GPU/CPU memory_usage differs from sys.getsizeof",
     "tests/extension/test_string.py::TestStringArray::test_memory_usage[string=string[pyarrow]-True]": "GPU/CPU memory_usage differs from sys.getsizeof",
     "tests/extension/test_string.py::TestStringArray::test_memory_usage[string=string[python]-False]": "GPU/CPU memory_usage differs from sys.getsizeof",
-    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_datetime_frame[D]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_datetime_frame[W]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_datetime_frame[s]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_inferred_freq[ME]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[bool-dtype-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[categorical-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[datetime-tz-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int16-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int32-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int64-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int8-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[interval-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[multi-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_bool-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_float-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_int-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_uint-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[range-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[repeats-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[string-pyarrow-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[string-python-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[string-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[uint16-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[uint32-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[uint8-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_find_replace.py::test_pyarrow_ambiguous_group_references[pyarrow_string_dtype0-(\\\\w+) (\\\\w+) (\\\\w+)-\\\\20]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
-    "tests/strings/test_find_replace.py::test_pyarrow_backend_group_replacement[\\\\[(\\\\d+)\\\\]-(\\\\1)-expected_list1]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
     "tests/test_downstream.py::test_construct_dask_float_array_int_dtype_match_ndarray": "Flaky under xdist due cross-test state interaction with dask",
     "tests/extension/test_string.py::TestStringArray::test_memory_usage[string=string[python]-True]": "GPU/CPU memory_usage differs from sys.getsizeof",
     "tests/extension/test_string.py::TestStringArray::test_series_constructor[string=str[pyarrow]-False]": "Asserts private APIs",
@@ -5292,6 +5267,41 @@ NODEIDS_TO_SKIP: dict[str, str] = {
     "tests/window/moments/test_moments_consistency_rolling.py::test_rolling_apply_consistency_sum[all_data6-rolling_consistency_cases0-False-sum]": "pandas xfails, but xpasses with cudf.pandas",
     "tests/window/moments/test_moments_consistency_rolling.py::test_rolling_apply_consistency_sum[all_data6-rolling_consistency_cases0-True-sum]": "pandas xfails, but xpasses with cudf.pandas",
     "tests/window/moments/test_moments_consistency_rolling.py::test_rolling_apply_consistency_sum[all_data7-rolling_consistency_cases0-False-sum]": "pandas xfails, but xpasses with cudf.pandas",
+}
+
+#: Tests that only fail when the suite is split across shards. Sharding
+#: changes the order tests run in, and cudf.pandas has order-dependent
+#: behaviour these expose. They are applied ONLY to sharded runs so the
+#: unsharded nightly and local runs keep exercising them -- skipping them
+#: everywhere would quietly drop the coverage instead of narrowing it.
+NODEIDS_TO_SKIP_WHEN_SHARDED: dict[str, str] = {
+    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_datetime_frame[D]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_datetime_frame[W]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_datetime_frame[s]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/plotting/test_datetimelike.py::TestTSPlot::test_line_plot_inferred_freq[ME]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[bool-dtype-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[categorical-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[datetime-tz-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int16-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int32-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int64-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[int8-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[interval-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[multi-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_bool-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_float-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_int-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[nullable_uint-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[range-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[repeats-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[string-pyarrow-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[string-python-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[string-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[uint16-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[uint32-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_extract.py::test_extract_dataframe_capture_groups_index[uint8-string=object]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_find_replace.py::test_pyarrow_ambiguous_group_references[pyarrow_string_dtype0-(\\\\w+) (\\\\w+) (\\\\w+)-\\\\20]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
+    "tests/strings/test_find_replace.py::test_pyarrow_backend_group_replacement[\\\\[(\\\\d+)\\\\]-(\\\\1)-expected_list1]": "Flaky under test sharding: cudf.pandas behavior is test-order-dependent (see #22992)",
     "tests/extension/test_arrow.py::TestArrowArray::test_compare_array[timestamp[ns]-eq]": "Skipped: failing in pandas-tests sharded CI (PR #22992, run 28204832469)",
     "tests/frame/test_stack_unstack.py::TestStackUnstackMultiLevel::test_stack_names_and_numbers[False]": "Skipped: failing in pandas-tests sharded CI (PR #22992, run 28204832469)",
     "tests/frame/test_stack_unstack.py::TestStackUnstackMultiLevel::test_stack_names_and_numbers[True]": "Skipped: failing in pandas-tests sharded CI (PR #22992, run 28204832469)",
@@ -5576,17 +5586,28 @@ def pytest_configure(config):
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(session, config, items):
     num_shards = config.getoption("num_shards")
-    if num_shards > 1:
+    sharded = num_shards > 1
+    if sharded:
         shard_id = config.getoption("shard_id")
         # Keep only this shard's items before applying skip/xfail markers so
         # the markers are only attached to the tests this shard will run.
-        items[:] = filter_items_by_shard(items, shard_id, num_shards)
+        items[:], deselected = partition_items_by_shard(
+            items, shard_id, num_shards
+        )
+        if deselected:
+            # Tell pytest what the other shards took, so reporting plugins
+            # account for them instead of seeing them vanish at collection.
+            config.hook.pytest_deselected(items=deselected)
     for item in items:
         if any(
             substr in item.nodeid for substr in NODEIDS_TOLERANT_INDEX_COMPARE
         ):
             item.add_marker(pytest.mark.tolerant_index_compare)
         if (reason := NODEIDS_TO_SKIP.get(item.nodeid, None)) is not None:
+            item.add_marker(pytest.mark.skip(reason=reason))
+        elif sharded and (
+            reason := NODEIDS_TO_SKIP_WHEN_SHARDED.get(item.nodeid, None)
+        ) is not None:
             item.add_marker(pytest.mark.skip(reason=reason))
         elif (
             reason := next(

@@ -20,25 +20,16 @@
 set -euo pipefail
 
 source rapids-init-pip
+# shellcheck source=ci/cudf_pandas_scripts/pandas-tests/shard-results.sh
+source ci/cudf_pandas_scripts/pandas-tests/shard-results.sh
 
 NUM_SHARDS=${1:?usage: merge-nightly.sh <num_shards>}
 
 rapids-logger "Merging pandas-tests results from ${NUM_SHARDS} shards"
 
-for ((shard = 0; shard < NUM_SHARDS; shard++)); do
-    rapids-logger "Downloading results for shard ${shard}"
-    gh run download "${GITHUB_RUN_ID}" \
-        --repo "${GITHUB_REPOSITORY}" \
-        --name "pandas-test-main-results-${shard}" \
-        --dir "shard-${shard}"
-done
+# set -e propagates a missing or unmergeable shard, which is what we want here:
+# see the header comment.
+merge_shard_results "pandas-test-main-results" "main-results.json" \
+    "${NUM_SHARDS}" main-results.json
 
-SHARD_RESULTS=()
-for ((shard = 0; shard < NUM_SHARDS; shard++)); do
-    SHARD_RESULTS+=("shard-${shard}/main-results.json")
-done
-
-python ci/cudf_pandas_scripts/pandas-tests/merge-results.py \
-    "${SHARD_RESULTS[@]}" > main-results.json
-
-rapids-logger "Merged $(wc -l < main-results.json) lines into main-results.json"
+rapids-logger "Wrote main-results.json"
