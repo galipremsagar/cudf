@@ -45,6 +45,7 @@ jobs:
       - wheel-tests-dask-cudf
       - devcontainer
       - unit-tests-cudf-pandas
+      - pandas-tests-shards
       - pandas-tests
       - pandas-tests-summary
       - narwhals-tests
