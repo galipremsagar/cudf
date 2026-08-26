@@ -86,7 +86,7 @@ MAIN_RUN_ID=$(
         --status success              \
         --limit 7                     \
         --json 'createdAt,databaseId' \
-        --jq 'sort_by(.createdAt) | reverse | .[0] | .databaseId'
+        --jq 'sort_by(.createdAt) | reverse | .[0].databaseId // empty'
 )
 
 if [[ -z "${MAIN_RUN_ID}" ]]; then
