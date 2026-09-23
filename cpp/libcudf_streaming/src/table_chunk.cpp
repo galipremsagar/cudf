@@ -191,7 +191,14 @@ table_chunk table_chunk::copy(rapidsmpf::MemoryReservation& reservation) const
                                       std::move(timing));
         // update the provided `reservation`
         br->release(reservation, nbytes);
-        auto host_buffer = br->move(std::move(packed_pinned.gpu_data), stream());
+        // The data leaves device memory here rather than through `BufferResource`, so
+        // the spill is opened by hand and the token handed to the buffer.
+        auto host_buffer =
+          br->move(std::move(packed_pinned.gpu_data),
+                   stream(),
+                   // An empty table packs to a default-constructed `device_buffer`,
+                   // which ignores the resource and frees nothing, so it gets no token.
+                   nbytes > 0 ? std::make_shared<rapidsmpf::SpillTrackToken>() : nullptr);
         return table_chunk(std::make_unique<rapidsmpf::PackedData>(
           std::move(packed_pinned.metadata), std::move(host_buffer)));
       }
@@ -226,16 +233,27 @@ table_chunk table_chunk::copy(rapidsmpf::MemoryReservation& reservation) const
   return table_chunk(std::make_unique<rapidsmpf::PackedData>(std::move(metadata), std::move(data)));
 }
 
+std::size_t table_chunk::into_packed_data_cost() const noexcept
+{
+  // Already packed data is moved out rather than serialized.
+  if (packed_data_ != nullptr) { return 0; }
+  return data_alloc_size_[static_cast<std::size_t>(rapidsmpf::MemoryType::DEVICE)];
+}
+
 std::unique_ptr<rapidsmpf::PackedData> table_chunk::into_packed_data(
-  rapidsmpf::BufferResource* br) &&
+  rapidsmpf::MemoryReservation& reservation) &&
 {
   if (packed_data_) {
     table_view_ = std::nullopt;
     return std::move(packed_data_);
   }
   RAPIDSMPF_EXPECTS(is_available(), "table_chunk must be available; call make_available() first");
-  // TODO: use `cudf::chunked_pack()` with a bounce buffer. Currently,
-  // `cudf::pack()` allocates device memory we haven't reserved.
+  RAPIDSMPF_EXPECTS(reservation.mem_type() == rapidsmpf::MemoryType::DEVICE,
+                    "device memory reservation is required");
+  auto* br = reservation.br();
+  auto res = reservation.split(into_packed_data_cost());
+  // TODO: use `cudf::chunked_pack()` with a bounce buffer, so the pack runs in
+  // bounded space instead of needing room for a whole second copy.
   auto packed_columns = cudf::pack(table_view_.value(), stream_, br->device_mr());
   table_view_         = std::nullopt;
   return std::make_unique<rapidsmpf::PackedData>(

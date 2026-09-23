@@ -14,7 +14,7 @@ add_library(
 target_compile_features(cudf_datagen PUBLIC cxx_std_20 cuda_std_20)
 
 target_compile_options(
-  cudf_datagen PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_FLAGS}>"
+  cudf_datagen PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_FLAGS};${CUDF_CXX_TEST_FLAGS}>"
                       "$<$<COMPILE_LANGUAGE:CUDA>:${CUDF_CUDA_FLAGS}>"
 )
 
@@ -39,7 +39,7 @@ add_library(
 target_compile_features(ndsh_data_generator PUBLIC cxx_std_20 cuda_std_20)
 
 target_compile_options(
-  ndsh_data_generator PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_FLAGS}>"
+  ndsh_data_generator PUBLIC "$<$<COMPILE_LANGUAGE:CXX>:${CUDF_CXX_FLAGS};${CUDF_CXX_TEST_FLAGS}>"
                              "$<$<COMPILE_LANGUAGE:CUDA>:${CUDF_CUDA_FLAGS}>"
 )
 
@@ -402,8 +402,7 @@ rtcx_add_embed(cudf_benchmark_fragments)
 add_fragment(cudf_benchmark_fragments FRAGMENT add_f32 SOURCE binaryop/fragments/add_f32.cu)
 add_fragment(cudf_benchmark_fragments FRAGMENT mul_f32 SOURCE binaryop/fragments/mul_f32.cu)
 rtcx_embed(
-  cudf_benchmark_fragments COMPRESSION none OUTPUT_DIRECTORY
-  "${CUDF_GENERATED_INCLUDE_DIR}/rtcx_embed"
+  cudf_benchmark_fragments COMPRESSION none OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embed"
 )
 
 # ##################################################################################################
